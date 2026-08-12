@@ -3,6 +3,22 @@
   "version": "0.1.0",
   "description": "Typed client for CoreTempo webhook triggers: fire, long-poll, schema-typed output",
   "private": true,
+  "license": "MIT",
+  "author": "John MacPhie",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jm709/CoreTempo.git",
+    "directory": "clients/js"
+  },
+  "homepage": "https://github.com/jm709/CoreTempo/tree/main/clients/js#readme",
+  "bugs": "https://github.com/jm709/CoreTempo/issues",
+  "keywords": [
+    "coretempo",
+    "claude-code",
+    "agents",
+    "webhook",
+    "client"
+  ],
   "type": "module",
   "engines": {
     "node": ">=22"
