@@ -1,0 +1,9 @@
+# Static musl targets for the headless export (spec §10). Build with cargo-zigbuild:
+#   cargo zigbuild --release --target x86_64-unknown-linux-musl -p coretempo-daemon -p coretempo-cli
+# +crt-static is the musl default; stated explicitly so a workspace-level override
+# can never silently produce a dynamically linked artifact.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

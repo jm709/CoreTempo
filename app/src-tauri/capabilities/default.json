@@ -1,0 +1,7 @@
+{
+  "$schema": "gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "CoreTempo main window: core events and command invoke",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

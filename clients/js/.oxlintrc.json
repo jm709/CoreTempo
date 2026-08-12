@@ -1,0 +1,5 @@
+{
+  "plugins": ["typescript", "import", "unicorn"],
+  "categories": { "correctness": "error", "suspicious": "error" },
+  "ignorePatterns": ["dist"]
+}

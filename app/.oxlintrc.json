@@ -1,0 +1,8 @@
+{
+  "plugins": ["typescript", "import", "unicorn"],
+  "categories": { "correctness": "error", "suspicious": "error" },
+  "rules": {
+    "import/no-unassigned-import": ["error", { "allow": ["**/*.css"] }]
+  },
+  "ignorePatterns": ["dist"]
+}

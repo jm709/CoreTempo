@@ -1,0 +1,28 @@
+:root {
+  --bg: #101214;
+  --panel: #16191c;
+  --panel-edge: #262b30; /* 1 px borders, no shadows */
+  --terminal-bg: #0c0e10; /* inset-glass */
+  --text: #d8dee4;
+  --text-dim: #7c8691;
+  --accent: #e2a85f; /* warm amber: focus, active tab, Run, captured border */
+  --ok: #7fb069;
+  --busy: var(--accent);
+  --info: #6699cc;
+  --warn: #d9a441;
+  --err: #c4585a;
+
+  --font-mono: "JetBrainsMono NL", "JetBrains Mono NL", "JetBrains Mono", ui-monospace, monospace;
+  --font-prose: "IBM Plex Sans", system-ui, sans-serif;
+
+  --fs-terminal: 13px; /* terminals */
+  --fs-data: 12px; /* mono data UI */
+  --fs-prose: 13px; /* prose */
+  --fs-label: 11px; /* uppercase mono labels */
+  --label-tracking: 0.08em;
+
+  --t-feed-fade: 150ms; /* motion ONLY on state change (spec §9.3) */
+  --t-border-flash: 200ms;
+  --t-maximize: 120ms;
+  --t-pulse: 1.2s; /* the only looping animation: working glyph */
+}

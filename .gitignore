@@ -1,0 +1,13 @@
+/target
+/app/src-tauri/gen/schemas
+*.db
+*.db-wal
+*.db-shm
+
+# local secrets and per-user workflow config
+.env
+.env.*
+/tempo.toml
+
+clients/js/node_modules
+clients/js/dist

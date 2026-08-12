@@ -1,0 +1,84 @@
+# Example CoreTempo workflow. Copy to tempo.toml and edit the dirs/prompts.
+#
+#   cp tempo.example.toml tempo.toml
+#   ./dev              # open it in the desktop app
+#   ./dev headless     # or run it with no UI
+#
+# The roster is frozen when a run starts: to add or remove an agent, stop the
+# run, edit this file, and start again.
+
+[workflow]
+name = "example"
+# db = "./tempo.db"            # message log (default: ./tempo.db)
+# port = 4820                  # local API port
+# ask_timeout_minutes = 30     # an ask with no reply fails after this
+# idle_debounce_seconds = 2.0  # stable-idle dwell before /clear and send-acks
+# scrollback = 5000            # terminal history lines per pane (~1 KiB x lines x agents)
+
+[server]
+# bind = "127.0.0.1"           # non-loopback requires a provisioned token
+# log = "info"                 # tracing EnvFilter string
+
+# Make the workflow self-starting (optional). on_start kicks off at launch;
+# webhook + `coretempod serve` starts a run per POST /v1/trigger call.
+# [trigger]
+# type = "on_start"
+# edge = { to = "planner", kind = "ask" }
+# message = "Plan the implementation."
+
+# Or accept kickoffs over HTTP, optionally with a structured-output contract
+# ([trigger.output] requires type = "webhook" with an ask edge; the reply is
+# validated against the schema and delivered parsed to the caller — and shown
+# in the desktop app's Run tab):
+# [trigger]
+# type = "webhook"
+# edge = { to = "planner", kind = "ask" }
+# [trigger.output]                       # reply must match this JSON Schema;
+# schema_file = "schemas/result.json"    # path relative to this file (or use
+#                                        # an inline `schema = { ... }` table).
+# max_repairs = 2                        # rejections before the trigger fails
+
+[agents.planner]
+dir = "~/projects/CoreTempo"
+prompt = """
+You are the planning agent. You break work into tasks and delegate them to the
+builder, then review what comes back. Do not write code yourself.
+"""
+# model = "opus"
+# Deterministic delegation: composed into the prompt as required steps and
+# enforced by the server (nudge instead of /clear when skipped). Kinds: "ask"
+# (one round-trip), "send" (one-way handoff), "loop" (supervised iteration —
+# the agent re-delegates each reply until it runs `tempo done <target>` or the
+# soft cap, max_rounds = 10 by default, stops the loop). Messages from an
+# agent you have an edge to never re-trigger your steps. Generated settings
+# always allow `Bash(tempo:*)`, so edges work with no manual setup; use
+# `tools = [...]` (see the builder agent below) to allowlist other CLI tools
+# the same way.
+edges = [{ to = "builder", kind = "ask" }]
+auto_clear = false             # keeps context while its asks are outstanding
+
+[agents.builder]
+dir = "~/projects/CoreTempo"
+prompt = """
+You implement tasks sent to you by the planner. Reply with a one-paragraph
+summary of what you changed, using code 0 on success and 1 if you were blocked.
+"""
+# permission_mode = "acceptEdits"
+# tools = ["pat"]              # extra CLI allowlist: Bash(pat:*) in generated settings
+
+# ── Pattern: connecting an agent to an app API (an "API source") ──────────
+# When an agent must drive a local app's HTTP API correctly, keep the
+# contract in the app and let the prompt carry only a stable pointer:
+#   - the app serves its request schema from the same object that validates
+#     requests (e.g. GET /api/schema returning JSON Schema plus a version),
+#     and rejects bad shapes with repair-friendly errors — never by
+#     silently stripping unknown fields;
+#   - the agent's prompt says to fetch that schema once at task start and
+#     treat it as the authoritative contract;
+#   - tools = ["curl"] allowlists the fetch, and every shell command must be
+#     a single plain invocation — compound shell (pipes, loops, subshells)
+#     parks on Claude Code's approval dialog and hangs the agent;
+#   - POST JSON bodies with `-d @file.json` — inline JSON breaks on quotes;
+#   - if the app is unreachable, reply with --code 1 and a one-line reason.
+# Worked example: the gp-research workflow in adding-to-DC
+# (research/tempo.toml).

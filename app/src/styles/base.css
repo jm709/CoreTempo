@@ -1,0 +1,84 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+html,
+body,
+#app {
+  height: 100%;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-prose);
+  font-size: var(--fs-prose);
+  overflow: hidden;
+  user-select: none;
+}
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-data);
+}
+.label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+  letter-spacing: var(--label-tracking);
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+}
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+@keyframes ct-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes ct-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.glyph {
+  font-family: var(--font-mono);
+}
+.glyph.working {
+  color: var(--busy);
+  animation: ct-pulse var(--t-pulse) ease-in-out infinite;
+}
+.glyph.idle {
+  color: var(--text-dim);
+}
+.glyph.starting,
+.glyph.restarting {
+  color: var(--info);
+}
+.glyph.exited {
+  color: var(--err);
+}
+@media (prefers-reduced-motion: reduce) {
+  .glyph.working {
+    animation: none;
+  }
+}
