@@ -9,7 +9,7 @@ initial response within a week.
 
 ## Supported versions
 
-Pre-1.0: only the latest commit on `main` is supported.
+Only the latest release and the tip of `main` are supported.
 
 ## Threat model
 

@@ -1,6 +1,6 @@
 {
   "name": "@coretempo/client",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Typed client for CoreTempo webhook triggers: fire, long-poll, schema-typed output",
   "private": true,
   "license": "MIT",

@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "coretempo-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "coretempo-core",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "coretempo-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "coretempo-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "coretempo-daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
