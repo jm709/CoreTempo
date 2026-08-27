@@ -4,6 +4,7 @@
 //! workflow: no frozen prompt, no router, no auto-`/clear`.
 
 pub mod store;
+pub mod worktree;
 
 use std::path::{Path, PathBuf};
 
