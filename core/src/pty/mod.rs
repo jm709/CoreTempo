@@ -293,6 +293,13 @@ struct AgentHandle {
     size: portable_pty::PtySize,
 }
 
+/// Per-agent lifecycle calls — `spawn`, `restart`, `stop`, `remove_agent` —
+/// must be serialized by the caller for one agent (a workflow run does so by
+/// construction; the session daemon holds a per-session lock). Racing them is
+/// unsupported: `stop` awaiting `reap` while another task `spawn`s the same
+/// agent lets the old reaper record its exit over the new session, and
+/// `remove_agent` between `spawn`'s two lock sections drops the fresh child
+/// without killing it.
 pub struct PtyManager {
     /// The roster's debounce, kept for agents added after construction.
     idle_debounce: Duration,
@@ -585,9 +592,9 @@ impl PtyManager {
     )]
     pub async fn spawn(&self, agent: &AgentId) -> Result<(), PtyError> {
         let (entry, size) = {
-            let mut agents = lock(&self.agents);
+            let agents = lock(&self.agents);
             let handle = agents
-                .get_mut(agent)
+                .get(agent)
                 .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
             if handle.session.is_some() {
                 return Ok(());
@@ -595,11 +602,7 @@ impl PtyManager {
             // `resume` is for this spawn only; only cleared once this spawn
             // actually lands a session (below) so a refused or failed attempt
             // leaves it armed for the next one.
-            let entry = RosterEntry {
-                resume: handle.entry.resume.clone(),
-                ..handle.entry.clone()
-            };
-            (entry, handle.size)
+            (handle.entry.clone(), handle.size)
         };
         if let Some(gate) = self.spawn_gate.get() {
             gate.before_spawn(agent, &entry.cfg.dir)
@@ -609,7 +612,7 @@ impl PtyManager {
                 })?;
         }
         let OpenedPty {
-            session,
+            mut session,
             mut child,
             exited_tx,
             reader,
@@ -625,9 +628,17 @@ impl PtyManager {
         let my_epoch;
         {
             let mut agents = lock(&self.agents);
-            let handle = agents
-                .get_mut(agent)
-                .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+            let Some(handle) = agents.get_mut(agent) else {
+                drop(agents);
+                if let Err(err) = session.killer.kill() {
+                    tracing::warn!(
+                        agent = %agent,
+                        error = %err,
+                        "kill after agent vanished mid-spawn failed"
+                    );
+                }
+                return Err(PtyError::UnknownAgent(agent.clone()));
+            };
             my_epoch = *handle.epoch_tx.borrow();
             *lock(&handle.writer_slot) = Some(writer);
             handle.exit = None;
@@ -857,6 +868,8 @@ impl PtyManager {
     /// `stop()` if live, then drop the handle. Output subscribers are closed
     /// explicitly; the queue worker, write pump and state subscribers end
     /// when their senders drop with the handle. The id becomes unknown.
+    ///
+    /// Must not race `spawn` on the same agent (see the type-level contract).
     ///
     /// # Errors
     /// [`PtyError::UnknownAgent`] off-roster.

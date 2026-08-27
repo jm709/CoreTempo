@@ -411,7 +411,7 @@ impl Run {
                 port,
                 token: server.token.clone(),
                 tempo_bin_dir,
-                credential_store: agent_files.credential_store.clone(),
+                credential_store: agent_files.credential_store,
             },
         );
         let router = Router::new(

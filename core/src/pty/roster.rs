@@ -16,6 +16,12 @@ pub enum McpPolicy {
     /// the agent sees only the servers its workflow declared (workflow runs).
     Strict(Option<PathBuf>),
     /// Neither flag: the agent inherits the operator's own MCP setup (sessions).
+    /// Hazard: without `--strict-mcp-config`, a project whose `.mcp.json`
+    /// servers the operator has not approved raises Claude Code's "New MCP
+    /// server found" dialog, which fires no hook — the agent then sits in
+    /// `starting` forever (CLAUDE.md gotchas). An `isolated_config` session's
+    /// managed `.claude.json` has no approvals at all. Callers must seed
+    /// approvals (`claude_config.rs`) or use `Strict`.
     Inherit,
 }
 

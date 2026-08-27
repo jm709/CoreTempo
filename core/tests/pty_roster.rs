@@ -30,7 +30,7 @@ fn write_argv_agent(dir: &Path) -> PathBuf {
     let path = dir.join("argv-agent.sh");
     let script = concat!(
         "#!/usr/bin/env bash\n",
-        "{ printf '%s\\n' \"$@\"; printf -- '--\\n'; } >> \"$PWD/argv.txt\"\n",
+        "{ printf '%s\\n' \"$@\"; printf -- '===ARGV===\\n'; } >> \"$PWD/argv.txt\"\n",
         "printf 'booted\\n'\n",
         "while IFS= read -r line; do\n",
         "  case \"$line\" in\n",
@@ -49,6 +49,7 @@ fn fresh_dir() -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("coretempo-roster-{}-{n}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
+    let _ = std::fs::remove_file(tmp.join("argv.txt"));
     tmp
 }
 
@@ -92,7 +93,7 @@ async fn wait_state(mgr: &PtyManager, agent: &AgentId, want: AgentState) {
 /// Argv of every spawn so far, one `Vec` per spawn.
 fn recorded_argv(dir: &Path) -> Vec<Vec<String>> {
     let text = std::fs::read_to_string(dir.join("argv.txt")).unwrap_or_default();
-    text.split("--\n")
+    text.split("===ARGV===\n")
         .filter(|block| !block.is_empty())
         .map(|block| {
             block
@@ -112,11 +113,18 @@ async fn an_added_agent_spawns_with_the_entry_recipe() {
     let mut e = entry(&dir);
     e.cfg.model = Some("haiku".into());
     mgr.add_agent(id.clone(), e).unwrap();
+    let mut out = mgr.subscribe_output(&id, None).unwrap();
     mgr.spawn(&id).await.unwrap();
-    // The fake never reports a hook state, so it stays Starting; a live
-    // session is observable through write() succeeding and the argv file.
-    mgr.write(&id, b"hello\n").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The fake writes argv.txt before it prints "booted", so draining until
+    // that shows up makes the argv read below deterministic.
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("booted") {
+        let chunk = tokio::time::timeout(DEADLINE, out.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        seen.extend(chunk.bytes);
+    }
     assert_eq!(
         recorded_argv(&dir),
         vec![vec!["--model".to_string(), "haiku".to_string()]],
@@ -131,11 +139,18 @@ async fn adding_an_existing_id_fails() {
     let (mgr, _bus) = empty_manager(&dir);
     let id = AgentId("s-1".into());
     mgr.add_agent(id.clone(), entry(&dir)).unwrap();
+    assert!(
+        !dir.join("argv.txt").exists(),
+        "add_agent creates the handle without spawning"
+    );
     let err = mgr.add_agent(id.clone(), entry(&dir)).unwrap_err();
     assert!(
         matches!(err, PtyError::AgentExists(ref got) if *got == id),
         "{err}"
     );
+    // A rejected add leaves the original entry usable.
+    mgr.spawn(&id).await.unwrap();
+    mgr.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
