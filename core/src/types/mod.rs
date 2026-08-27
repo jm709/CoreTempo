@@ -7,6 +7,7 @@ pub mod config;
 pub mod event;
 pub mod id;
 pub mod message;
+pub mod session;
 
 pub use crate::types::agent::{AgentDetail, AgentExit, AgentInfo, AgentState};
 pub use crate::types::api::{
@@ -21,7 +22,12 @@ pub use crate::types::config::{
     ServerSection, ValidationIssue, WorkflowFile, WorkflowSection,
 };
 pub use crate::types::event::{Event, EventPayload, LifecyclePhase};
-pub use crate::types::id::{AgentId, FlowName, MessageId, RunId, Token};
+pub use crate::types::id::{AgentId, FlowName, MessageId, ProjectId, RunId, Token};
 pub use crate::types::message::{
     MessageKind, MessageRecord, MessageStatus, Origin, OriginParseError,
+};
+pub use crate::types::session::{
+    BlockedView, CreateProjectRequest, CreateSessionRequest, DeleteSessionResponse, ProjectView,
+    ResumeResponse, SessionCounts, SessionState, SessionView, SessionsApiFile, SessionsHealth,
+    WorktreeInfo, WorktreeStatus,
 };

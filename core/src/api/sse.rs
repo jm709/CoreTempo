@@ -38,6 +38,12 @@ pub(crate) fn event_type(payload: &EventPayload) -> &'static str {
         EventPayload::ReplyRejected { .. } => "reply.rejected",
         EventPayload::BusReset {} => "bus.reset",
         EventPayload::WorkflowCompleted { .. } => "workflow.completed",
+        EventPayload::SessionCreated { .. } => "session.created",
+        EventPayload::SessionStopped { .. } => "session.stopped",
+        EventPayload::SessionResumed { .. } => "session.resumed",
+        EventPayload::SessionDeleted { .. } => "session.deleted",
+        EventPayload::ProjectRegistered { .. } => "project.registered",
+        EventPayload::ProjectForgotten { .. } => "project.forgotten",
     }
 }
 
@@ -65,7 +71,9 @@ impl EventFilterSpec {
         let always = match &event.payload {
             EventPayload::RunStarted { .. }
             | EventPayload::BusReset {}
-            | EventPayload::WorkflowCompleted { .. } => true,
+            | EventPayload::WorkflowCompleted { .. }
+            | EventPayload::ProjectRegistered { .. }
+            | EventPayload::ProjectForgotten { .. } => true,
             EventPayload::AgentStateChanged { .. }
             | EventPayload::AgentLifecycle { .. }
             | EventPayload::AgentNudged { .. }
@@ -74,7 +82,11 @@ impl EventFilterSpec {
             | EventPayload::AgentPermissionRefused { .. }
             | EventPayload::MessageCreated { .. }
             | EventPayload::MessageStatusChanged { .. }
-            | EventPayload::ReplyRejected { .. } => false,
+            | EventPayload::ReplyRejected { .. }
+            | EventPayload::SessionCreated { .. }
+            | EventPayload::SessionStopped { .. }
+            | EventPayload::SessionResumed { .. }
+            | EventPayload::SessionDeleted { .. } => false,
         };
         if always {
             return true;
@@ -103,7 +115,11 @@ impl EventFilterSpec {
             | EventPayload::AgentStalled { agent }
             | EventPayload::AgentBlocked { agent, .. }
             | EventPayload::AgentPermissionRefused { agent, .. }
-            | EventPayload::ReplyRejected { agent, .. } => agent == want,
+            | EventPayload::ReplyRejected { agent, .. }
+            | EventPayload::SessionCreated { agent }
+            | EventPayload::SessionStopped { agent }
+            | EventPayload::SessionResumed { agent, .. }
+            | EventPayload::SessionDeleted { agent } => agent == want,
             EventPayload::MessageCreated { message }
             | EventPayload::MessageStatusChanged { message } => {
                 if message.to == *want {
@@ -116,7 +132,9 @@ impl EventFilterSpec {
             }
             EventPayload::RunStarted { .. }
             | EventPayload::BusReset {}
-            | EventPayload::WorkflowCompleted { .. } => true,
+            | EventPayload::WorkflowCompleted { .. }
+            | EventPayload::ProjectRegistered { .. }
+            | EventPayload::ProjectForgotten { .. } => true,
         }
     }
 }
@@ -408,6 +426,33 @@ mod tests {
     #[test]
     fn event_type_strings_are_the_wire_names() {
         assert_eq!(event_type(&EventPayload::BusReset {}), "bus.reset");
+    }
+
+    #[test]
+    fn session_events_take_the_agent_filter_and_project_events_always_pass() {
+        let f = EventFilterSpec::parse(None, Some("s-1"));
+        assert!(f.matches(&ev(EventPayload::SessionCreated {
+            agent: AgentId("s-1".to_string())
+        })));
+        assert!(!f.matches(&ev(EventPayload::SessionStopped {
+            agent: AgentId("s-2".to_string())
+        })));
+        assert!(f.matches(&ev(EventPayload::ProjectForgotten {
+            project: crate::types::id::ProjectId("p-1".to_string())
+        })));
+        assert_eq!(
+            event_type(&EventPayload::SessionResumed {
+                agent: AgentId("s-1".to_string()),
+                resumed: false
+            }),
+            "session.resumed"
+        );
+        assert_eq!(
+            event_type(&EventPayload::ProjectRegistered {
+                project: crate::types::id::ProjectId("p-1".to_string())
+            }),
+            "project.registered"
+        );
     }
 
     #[test]
