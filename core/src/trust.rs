@@ -184,31 +184,89 @@ impl TrustStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut doc = self.read()?;
-        let Value::Object(top) = &mut doc else {
-            return Err(TrustError::Shape {
-                path: self.path.clone(),
-            });
+        for root in roots {
+            let entry = Self::project_entry(&mut doc, root, &self.path)?;
+            entry.insert(TRUST_KEY.to_string(), Value::Bool(true));
+        }
+        self.write_atomic(&doc)
+    }
+
+    /// The listed keys of `projects[<root>]`, those present. Empty when the
+    /// entry or every key is absent.
+    ///
+    /// # Errors
+    /// [`TrustError::Io`] / [`TrustError::Json`].
+    pub fn project_keys(
+        &self,
+        root: &Path,
+        keys: &[&str],
+    ) -> Result<Map<String, Value>, TrustError> {
+        let doc = self.read()?;
+        let mut out = Map::new();
+        let Some(entry) = doc
+            .get("projects")
+            .and_then(|p| p.get(root.to_string_lossy().as_ref()))
+        else {
+            return Ok(out);
+        };
+        for key in keys {
+            if let Some(value) = entry.get(*key) {
+                out.insert((*key).to_string(), value.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Sets `values` on `projects[<root>]`, creating the entry, preserving
+    /// everything else; the same atomic 0600 write as [`TrustStore::grant`].
+    /// Empty `values` touches nothing.
+    ///
+    /// # Errors
+    /// [`TrustError::Io`] / [`TrustError::Json`] / [`TrustError::Shape`].
+    pub fn set_project_keys(
+        &self,
+        root: &Path,
+        values: Map<String, Value>,
+    ) -> Result<(), TrustError> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let _serialized = GRANT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut doc = self.read()?;
+        let entry = Self::project_entry(&mut doc, root, &self.path)?;
+        for (key, value) in values {
+            entry.insert(key, value);
+        }
+        self.write_atomic(&doc)
+    }
+
+    /// `projects[<root>]` as a mutable object, created on demand.
+    fn project_entry<'a>(
+        doc: &'a mut Value,
+        root: &Path,
+        path: &Path,
+    ) -> Result<&'a mut Map<String, Value>, TrustError> {
+        let shape = || TrustError::Shape {
+            path: path.to_path_buf(),
+        };
+        let Value::Object(top) = doc else {
+            return Err(shape());
         };
         let projects = top
             .entry("projects")
             .or_insert_with(|| Value::Object(Map::new()));
         let Value::Object(projects) = projects else {
-            return Err(TrustError::Shape {
-                path: self.path.clone(),
-            });
+            return Err(shape());
         };
-        for root in roots {
-            let entry = projects
-                .entry(root.to_string_lossy().into_owned())
-                .or_insert_with(|| Value::Object(Map::new()));
-            let Value::Object(entry) = entry else {
-                return Err(TrustError::Shape {
-                    path: self.path.clone(),
-                });
-            };
-            entry.insert(TRUST_KEY.to_string(), Value::Bool(true));
-        }
-        self.write_atomic(&doc)
+        let entry = projects
+            .entry(root.to_string_lossy().into_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(entry) = entry else {
+            return Err(shape());
+        };
+        Ok(entry)
     }
 
     fn write_atomic(&self, doc: &Value) -> Result<(), TrustError> {
@@ -773,5 +831,55 @@ mod tests {
         let gate = TrustGate::new(operator, TrustPolicy { grant: false }, BTreeMap::new());
         gate.before_spawn(&AgentId("plain".into()), &dir)
             .expect("spawn allowed");
+    }
+
+    #[test]
+    fn project_keys_copy_between_roots_and_skip_absent_ones() {
+        let t = tmp();
+        let store = store_with(&t, Path::new("/home/u/trusted"));
+        store
+            .set_project_keys(
+                Path::new("/home/u/trusted"),
+                json!({"enabledMcpjsonServers": ["mailbox"], "enableAllProjectMcpServers": false})
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            )
+            .expect("writes");
+        let keys = store
+            .project_keys(
+                Path::new("/home/u/trusted"),
+                &[
+                    "enabledMcpjsonServers",
+                    "disabledMcpjsonServers",
+                    "enableAllProjectMcpServers",
+                ],
+            )
+            .expect("reads");
+        assert_eq!(keys.len(), 2, "absent keys are skipped: {keys:?}");
+        assert_eq!(keys["enabledMcpjsonServers"], json!(["mailbox"]));
+        store
+            .set_project_keys(Path::new("/w/wt"), keys)
+            .expect("writes into a new entry");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store.path).expect("read"))
+                .expect("json");
+        assert_eq!(
+            doc["projects"]["/w/wt"]["enabledMcpjsonServers"],
+            json!(["mailbox"])
+        );
+        assert_eq!(
+            doc["projects"]["/home/u/trusted"]["allowedTools"][0],
+            "Bash(tempo:*)"
+        );
+        assert!(
+            store
+                .project_keys(Path::new("/nowhere"), &["x"])
+                .expect("reads")
+                .is_empty()
+        );
+        store
+            .set_project_keys(Path::new("/w/wt"), serde_json::Map::new())
+            .expect("empty is a no-op");
     }
 }
