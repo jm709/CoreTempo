@@ -1,7 +1,7 @@
 # Session manager — Spec A: core, daemon, API, CLI
 
 Date: 2026-08-27
-Status: draft for review (revision 2, after the 2026-08-27 review)
+Status: draft for review (revision 3, after two review passes on 2026-08-27)
 Amends: the design spec (2026-08-01) and the contracts doc (amendments 46–48,
 assigned up front, renumbered on rebase if PRs cross).
 Follow-up: Spec B (desktop Sessions mode) is designed after this spec ships.
