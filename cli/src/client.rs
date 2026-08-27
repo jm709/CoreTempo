@@ -108,7 +108,6 @@ impl Client {
     }
 
     /// Raw bytes to a PTY write route; the server answers 204.
-    #[expect(dead_code, reason = "`tempo session attach` (task 13) is its caller")]
     pub fn post_raw(&self, path: &str, bytes: &[u8]) -> Result<(), ApiCallError> {
         let res = self
             .agent
@@ -121,7 +120,6 @@ impl Client {
     }
 
     /// An SSE stream's body, read line by line by the caller.
-    #[expect(dead_code, reason = "`tempo session attach` (task 13) is its caller")]
     pub fn stream(&self, path: &str) -> Result<Box<dyn std::io::Read + Send>, ApiCallError> {
         let res = self
             .agent
