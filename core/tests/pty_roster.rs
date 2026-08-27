@@ -150,19 +150,18 @@ async fn resume_is_passed_once_and_then_cleared() {
 
     mgr.set_resume(&id, Some("abc-123".into())).unwrap();
     mgr.spawn(&id).await.unwrap();
-    // `spawn`'s body has no internal `.await`, so it sends the raw state
-    // straight from Exited to Starting without ever yielding to the runtime.
-    // Without a real sleep here, the debouncer task that forwards raw state
-    // onto the debounced channel `wait_state` reads may not have run yet, so
-    // the very next `wait_state(Exited)` can match the stale Exited value
-    // left over from the previous cycle instead of waiting for this spawn's
-    // own exit.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // `wait_state`'s freshly-subscribed `wait_for` checks its predicate
+    // against the *current* debounced value first, which right after
+    // `spawn()` returns is still the previous cycle's Exited (spawn has no
+    // internal `.await`, so it never yields to let the debouncer forward
+    // Starting). Waiting for Starting here drains that stale value through
+    // the same channel before we wait for this cycle's real Exited.
+    wait_state(&mgr, &id, AgentState::Starting).await;
     mgr.write(&id, b"quit\n").await.unwrap();
     wait_state(&mgr, &id, AgentState::Exited).await;
 
     mgr.spawn(&id).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_state(&mgr, &id, AgentState::Starting).await;
     mgr.write(&id, b"quit\n").await.unwrap();
     wait_state(&mgr, &id, AgentState::Exited).await;
 
