@@ -821,6 +821,39 @@ impl PtyManager {
         Ok(())
     }
 
+    /// Kills one agent's process and waits for it to exit (SIGHUP, then SIGKILL
+    /// after [`EXIT_GRACE`]) — `shutdown` for one handle. Unlike `restart`
+    /// there is no epoch bump: the bump exists to fail queued injections with
+    /// `AgentRestarted`, and here the queue fails them itself on the raw
+    /// `Exited`; because `reap` awaits the reaper thread's oneshot, which it
+    /// sends only after `on_child_exit`, [`PtyManager::exit`] is recorded when
+    /// this returns. The handle, ring and output subscribers survive, so a
+    /// later [`PtyManager::spawn`] continues the same stream (spec 2026-08-27
+    /// §4, amendment 46).
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] off-roster; [`PtyError::AgentExited`] when
+    /// there is no live session to stop.
+    pub async fn stop(&self, agent: &AgentId) -> Result<(), PtyError> {
+        let (session, was_blocked) = {
+            let mut agents = lock(&self.agents);
+            let handle = agents
+                .get_mut(agent)
+                .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+            let Some(session) = handle.session.take() else {
+                return Err(PtyError::AgentExited(agent.clone()));
+            };
+            let _ = handle.raw_tx.send(AgentState::Exited);
+            *lock(&handle.writer_slot) = None;
+            (session, Self::take_blocked(handle))
+        };
+        if was_blocked {
+            self.publish_blocked(agent, false, None);
+        }
+        reap(agent, session, "stop").await;
+        Ok(())
+    }
+
     /// Kills every agent PTY, stops the reader/coalescer/queue tasks, and fails
     /// queued injections with `InjectError::AgentExited`. Returns once every
     /// agent process has actually exited (SIGHUP, then SIGKILL after

@@ -18,7 +18,7 @@ use std::time::Duration;
 use coretempo_core::bus::EventBus;
 use coretempo_core::pty::{AgentEnv, McpPolicy, PtyError, PtyManager, PtyRoster, RosterEntry};
 use coretempo_core::types::config::AgentConfig;
-use coretempo_core::types::{AgentId, AgentState, Token};
+use coretempo_core::types::{AgentExit, AgentId, AgentState, Token};
 
 const IDLE_DEBOUNCE: Duration = Duration::from_millis(100);
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -217,4 +217,97 @@ async fn a_failed_spawn_keeps_the_resume_id_armed() {
         vec![vec!["--resume".to_string(), "abc-123".to_string()]],
         "the refused attempt did not consume the id"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_reaps_records_the_exit_and_keeps_the_handle() {
+    let dir = fresh_dir();
+    let (mgr, _bus) = empty_manager(&dir);
+    let id = AgentId("s-1".into());
+    mgr.add_agent(id.clone(), entry(&dir)).unwrap();
+    mgr.spawn(&id).await.unwrap();
+    let mut out = mgr.subscribe_output(&id, None).unwrap();
+    mgr.write(&id, b"ping\n").await.unwrap();
+    // Drain until the echo shows up so the ring has content before the stop.
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("got:ping") {
+        let chunk = tokio::time::timeout(DEADLINE, out.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        seen.extend(chunk.bytes);
+    }
+
+    mgr.stop(&id).await.unwrap();
+
+    assert_eq!(mgr.state(&id).unwrap(), AgentState::Exited);
+    assert!(
+        matches!(mgr.exit(&id).unwrap(), Some(AgentExit::Signal(_))),
+        "SIGHUP-terminated bash reports a signal; got {:?}",
+        mgr.exit(&id).unwrap()
+    );
+    let (_, tail) = mgr.read_ring(&id, None).unwrap();
+    assert!(
+        String::from_utf8_lossy(&tail).contains("got:ping"),
+        "ring kept after stop"
+    );
+    assert!(
+        !matches!(
+            out.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "subscribers outlive the process so a resume continues the same stream"
+    );
+
+    mgr.spawn(&id).await.unwrap();
+    mgr.write(&id, b"again\n").await.unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("got:again") {
+        let chunk = tokio::time::timeout(DEADLINE, out.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        seen.extend(chunk.bytes);
+    }
+    mgr.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_clears_the_blocked_flag() {
+    let dir = fresh_dir();
+    let (mgr, bus) = empty_manager(&dir);
+    let id = AgentId("s-1".into());
+    mgr.add_agent(id.clone(), entry(&dir)).unwrap();
+    mgr.spawn(&id).await.unwrap();
+    mgr.report_state(&id, AgentState::Working).unwrap();
+    let mut events = bus.subscribe();
+    mgr.report_blocked(&id, Some("Bash".into()), None).unwrap();
+    assert!(mgr.blocked(&id).unwrap());
+
+    mgr.stop(&id).await.unwrap();
+
+    assert!(!mgr.blocked(&id).unwrap());
+    let mut saw_unblock = false;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+        if let coretempo_core::types::EventPayload::AgentBlocked { agent, blocked, .. } = ev.payload
+            && agent == id
+            && !blocked
+        {
+            saw_unblock = true;
+            break;
+        }
+    }
+    assert!(saw_unblock, "stop publishes blocked: false");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_without_a_live_session_is_an_error() {
+    let dir = fresh_dir();
+    let (mgr, _bus) = empty_manager(&dir);
+    let id = AgentId("s-1".into());
+    mgr.add_agent(id.clone(), entry(&dir)).unwrap();
+    let err = mgr.stop(&id).await.unwrap_err();
+    assert!(matches!(err, PtyError::AgentExited(_)), "{err}");
+    let err = mgr.stop(&AgentId("nope".into())).await.unwrap_err();
+    assert!(matches!(err, PtyError::UnknownAgent(_)), "{err}");
 }
