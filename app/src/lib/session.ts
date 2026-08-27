@@ -3,7 +3,7 @@ import { resetAgents } from "./state/agents.svelte";
 import { runState } from "./state/run.svelte";
 import { releaseCapture, uiState } from "./state/ui.svelte";
 import { disposeAllTerminals, ensureTerminal } from "./term/manager";
-import { confirmTrust } from "./trustDialog";
+import { confirmTrust } from "./dialogs";
 import { applySnapshot, wireEvents } from "./wireEvents";
 import type { Snapshot } from "./types";
 

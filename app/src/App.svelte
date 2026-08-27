@@ -5,9 +5,16 @@
   import { boot, startRun, stopRun } from "./lib/session";
   import { agentsState, runningCount } from "./lib/state/agents.svelte";
   import { runState } from "./lib/state/run.svelte";
-  import { releaseCapture, runGate, toggleRunCenter, uiState } from "./lib/state/ui.svelte";
+  import {
+    closeWorkflow,
+    releaseCapture,
+    runGate,
+    toggleRunCenter,
+    uiState,
+  } from "./lib/state/ui.svelte";
   import { jumpToAgentTerminal } from "./lib/term/jump";
   import { blurAllTerminals } from "./lib/term/manager";
+  import { confirmDiscard } from "./lib/dialogs";
   import Dock from "./lib/views/Dock.svelte";
   import NoWorkflowCard from "./lib/views/NoWorkflowCard.svelte";
   import Roster from "./lib/views/Roster.svelte";
@@ -97,6 +104,17 @@
     }
   }
 
+  // A run adopts its workflow file at start, so the way back only exists while
+  // stopped; the phase guard keeps it out of the starting/stopping window.
+  const canClose = $derived(uiState.editorPath !== null && runState.phase === "stopped");
+
+  async function onCloseClick(): Promise<void> {
+    const path = uiState.editorPath;
+    if (path === null) return;
+    if (uiState.editorDirty && !(await confirmDiscard(path))) return;
+    closeWorkflow();
+  }
+
   function clock(ms: number): string {
     const d = new Date(ms);
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -108,6 +126,18 @@
 <div class="shell">
   <header class="topbar panel mono">
     <span class="brand">◉ CoreTempo</span>
+    {#if canClose}
+      <button
+        class="closewf"
+        title="Close workflow"
+        aria-label="Close workflow"
+        onclick={() => {
+          void onCloseClick();
+        }}
+      >
+        ←
+      </button>
+    {/if}
     <span class="wf" title={uiState.editorPath ?? ""}>
       {uiState.editorPath ?? runState.info?.workflow_path ?? "no workflow"}
     </span>
@@ -198,6 +228,8 @@
     font-size: var(--fs-data); border: none;
   }
   .brand { color: var(--accent); }
+  .closewf { color: var(--text-dim); }
+  .closewf:hover { color: var(--text); }
   .wf { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .err { color: var(--err); }
   .hint { margin-left: auto; color: var(--text-dim); }

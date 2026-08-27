@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, test } from "vitest";
-import { openAgentTerminal, resetUi, runGate, toggleRunCenter, uiState } from "./ui.svelte";
+import {
+  closeWorkflow,
+  openAgentTerminal,
+  resetUi,
+  runGate,
+  toggleRunCenter,
+  uiState,
+} from "./ui.svelte";
 
 describe("run center view", () => {
   beforeEach(() => {
@@ -73,5 +80,29 @@ describe("run gate", () => {
     uiState.editorDirty = true;
     resetUi();
     expect(uiState.editorDirty).toBe(false);
+  });
+});
+
+describe("closeWorkflow", () => {
+  beforeEach(() => {
+    resetUi();
+    uiState.editorPath = "/w/tempo.toml";
+  });
+
+  test("returns to the no-workflow card and forgets edits", () => {
+    uiState.editorDirty = true;
+    uiState.runCenter = "terminals";
+    closeWorkflow();
+    expect(uiState.editorPath).toBeNull();
+    expect(uiState.editorDirty).toBe(false);
+    expect(uiState.runCenter).toBe("graph");
+  });
+
+  test("leaves the dock and terminal focus alone", () => {
+    uiState.dockTab = "chat";
+    uiState.focusedAgent = "builder";
+    closeWorkflow();
+    expect(uiState.dockTab).toBe("chat");
+    expect(uiState.focusedAgent).toBe("builder");
   });
 });
