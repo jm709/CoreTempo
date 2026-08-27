@@ -1,17 +1,12 @@
 //! `SessionManager` against a temp git repository and the argv-dumping fake
 //! agent (spec 2026-08-27 §10). No HOME mutation: the trust store, the
-//! sessions root and the tempo path are explicit inputs.
+//! sessions root and the tempo path are explicit inputs. The harness itself
+//! is `support::sessions`, shared with the HTTP suite.
 #![cfg(unix)]
-#![expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helpers outside #[test] fns are not covered by allow-*-in-tests"
-)]
 
-use std::os::unix::fs::PermissionsExt;
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 use coretempo_core::bus::EventBus;
@@ -19,186 +14,8 @@ use coretempo_core::pty::{AgentEnv, PtyManager, PtyRoster};
 use coretempo_core::sessions::manager::{SessionManager, SessionManagerInputs};
 use coretempo_core::sessions::{SessionError, SessionStore, SessionsRoot};
 use coretempo_core::trust::{TrustPolicy, TrustStore};
-use coretempo_core::types::{
-    AgentId, AgentState, CreateSessionRequest, EventPayload, ProjectId, SessionState, Token,
-    WorktreeStatus,
-};
-
-const DEADLINE: Duration = Duration::from_secs(10);
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-struct Harness {
-    root: PathBuf,
-    repo: PathBuf,
-    argv_log: PathBuf,
-    trust: TrustStore,
-    bus: EventBus,
-    mgr: Arc<SessionManager>,
-}
-
-/// The fake `claude`: appends its argv and cwd to `argv_log`, prints
-/// `booted`, echoes `got:<line>`, exits 3 on `quit`.
-fn write_fake(dir: &Path, argv_log: &Path) -> PathBuf {
-    let path = dir.join("fake-claude.sh");
-    let script = format!(
-        "#!/usr/bin/env bash\n\
-         {{ printf 'cwd=%s\\n' \"$PWD\"; printf '%s\\n' \"$@\"; printf -- '===ARGV===\\n'; }} \
-         >> '{log}'\n\
-         printf 'booted\\n'\n\
-         while IFS= read -r line; do\n\
-         \x20 case \"$line\" in quit) exit 3 ;; *) printf 'got:%s\\n' \"$line\" ;; esac\n\
-         done\n",
-        log = argv_log.display()
-    );
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
-async fn harness(name: &str) -> Harness {
-    harness_with(name, true).await
-}
-
-/// `trusted = false` leaves the repo root without a trust key.
-async fn harness_with(name: &str, trusted: bool) -> Harness {
-    let root =
-        std::env::temp_dir().join(format!("coretempo-sessions-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    let repo = root.join("repo");
-    std::fs::create_dir_all(repo.join("pkg")).unwrap();
-    // Git tracks no empty directories: without a file under pkg/ a worktree
-    // of this repo has no pkg/, and a `cwd = "pkg"` worktree session fails.
-    std::fs::write(repo.join("pkg/.keep"), "").unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    std::fs::write(repo.join("README"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    let repo = std::fs::canonicalize(&repo).unwrap();
-    let argv_log = root.join("argv.txt");
-    let fake = write_fake(&root, &argv_log);
-    let trust = TrustStore::at(root.join("claude.json"));
-    if trusted {
-        trust.grant(std::slice::from_ref(&repo)).unwrap();
-    }
-    let sessions_root = SessionsRoot::at(root.join("sessions"));
-    std::fs::create_dir_all(&sessions_root.dir).unwrap();
-    let store = SessionStore::open(&sessions_root.db()).unwrap();
-    let bus = EventBus::new();
-    let pty = PtyManager::new_with_program(
-        PtyRoster::empty(Duration::from_millis(100)),
-        bus.clone(),
-        AgentEnv {
-            port: 4821,
-            token: Token("ab".repeat(32)),
-            tempo_bin_dir: PathBuf::from("/usr/bin"),
-            credential_store: None,
-        },
-        fake.to_str().unwrap(),
-    );
-    let mgr = SessionManager::boot(SessionManagerInputs {
-        root: sessions_root,
-        store,
-        pty,
-        bus: bus.clone(),
-        trust_store: trust.clone(),
-        policy: TrustPolicy { grant: false },
-        tempo_bin: PathBuf::from("/usr/bin/tempo"),
-        operator_token: Token("ab".repeat(32)),
-    })
-    .await
-    .unwrap();
-    Harness {
-        root,
-        repo,
-        argv_log,
-        trust,
-        bus,
-        mgr,
-    }
-}
-
-/// A session in the project root: no worktree, no prompt, all defaults.
-fn plain_req(project: &ProjectId) -> CreateSessionRequest {
-    CreateSessionRequest {
-        project: project.clone(),
-        worktree: false,
-        cwd: None,
-        title: None,
-        prompt: None,
-        model: None,
-        permission_mode: None,
-        isolated_config: false,
-    }
-}
-
-impl Harness {
-    async fn project(&self) -> ProjectId {
-        self.mgr
-            .register_project(&self.repo, None)
-            .await
-            .unwrap()
-            .id
-    }
-
-    /// Simulates the `SessionStart` hook.
-    fn hook_idle(&self, id: &AgentId) {
-        self.mgr.pty().report_state(id, AgentState::Idle).unwrap();
-    }
-
-    async fn wait_state(&self, id: &AgentId, want: AgentState) {
-        let mut rx = self.mgr.pty().subscribe_state_debounced(id).unwrap();
-        tokio::time::timeout(DEADLINE, rx.wait_for(|s| *s == want))
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for {want:?}"))
-            .unwrap();
-    }
-
-    fn argv(&self) -> Vec<Vec<String>> {
-        let text = std::fs::read_to_string(&self.argv_log).unwrap_or_default();
-        text.split("===ARGV===\n")
-            .filter(|b| !b.is_empty())
-            .map(|b| {
-                b.lines()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .collect()
-    }
-
-    async fn wait_argv(&self, spawns: usize) {
-        let deadline = tokio::time::Instant::now() + DEADLINE;
-        while self.argv().len() < spawns {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "spawn {spawns} never recorded"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-}
+use coretempo_core::types::{AgentState, EventPayload, SessionState, Token, WorktreeStatus};
+use support::sessions::{DEADLINE, git, harness, harness_with, plain_req};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plain_session_spawns_in_the_project_root_with_the_session_recipe() {

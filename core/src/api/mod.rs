@@ -5,6 +5,7 @@ pub mod agents;
 pub mod auth;
 pub mod messages;
 pub mod pty;
+pub mod sessions;
 pub mod sse;
 pub mod trigger;
 

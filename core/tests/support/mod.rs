@@ -6,6 +6,8 @@
 )]
 
 pub mod run;
+#[cfg(unix)]
+pub mod sessions;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
@@ -402,6 +404,28 @@ pub fn temp_path(name: &str) -> PathBuf {
         "coretempo-api-test-{}-{n}-{name}",
         std::process::id()
     ))
+}
+
+/// Standard base64 (RFC 4648) decoder for PTY-stream assertions: test-local,
+/// so an assertion verifies bytes rather than trusting our own encoder. A
+/// character outside the alphabet (the `=` padding included) ends the decode.
+pub fn b64_decode(s: &str) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        let Some(v) = TABLE.iter().position(|t| *t == c) else {
+            break;
+        };
+        acc = (acc << 6) | u32::try_from(v).unwrap_or_default();
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    out
 }
 
 fn agent_config() -> AgentConfig {
