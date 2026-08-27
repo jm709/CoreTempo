@@ -1,4 +1,4 @@
-import type { AgentState, MessageRecord } from "./types";
+import type { AgentExit, AgentState, MessageRecord } from "./types";
 
 // Spec §9.3: ● working (pulsing) · ◌ idle · ◐ starting · ✕ dead. Restarting reuses ◐.
 export const STATE_GLYPHS: Record<AgentState, string> = {
@@ -11,6 +11,14 @@ export const STATE_GLYPHS: Record<AgentState, string> = {
 
 export function stateLabel(s: AgentState): string {
   return s === "exited" ? "dead" : s;
+}
+
+// Pane overlay for a dead agent: `exited 3`, or `killed: Terminated` when a
+// signal ended it; `exited ?` while the snapshot has not caught up.
+export function exitLabel(exit: AgentExit | null): string {
+  if (exit === null) return "exited ?";
+  if ("signal" in exit) return `killed: ${exit.signal}`;
+  return `exited ${exit.code}`;
 }
 
 // Spec §9.3 lifecycle: ○ → ⟳ ∅0|✓ ; codes render as mono chips ∅0/∅1.
@@ -36,11 +44,14 @@ export function originAgent(from: string): string | null {
 export function originLabel(from: string): string {
   const agent = originAgent(from);
   if (agent !== null) return agent;
-  return from === "user" ? "you" : "external";
+  if (from === "user") return "you";
+  return from.startsWith("trigger:") ? "trigger" : "external";
 }
 
+// Anything that entered over the API rather than from an agent or the in-process
+// user: a plain HTTP message or a flow kickoff.
 export function isExternal(from: string): boolean {
-  return from.startsWith("http:");
+  return from.startsWith("http:") || from.startsWith("trigger:");
 }
 
 // Chat = the feed filtered to human ↔ agent (spec §9.2). `to` is always an agent,

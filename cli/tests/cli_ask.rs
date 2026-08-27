@@ -78,6 +78,32 @@ fn reply_code_1_exits_1_failed_exits_2() -> anyhow::Result<()> {
 }
 
 #[test]
+fn failed_ask_prints_the_records_reason() -> anyhow::Result<()> {
+    let failed_with_reason = concat!(
+        "{\"id\":\"m-b7c2aaaa\",\"kind\":\"ask\",\"from\":\"agent:planner\",",
+        "\"to\":\"builder\",\"body\":\"b\",\"status\":\"failed\",\"code\":null,",
+        "\"reply\":null,\"created_at\":\"2026-08-01T17:03:11Z\",",
+        "\"injected_at\":null,\"completed_at\":null,",
+        "\"reason\":\"agent 'b' has been waiting on a Claude Code permission \
+         dialog for Bash(perl …) for 90 s\",",
+        "\"reason_code\":\"blocked_on_permission\"}"
+    )
+    .to_string();
+    let srv = serve(vec![
+        (201, record_json("m-b7c2aaaa", "ask", "queued", None, None)),
+        (200, failed_with_reason),
+    ])?;
+    let out = tempo(&["ask", "builder", "done?"], srv.port, None)?;
+    assert_eq!(exit_code(&out), 2);
+    assert!(
+        stderr(&out).contains("Bash(perl"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    Ok(())
+}
+
+#[test]
 fn wait_flags_override_the_default() -> anyhow::Result<()> {
     // --no-wait as a human: single request, id printed.
     let srv = serve(vec![(

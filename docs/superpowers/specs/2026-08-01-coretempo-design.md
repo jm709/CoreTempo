@@ -93,8 +93,9 @@ enum, so frontend code is portable to a future remote UI.
   restarted before completion, or ask TTL expired).
 - `code`: 0 | 1, set by the reply. `code`/`reply` are null until `replied`.
 - `from` is derived server-side from auth context (`agent:<id>` via
-  `X-CoreTempo-Agent`, `user` for in-process UI, `http:<req-id>` otherwise) —
-  never trusted from the request body.
+  `X-CoreTempo-Agent`, `user` for in-process UI, `http:<req-id>` otherwise;
+  flow kickoffs are minted internally as `trigger:<hex>`, contracts
+  amendment 38) — never trusted from the request body.
 - Ask TTL: per-workflow `ask_timeout_minutes` (default 30). Expiry moves the
   message to `failed`, emits an event, and decrements the asker's pending count.
 
@@ -267,9 +268,9 @@ the fix) — the CLI prints them verbatim to the calling agent.
 - **PTY output is never on this bus.** `GET /v1/agents/{id}/pty` streams
   base64-encoded raw chunks (`{"seq":N,"b64":"…"}`) with ring-buffer replay on
   connect. Base64 because split escape sequences / partial UTF-8 must survive
-  transit. Resume caveat: `Last-Event-ID` (chunk-start cursor) re-delivers the
-  final chunk; byte-exact resume uses `?since=<start+len>`. The in-process
-  Tauri channel path is cursor-exact.
+  transit. `seq` is the chunk's first byte; the SSE `id:` is the cursor to
+  resume at (`start + len`), so `Last-Event-ID` and `?since=` both resume
+  byte-exactly. The in-process Tauri channel path is cursor-exact too.
 
 ### 6.5 Auth & security
 
@@ -281,8 +282,10 @@ the fix) — the CLI prints them verbatim to the calling agent.
   `~/.coretempo/runs/<run_id>/api.json` + `current` symlink (also solves
   multi-run port discovery — `tempo` never scans ports).
 - Reject non-JSON `Content-Type` (`415`) and validate `Host` — kills browser
-  preflight-less requests and DNS rebinding. No CORS headers by default;
-  `[server] allowed_origins` config exists for a future remote UI.
+  preflight-less requests and DNS rebinding. No CORS support at all: the API
+  never emits CORS headers and has no config to make it. A browser caller
+  reaches it same-origin, or through a reverse proxy that serves the API under
+  the page's own origin and rewrites `Host` to one the API accepts.
 - Default bind `127.0.0.1`. Non-loopback bind requires an explicitly
   provisioned token (env or `token_file`) or the daemon refuses to start. No
   TLS in the daemon — remote exposure goes behind Caddy/nginx/Tailscale.

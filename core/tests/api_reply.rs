@@ -78,20 +78,41 @@ fn wrong_replier_403_send_409_bad_code_400() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An HTTP-origin ask to `to`. No `X-CoreTempo-Agent` header ⇒ `Origin::Http`.
-fn create_http_ask_to(srv: &support::TestServer, to: &str) -> anyhow::Result<String> {
+/// An HTTP-origin ask to `builder`, created the way a UI or script does. No
+/// `X-CoreTempo-Agent` header ⇒ `Origin::Http`, but no flow trigger bound a
+/// contract to it.
+fn create_http_ask(srv: &support::TestServer) -> anyhow::Result<String> {
     let (_, body) = srv.post(
         "/v1/messages",
         None,
-        &json!({"to": to, "kind": "ask", "body": "translate"}),
+        &json!({"to": "builder", "kind": "ask", "body": "translate"}),
     )?;
     Ok(body["id"].as_str().unwrap_or_default().to_string())
 }
 
-/// The kickoff shape the webhook trigger creates: an HTTP-origin ask to the
-/// contract's target agent.
-fn create_http_ask(srv: &support::TestServer) -> anyhow::Result<String> {
-    create_http_ask_to(srv, "builder")
+/// Fires the `hook` flow and returns the kickoff ask it creates. This is the
+/// path that binds the flow's output contract to the kickoff (multi-flow
+/// spec §5), so every schema test goes through it.
+fn fire_kickoff(srv: &support::TestServer) -> anyhow::Result<String> {
+    let (status, text) = srv.post_raw(support::RawPost {
+        path: "/v1/flows/hook/trigger",
+        content_type: Some("text/plain"),
+        body: b"translate",
+        token: None,
+    })?;
+    anyhow::ensure!(status == 202, "trigger not accepted ({status}): {text}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (_, body) = srv.get("/v1/messages", None)?;
+        if let Some(id) = body["messages"][0]["id"].as_str() {
+            return Ok(id.to_string());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the trigger never created its kickoff"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 fn reply_path(id: &str) -> String {
@@ -112,7 +133,7 @@ fn rejections(events: &mut broadcast::Receiver<Event>) -> Vec<(String, String)> 
 #[test]
 fn http_ask_invalid_reply_is_422_with_actionable_body() -> anyhow::Result<()> {
     let srv = support::start_with_output(2)?;
-    let id = create_http_ask(&srv)?;
+    let id = fire_kickoff(&srv)?;
     let mut events = srv.handles.bus.subscribe();
     let (status, body) = srv.post(
         &reply_path(&id),
@@ -151,7 +172,7 @@ fn http_ask_invalid_reply_is_422_with_actionable_body() -> anyhow::Result<()> {
 #[test]
 fn http_ask_valid_reply_after_rejection_succeeds() -> anyhow::Result<()> {
     let srv = support::start_with_output(2)?;
-    let id = create_http_ask(&srv)?;
+    let id = fire_kickoff(&srv)?;
     let (status, _) = srv.post(
         &reply_path(&id),
         Some("builder"),
@@ -172,7 +193,7 @@ fn http_ask_valid_reply_after_rejection_succeeds() -> anyhow::Result<()> {
 #[test]
 fn budget_exhaustion_accepts_the_reply() -> anyhow::Result<()> {
     let srv = support::start_with_output(1)?;
-    let id = create_http_ask(&srv)?;
+    let id = fire_kickoff(&srv)?;
     let invalid = json!({"code": 0, "body": "{\"wrong\":true}"});
     let (status, _) = srv.post(&reply_path(&id), Some("builder"), &invalid)?;
     assert_eq!(status, 422);
@@ -189,7 +210,7 @@ fn budget_exhaustion_accepts_the_reply() -> anyhow::Result<()> {
 #[test]
 fn code_1_bypasses_validation() -> anyhow::Result<()> {
     let srv = support::start_with_output(2)?;
-    let id = create_http_ask(&srv)?;
+    let id = fire_kickoff(&srv)?;
     let (status, body) = srv.post(
         &reply_path(&id),
         Some("builder"),
@@ -216,15 +237,19 @@ fn agent_to_agent_ask_is_not_validated() -> anyhow::Result<()> {
 }
 
 #[test]
-fn http_ask_to_a_non_target_agent_is_not_validated() -> anyhow::Result<()> {
+fn an_http_ask_outside_a_flow_trigger_is_not_validated() -> anyhow::Result<()> {
+    // The contract binds the kickoff, not the agent (multi-flow spec §5): an
+    // HTTP ask to the flow's own target that no trigger fired — a UI message, a
+    // script — bound no contract, so it is ungated. This is what keeps one
+    // flow's schema off another flow's (or an on_start flow's) kickoff.
     let srv = support::start_with_output(2)?;
-    let id = create_http_ask_to(&srv, "planner")?; // HTTP origin, but not the target
+    let id = create_http_ask(&srv)?;
     let (status, body) = srv.post(
         &reply_path(&id),
-        Some("planner"),
+        Some("builder"),
         &json!({"code": 0, "body": "not json at all"}),
     )?;
-    assert_eq!(status, 200, "the contract binds its target agent only");
+    assert_eq!(status, 200, "an unbound kickoff is not schema-gated");
     assert_eq!(body["status"], "replied");
     Ok(())
 }
@@ -232,7 +257,7 @@ fn http_ask_to_a_non_target_agent_is_not_validated() -> anyhow::Result<()> {
 #[test]
 fn max_repairs_zero_validates_once_never_reasks() -> anyhow::Result<()> {
     let srv = support::start_with_output(0)?;
-    let id = create_http_ask(&srv)?;
+    let id = fire_kickoff(&srv)?;
     let (status, body) = srv.post(
         &reply_path(&id),
         Some("builder"),
@@ -246,7 +271,7 @@ fn max_repairs_zero_validates_once_never_reasks() -> anyhow::Result<()> {
 #[test]
 fn fenced_but_valid_reply_is_accepted() -> anyhow::Result<()> {
     let srv = support::start_with_output(2)?;
-    let id = create_http_ask(&srv)?;
+    let id = fire_kickoff(&srv)?;
     let fenced = "```json\n{\"name\":\"ada\"}\n```";
     let (status, body) = srv.post(
         &reply_path(&id),

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { recordedRun, snapshotMidRun, snapshotRunning } from "./fixtures/recorded";
-import { agentsState, resetAgents } from "./state/agents.svelte";
+import { agentsState, resetAgents, setAgents } from "./state/agents.svelte";
 import { messagesState, resetMessages } from "./state/messages.svelte";
 import { resetRun, runState } from "./state/run.svelte";
 import { resetTriggers, triggersState } from "./state/triggers.svelte";
@@ -20,8 +20,9 @@ function seedRosterWith(id: string): void {
   applySnapshot({
     run: null,
     agents: [{
-      id, state: "idle", dir: "/tmp", pending_asks: 0, exit_code: null,
-      model: null, permission_mode: null, auto_clear: true, pty_cursor: 0,
+      id, state: "idle", dir: "/tmp", pending_asks: 0, exit: null,
+      model: null, permission_mode: null, auto_clear: true, isolated_config: false,
+      skills: [], pty_cursor: 0, blocked: false,
     }],
     messages: [], pty_cursors: {}, last_seq: 0, triggers: [],
   });
@@ -47,13 +48,15 @@ describe("wireEvents reduction (recorded stream)", () => {
     expect(agentsState.byId["builder"]?.state).toBe("idle");
     expect(agentsState.byId["planner"]?.state).toBe("idle");
     expect(agentsState.byId["docs"]?.state).toBe("exited");
-    expect(agentsState.byId["docs"]?.exit_code).toBe(1);
+    expect(agentsState.byId["docs"]?.exit).toEqual({ code: 1 });
     expect(messagesState.list.map((m) => [m.id, m.status])).toEqual([
       ["m-a3f91c2e", "replied"],
       ["m-b7c21d0e", "failed"],
     ]);
     expect(messagesState.list[0]?.code).toBe(0);
     expect(messagesState.list[0]?.reply).toBe("Yes, migration 004 applied and tested.");
+    expect(messagesState.list[1]?.reason).toContain("exited");
+    expect(messagesState.list[1]?.reason_code).toBe("agent_exited");
   });
 
   it("drops replayed seqs without corrupting state", () => {
@@ -104,6 +107,49 @@ describe("wireEvents reduction (recorded stream)", () => {
     expect(agentsState.stalled["planner"]).toBe(true);
     applyEvent(mkEvent({ type: "agent.state", agent: "planner", state: "working" }));
     expect(agentsState.stalled["planner"]).toBeUndefined();
+  });
+
+  it("agent.permission_refused keeps the last refusal per agent until a resync", () => {
+    seedRosterWith("planner");
+    applyEvent(mkEvent({
+      type: "agent.permission_refused", agent: "planner", tool: "Bash", input: "python3 -c 1",
+    }));
+    expect(agentsState.refused["planner"]).toEqual({
+      tool: "Bash", input: "python3 -c 1", ts: "2026-08-03T00:00:00Z",
+    });
+    applyEvent(mkEvent({
+      type: "agent.permission_refused", agent: "planner", tool: "Read", input: null,
+    }));
+    expect(agentsState.refused["planner"]?.tool).toBe("Read");
+    setAgents([]); // resync
+    expect(agentsState.refused["planner"]).toBeUndefined();
+  });
+
+  it("agent.blocked carries the tool; clearing and resync drop the entry", () => {
+    seedRosterWith("planner");
+    applyEvent(
+      mkEvent({ type: "agent.blocked", agent: "planner", blocked: true, tool: "Read" }),
+    );
+    expect(agentsState.blocked["planner"]).toBe("Read");
+    applyEvent(
+      mkEvent({ type: "agent.blocked", agent: "planner", blocked: false, tool: null }),
+    );
+    expect(agentsState.blocked["planner"]).toBeUndefined();
+    applyEvent(
+      mkEvent({ type: "agent.blocked", agent: "planner", blocked: true, tool: null }),
+    );
+    expect(agentsState.blocked["planner"]).toBeNull();
+    setAgents([]); // what a resync (bus.reset → snapshot) does
+    expect(agentsState.blocked["planner"]).toBeUndefined();
+  });
+
+  it("setAgents seeds blocked=null for a roster snapshot with blocked: true", () => {
+    setAgents([{
+      id: "planner", state: "working", dir: "/tmp", pending_asks: 0, exit: null,
+      model: null, permission_mode: null, auto_clear: true, isolated_config: false,
+      skills: [], pty_cursor: 0, blocked: true,
+    }]);
+    expect(agentsState.blocked["planner"]).toBeNull();
   });
 
   it("agent.nudged is accepted and does not throw", () => {
@@ -160,9 +206,10 @@ describe("trigger lifecycle reduction", () => {
   it("assembles kickoff → rejection → completion from the stream", () => {
     seedRosterWith("translator");
     const kickoff: MessageRecord = {
-      id: "m-a3f91c2e", kind: "ask", from: "http:11223344", to: "translator",
+      id: "m-a3f91c2e", kind: "ask", from: "trigger:11223344", to: "translator",
       body: "translate this", status: "working", code: null, reply: null,
       created_at: "2026-08-07T10:00:00Z", injected_at: null, completed_at: null,
+      reason: null, reason_code: null,
     };
     applyEvent(mkEvent({ type: "message.created", message: kickoff }));
     applyEvent(mkEvent({

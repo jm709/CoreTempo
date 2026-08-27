@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use sha2::Digest;
 
+use crate::mcp::{McpError, McpSources, resolve_mcp_servers};
 use crate::types::config::{
-    AgentConfig, EdgeKind, FrozenWorkflow, ResolvedServer, ServerOverrides, TriggerConfig,
-    TriggerType, ValidationIssue, WorkflowFile,
+    AgentConfig, EdgeKind, FlowConfig, FrozenFlow, FrozenWorkflow, McpServers, OutputConfig,
+    ResolvedServer, ServerOverrides, TriggerConfig, TriggerType, ValidationIssue, WorkflowFile,
 };
-use crate::types::id::{AgentId, Token};
+use crate::types::id::{AgentId, FlowName, Token};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -38,6 +39,51 @@ pub enum ConfigError {
     NonLoopbackWithoutToken { bind: std::net::IpAddr },
     #[error("cannot determine home directory to expand '~' in agents.{agent}.dir")]
     NoHome { agent: AgentId },
+    #[error("agents.{agent}.mcp: {source}")]
+    Mcp {
+        agent: AgentId,
+        #[source]
+        source: crate::mcp::McpError,
+    },
+    #[error("agents.{agent}.skills: cannot read '{path}' inside a declared skill dir: {source}")]
+    SkillIo {
+        agent: AgentId,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Serde's parse error, plus a rewrite note when the file still uses a key
+/// `CoreTempo` has removed. Deleting a key turns every workflow that set it
+/// into an `unknown field` error, which says what is wrong but not what
+/// replaced it — these notes do.
+fn explain_parse_error(message: &str) -> String {
+    let mut message = message.to_string();
+    // CoreTempo used to read a top-level [trigger]; a file that still
+    // has one deserves the rewrite, not a bare unknown-field error.
+    if message.contains("unknown field `trigger`") && message.contains("`flows`") {
+        message.push_str(
+            "\nCoreTempo no longer reads a top-level [trigger]; workflows \
+             declare named flows instead. Rewrite it as:\n\
+             [flows.main]\n\
+             agents = [\"<every agent this kickoff's work reaches>\"]\n\
+             trigger = { type = \"...\", edge = { to = \"...\", kind = \"...\" } }\n\
+             (message = \"...\" stays inside the trigger table for on_start), \
+             and move [trigger.output] to [flows.main.output].",
+        );
+    }
+    // [server] allowed_origins parsed since day one and was never read (#6).
+    if message.contains("unknown field `allowed_origins`") {
+        message.push_str(
+            "\n[server] allowed_origins was removed: CoreTempo emits no CORS \
+             headers and never did, so the key only ever looked like it worked. \
+             Delete it. A browser on another origin reaches the API through a \
+             reverse proxy that serves it same-origin (the proxy must also \
+             rewrite Host, which the API validates).",
+        );
+    }
+    message
 }
 
 /// Parse + validate tempo.toml text. All problems are reported at once so an agent
@@ -53,7 +99,7 @@ pub fn validate_workflow(text: &str) -> Result<WorkflowFile, Vec<ValidationIssue
         Err(e) => {
             return Err(vec![ValidationIssue {
                 path: String::new(),
-                message: e.to_string(),
+                message: explain_parse_error(&e.to_string()),
             }]);
         }
     };
@@ -109,11 +155,20 @@ pub fn validate_workflow(text: &str) -> Result<WorkflowFile, Vec<ValidationIssue
         }
         validate_edges(&file.agents, id, agent, &mut issues);
         validate_tools(id, agent, &mut issues);
+        validate_allow(id, agent, &mut issues);
+        validate_mcp(id, agent, &mut issues);
+        validate_skills(id, agent, &mut issues);
     }
     validate_loop_cycles(&file.agents, &mut issues);
-    if let Some(trigger) = &file.trigger {
-        validate_trigger(&file.agents, trigger, &mut issues);
+    if !(1..=16).contains(&file.server.max_concurrent_runs) {
+        push(
+            &mut issues,
+            "server.max_concurrent_runs",
+            "must be 1..=16; each live run spawns a flow's full agent roster \
+             (real claude sessions — RAM and token spend), so the default is 2",
+        );
     }
+    validate_flows(&file, &mut issues);
     if issues.is_empty() {
         Ok(file)
     } else {
@@ -217,6 +272,101 @@ fn validate_tools(id: &AgentId, agent: &AgentConfig, issues: &mut Vec<Validation
     }
 }
 
+fn validate_allow(id: &AgentId, agent: &AgentConfig, issues: &mut Vec<ValidationIssue>) {
+    for rule in &agent.allow {
+        if rule.trim().is_empty() {
+            issues.push(ValidationIssue {
+                path: format!("agents.{}.allow", id.0),
+                message: format!(
+                    "allow entry {rule:?} is blank; each entry is a Claude Code permission \
+                     rule written into the agent's settings verbatim, e.g. \"WebSearch\", \
+                     \"WebFetch\", \"Read(//data/**)\" — remove the blank entry"
+                ),
+            });
+        }
+    }
+}
+
+/// Names are checked for shape only; whether each one is declared anywhere is
+/// a load-time question (`resolve_agent_mcp`), since it needs the home dir.
+fn validate_mcp(id: &AgentId, agent: &AgentConfig, issues: &mut Vec<ValidationIssue>) {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &agent.mcp {
+        if name.trim().is_empty() {
+            issues.push(ValidationIssue {
+                path: format!("agents.{}.mcp", id.0),
+                message: format!(
+                    "mcp entry {name:?} is blank; each entry names an MCP server declared \
+                     in .claude.json (under CLAUDE_CONFIG_DIR or HOME), ~/.mcp.json or \
+                     <dir>/.mcp.json, e.g. \"context7\" — remove the blank entry"
+                ),
+            });
+        } else if !seen.insert(name.as_str()) {
+            issues.push(ValidationIssue {
+                path: format!("agents.{}.mcp", id.0),
+                message: format!("mcp entry {name:?} is listed twice; list each server once"),
+            });
+        }
+    }
+}
+
+/// Structural rules for `skills` (spec 2026-08-24 §1). Paths are checked
+/// against the filesystem at freeze (`resolve_skills`), where the tempo.toml
+/// directory is known.
+fn validate_skills(id: &AgentId, agent: &AgentConfig, issues: &mut Vec<ValidationIssue>) {
+    if agent.skills.is_empty() {
+        return;
+    }
+    if !agent.isolated_config {
+        push2(
+            issues,
+            &id.0,
+            "skills",
+            "declared skills reach the agent only through an isolated config dir; \
+             set isolated_config = true or drop skills",
+        );
+    }
+    let mut names: BTreeMap<String, &Path> = BTreeMap::new();
+    for (n, path) in agent.skills.iter().enumerate() {
+        let entry = format!("agents.{}.skills[{n}]", id.0);
+        if path.as_os_str().is_empty() {
+            issues.push(ValidationIssue {
+                path: entry,
+                message: "skill path is empty; point it at a directory holding SKILL.md, \
+                          e.g. \"./skills/handoff\""
+                    .to_string(),
+            });
+            continue;
+        }
+        let Some(name) = path.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+            issues.push(ValidationIssue {
+                path: entry,
+                message: format!(
+                    "skill path '{}' has no directory name; Claude Code keys skills by \
+                     directory name",
+                    path.display()
+                ),
+            });
+            continue;
+        };
+        match names.entry(name) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(path);
+            }
+            std::collections::btree_map::Entry::Occupied(first) => issues.push(ValidationIssue {
+                path: format!("agents.{}.skills", id.0),
+                message: format!(
+                    "two entries are both named '{}' ('{}', '{}'); Claude Code keys \
+                     skills by directory name",
+                    first.key(),
+                    first.get().display(),
+                    path.display()
+                ),
+            }),
+        }
+    }
+}
+
 /// A cycle in the loop-edge subgraph is always-active and never quiescent —
 /// invisible to stall detection (edge-semantics spec). Reject it at freeze.
 fn validate_loop_cycles(
@@ -271,33 +421,122 @@ fn walk_loops(
     done.insert(at.clone());
 }
 
-fn validate_trigger(
-    agents: &BTreeMap<AgentId, AgentConfig>,
-    trigger: &TriggerConfig,
+fn pool_roster(agents: &BTreeMap<AgentId, AgentConfig>) -> String {
+    agents
+        .keys()
+        .map(|a| a.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_flows(file: &WorkflowFile, issues: &mut Vec<ValidationIssue>) {
+    for (name, flow) in &file.flows {
+        if !FlowName::is_valid(&name.0) {
+            issues.push(ValidationIssue {
+                path: format!("flows.{}", name.0),
+                message: format!(
+                    "flow name '{}' must match ^[a-z0-9][a-z0-9_-]{{0,31}}$ \
+                     (lowercase ascii, digits, '_', '-'; max 32 chars)",
+                    name.0
+                ),
+            });
+        }
+        validate_flow_members(&file.agents, name, flow, issues);
+        validate_flow_trigger(name, flow, issues);
+    }
+}
+
+fn validate_flow_members(
+    pool: &BTreeMap<AgentId, AgentConfig>,
+    name: &FlowName,
+    flow: &FlowConfig,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    if !agents.contains_key(&trigger.edge.to) {
-        let roster = agents
-            .keys()
+    let path = format!("flows.{}.agents", name.0);
+    if flow.agents.is_empty() {
+        issues.push(ValidationIssue {
+            path: path.clone(),
+            message: format!(
+                "a flow needs at least one member agent; pool: {}",
+                pool_roster(pool)
+            ),
+        });
+    }
+    let mut seen: std::collections::HashSet<&AgentId> = std::collections::HashSet::new();
+    for member in &flow.agents {
+        if !pool.contains_key(member) {
+            issues.push(ValidationIssue {
+                path: path.clone(),
+                message: format!(
+                    "flow member '{}' is not in the [agents.*] pool ({}); \
+                     fix the name or add the agent",
+                    member.0,
+                    pool_roster(pool)
+                ),
+            });
+        }
+        if !seen.insert(member) {
+            issues.push(ValidationIssue {
+                path: path.clone(),
+                message: format!(
+                    "flow '{name}' lists member '{member}' more than once; each agent id \
+                     may appear once in flows.{name}.agents — delete the duplicate",
+                    name = name.0,
+                    member = member.0,
+                ),
+            });
+        }
+    }
+    // Edge closure: a member's delegation edges must stay inside the flow, or
+    // a subset run would delegate to an agent that was never spawned.
+    for member in &flow.agents {
+        let Some(config) = pool.get(member) else {
+            continue;
+        };
+        for edge in &config.edges {
+            if !flow.agents.contains(&edge.to) {
+                issues.push(ValidationIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "flow '{name}' is not edge-closed: member '{member}' has an \
+                         edge to '{to}', which is not a member; add '{to}' to \
+                         flows.{name}.agents or remove the edge",
+                        name = name.0,
+                        member = member.0,
+                        to = edge.to.0,
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn validate_flow_trigger(name: &FlowName, flow: &FlowConfig, issues: &mut Vec<ValidationIssue>) {
+    let trigger = &flow.trigger;
+    if !flow.agents.contains(&trigger.edge.to) {
+        let members = flow
+            .agents
+            .iter()
             .map(|a| a.0.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         issues.push(ValidationIssue {
-            path: "trigger.edge".to_string(),
+            path: format!("flows.{}.trigger.edge", name.0),
             message: format!(
-                "trigger target '{}' is not in the roster ({roster}); \
-                 fix the name or add the agent",
-                trigger.edge.to.0
+                "trigger target '{}' is not a member of flow '{}' (members: \
+                 {members}); add it to flows.{}.agents or re-aim the edge",
+                trigger.edge.to.0, name.0, name.0
             ),
         });
     }
     if trigger.edge.kind == EdgeKind::Loop {
-        push(
-            issues,
-            "trigger.edge",
-            "a trigger edge cannot be kind 'loop' — loops belong to agents; \
-             use 'ask' (completion = the reply) or 'send' (completion = quiescence)",
-        );
+        issues.push(ValidationIssue {
+            path: format!("flows.{}.trigger.edge", name.0),
+            message: "a trigger edge cannot be kind 'loop' — loops belong to \
+                      agents; use 'ask' (completion = the reply) or 'send' \
+                      (completion = quiescence)"
+                .to_string(),
+        });
     }
     match trigger.trigger_type {
         TriggerType::OnStart => {
@@ -306,69 +545,79 @@ fn validate_trigger(
                 .as_deref()
                 .is_none_or(|m| m.trim().is_empty())
             {
-                push(
-                    issues,
-                    "trigger.message",
-                    "an on_start trigger requires a non-empty message — it is \
-                     the kickoff prompt sent when the run launches",
-                );
+                issues.push(ValidationIssue {
+                    path: format!("flows.{}.trigger.message", name.0),
+                    message: "an on_start trigger requires a non-empty message — \
+                              it is the kickoff prompt sent when the run launches"
+                        .to_string(),
+                });
             }
         }
         TriggerType::Webhook => {
             if trigger.message.is_some() {
-                push(
-                    issues,
-                    "trigger.message",
-                    "a webhook trigger takes no message — the HTTP request body \
-                     is the kickoff message; delete this key",
-                );
+                issues.push(ValidationIssue {
+                    path: format!("flows.{}.trigger.message", name.0),
+                    message: "a webhook trigger takes no message — the HTTP \
+                              request body is the kickoff message; delete this key"
+                        .to_string(),
+                });
             }
         }
     }
-    if let Some(output) = &trigger.output {
-        if trigger.edge.kind == EdgeKind::Send {
-            push(
-                issues,
-                "trigger.output",
-                "an output schema requires edge kind 'ask' — a send kickoff \
-                 completes on quiescence and carries no reply body to validate; \
-                 change kind to 'ask' or delete [trigger.output]",
-            );
-        }
-        if trigger.trigger_type == TriggerType::OnStart {
-            push(
-                issues,
-                "trigger.output",
-                "an output schema requires type 'webhook' — only an HTTP-origin \
-                 kickoff gets the validate-and-repair loop and a caller to \
-                 receive the structured result; change the type or delete \
-                 [trigger.output]",
-            );
-        }
-        match (&output.schema, &output.schema_file) {
-            (Some(_), Some(_)) | (None, None) => push(
-                issues,
-                "trigger.output",
-                "declare exactly one of 'schema' (inline JSON Schema) or \
-                 'schema_file' (path relative to the tempo.toml)",
-            ),
-            (None, Some(path)) if path.as_os_str().is_empty() => push(
-                issues,
-                "trigger.output.schema_file",
-                "schema_file is empty; point it at a JSON Schema file relative \
-                 to the tempo.toml, or use an inline 'schema'",
-            ),
-            (Some(_), None) | (None, Some(_)) => {}
-        }
-        if output.max_repairs > 5 {
-            push(
-                issues,
-                "trigger.output.max_repairs",
-                "max_repairs must be 0..=5 (0 = validate once, never re-ask); \
-                 each repair is one more agent attempt, and a larger budget \
-                 hides an impossible schema instead of failing it",
-            );
-        }
+    if let Some(output) = &flow.output {
+        validate_output_shape(&format!("flows.{}.output", name.0), trigger, output, issues);
+    }
+}
+
+/// The output-contract shape rules for a `[flows.<name>.output]` section.
+/// `path` names the section in every issue so the fix lands in the right place.
+fn validate_output_shape(
+    path: &str,
+    trigger: &TriggerConfig,
+    output: &OutputConfig,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if trigger.edge.kind == EdgeKind::Send {
+        push(
+            issues,
+            path,
+            "an output schema requires edge kind 'ask' — a send kickoff \
+             completes on quiescence and carries no reply body to validate; \
+             change kind to 'ask' or delete the output section",
+        );
+    }
+    if trigger.trigger_type == TriggerType::OnStart {
+        push(
+            issues,
+            path,
+            "an output schema requires type 'webhook' — only an HTTP-origin \
+             kickoff gets the validate-and-repair loop and a caller to receive \
+             the structured result; change the type or delete the output section",
+        );
+    }
+    match (&output.schema, &output.schema_file) {
+        (Some(_), Some(_)) | (None, None) => push(
+            issues,
+            path,
+            "declare exactly one of 'schema' (inline JSON Schema) or \
+             'schema_file' (path relative to the tempo.toml)",
+        ),
+        (None, Some(p)) if p.as_os_str().is_empty() => push(
+            issues,
+            path,
+            "schema_file is empty; point it at a JSON Schema file relative \
+             to the tempo.toml, or use an inline 'schema'",
+        ),
+        (Some(_), None) | (None, Some(_)) => {}
+    }
+    if output.max_repairs > 5 {
+        push(
+            issues,
+            path,
+            "max_repairs must be 0..=5 (0 = validate once, never re-ask); \
+             each repair is one more agent attempt, and a larger budget hides \
+             an impossible schema instead of failing it",
+        );
     }
 }
 
@@ -379,8 +628,9 @@ fn validate_trigger(
 ///
 /// Returns [`ConfigError::Io`] when the file cannot be read or canonicalized,
 /// [`ConfigError::Invalid`] when it is not UTF-8, fails validation, or holds an
-/// unrepresentable duration, and [`ConfigError::NoHome`] when a `~` dir cannot
-/// be expanded.
+/// unrepresentable duration, [`ConfigError::NoHome`] when a `~` dir cannot
+/// be expanded, and [`ConfigError::Mcp`] when an agent's `mcp = [...]` names a
+/// server no source declares (or a source is unreadable/malformed).
 pub fn load_workflow(path: &Path) -> Result<(WorkflowFile, FrozenWorkflow), ConfigError> {
     let bytes = std::fs::read(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
@@ -411,21 +661,40 @@ pub fn load_workflow(path: &Path) -> Result<(WorkflowFile, FrozenWorkflow), Conf
         path: path.to_path_buf(),
         source,
     })?;
-    let output = compile_output(file.trigger.as_ref(), &source_path)?;
-    let hash = match output.as_ref().and_then(|o| o.schema_bytes.as_deref()) {
-        Some(extra) => {
-            let mut all = bytes.clone();
-            all.extend_from_slice(extra);
-            sha256_hex(&all)
-        }
-        None => sha256_hex(&bytes),
-    };
+    let mut hash_input = bytes.clone();
+    let flows = freeze_flows(&file, &source_path, &mut hash_input)?;
+    let base = source_path.parent().unwrap_or_else(|| Path::new("."));
     let mut agents = BTreeMap::new();
     for (id, cfg) in &file.agents {
         let mut cfg = cfg.clone();
         cfg.dir = expand_tilde(&cfg.dir, id)?;
+        cfg.skills = resolve_skills(id, &cfg.skills, base)?;
         agents.insert(id.clone(), cfg);
     }
+    // Each agent's resolved MCP servers join after the schema files, in
+    // agent-id order, framed like them, in canonical JSON: the tool surface is
+    // part of what makes a run reproducible, but a live Claude session
+    // reformats ~/.claude.json on every flush, so raw source bytes would
+    // refuse runs nobody edited (`Run::start_with` and every serve trigger
+    // re-load and compare hashes).
+    let mcp_servers = resolve_agent_mcp(&agents)?;
+    for (id, servers) in &mcp_servers {
+        push_framed(&mut hash_input, id.0.as_bytes());
+        push_framed(&mut hash_input, &crate::mcp::canonical_bytes(servers));
+    }
+    // Skill contents join last (spec 2026-08-24 §5): an isolated agent's skills
+    // are as much its tool surface as its MCP servers, and they live in files
+    // the raw tempo.toml bytes cannot see.
+    for (id, cfg) in &agents {
+        if cfg.skills.is_empty() {
+            continue;
+        }
+        push_framed(&mut hash_input, id.0.as_bytes());
+        for skill in &cfg.skills {
+            hash_skill_dir(id, skill, &mut hash_input)?;
+        }
+    }
+    let hash = sha256_hex(&hash_input);
     let idle_debounce =
         Duration::try_from_secs_f64(file.workflow.idle_debounce_seconds).map_err(|e| {
             ConfigError::Invalid {
@@ -444,28 +713,269 @@ pub fn load_workflow(path: &Path) -> Result<(WorkflowFile, FrozenWorkflow), Conf
         idle_debounce,
         scrollback: file.workflow.scrollback,
         agents,
-        output: output.map(|o| o.contract),
+        mcp_servers,
+        flows,
     };
     Ok((file, frozen))
 }
 
-/// A compiled `[trigger.output]` alongside the bytes the freeze hash must cover.
+/// Compiles every flow, folding each `schema_file`'s bytes into `hash_input`
+/// in flow-name order (`BTreeMap` iteration), length-framed.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Invalid`] when a flow's output declaration does not
+/// compile, and [`ConfigError::Io`] when its `schema_file` cannot be read.
+fn freeze_flows(
+    file: &WorkflowFile,
+    source_path: &Path,
+    hash_input: &mut Vec<u8>,
+) -> Result<BTreeMap<FlowName, FrozenFlow>, ConfigError> {
+    // Flow schema bytes join in flow-name order (BTreeMap iteration), so serve
+    // mode's edit-refusal (`workflow_changed`) covers every external schema.
+    // Each blob is length-framed: concatenated raw, two adjacent schema files
+    // are indistinguishable from any other split of the same bytes, so moving a
+    // byte from the end of one file to the start of the next would not move the
+    // hash.
+    let mut flows = BTreeMap::new();
+    for (name, flow) in &file.flows {
+        let compiled = match &flow.output {
+            Some(output) => Some(compile_contract(
+                name,
+                &flow.trigger.edge.to,
+                output,
+                source_path,
+            )?),
+            None => None,
+        };
+        if let Some(extra) = compiled.as_ref().and_then(|o| o.schema_bytes.as_deref()) {
+            push_framed(hash_input, name.0.as_bytes());
+            push_framed(hash_input, extra);
+        }
+        flows.insert(
+            name.clone(),
+            FrozenFlow {
+                members: flow.agents.iter().cloned().collect(),
+                trigger_type: flow.trigger.trigger_type,
+                edge: flow.trigger.edge.clone(),
+                message: flow.trigger.message.clone(),
+                output: compiled.map(|o| o.contract),
+            },
+        );
+    }
+    Ok(flows)
+}
+
+/// Appends `blob` to the freeze-hash input behind its own length, so no two
+/// different sequences of blobs can build the same input.
+fn push_framed(hash_input: &mut Vec<u8>, blob: &[u8]) {
+    hash_input.extend_from_slice(&(blob.len() as u64).to_be_bytes());
+    hash_input.extend_from_slice(blob);
+}
+
+/// Turns each declared skill path into an absolute one — `~` expanded,
+/// relative paths joined onto the tempo.toml directory — and checks it is a
+/// directory holding `SKILL.md`. Lexically normalized (`./` components
+/// dropped, so the frozen path reads cleanly) but not canonicalized: the
+/// declared basename is the skill name Claude Code will show, even when the
+/// directory is a symlink.
+fn resolve_skills(
+    id: &AgentId,
+    declared: &[PathBuf],
+    base: &Path,
+) -> Result<Vec<PathBuf>, ConfigError> {
+    let mut resolved = Vec::with_capacity(declared.len());
+    for (n, path) in declared.iter().enumerate() {
+        let expanded = expand_home(path).ok_or_else(|| {
+            skill_issue(
+                id,
+                n,
+                "cannot determine the home directory to expand '~'".to_string(),
+            )
+        })?;
+        let absolute: PathBuf = if expanded.is_absolute() {
+            expanded
+        } else {
+            base.join(expanded)
+        }
+        .components()
+        .collect();
+        if !is_dir(id, &absolute)? {
+            return Err(skill_issue(
+                id,
+                n,
+                format!(
+                    "'{}' is not a directory (relative to '{}')",
+                    absolute.display(),
+                    base.display()
+                ),
+            ));
+        }
+        if !is_file(id, &absolute.join("SKILL.md"))? {
+            return Err(skill_issue(
+                id,
+                n,
+                format!(
+                    "'{}' has no SKILL.md; a skill is a directory whose SKILL.md carries \
+                     the frontmatter",
+                    absolute.display()
+                ),
+            ));
+        }
+        resolved.push(absolute);
+    }
+    Ok(resolved)
+}
+
+/// `Path::is_dir` reads any failure as "no": an unreadable parent would be
+/// reported as a missing skill. Only not-found is "no" here; every other
+/// failure is a [`ConfigError::SkillIo`] naming the path.
+fn is_dir(id: &AgentId, path: &Path) -> Result<bool, ConfigError> {
+    stat(id, path).map(|meta| meta.is_some_and(|m| m.is_dir()))
+}
+
+fn is_file(id: &AgentId, path: &Path) -> Result<bool, ConfigError> {
+    stat(id, path).map(|meta| meta.is_some_and(|m| m.is_file()))
+}
+
+fn stat(id: &AgentId, path: &Path) -> Result<Option<std::fs::Metadata>, ConfigError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(skill_io(id, path, source)),
+    }
+}
+
+fn skill_io(id: &AgentId, path: &Path, source: std::io::Error) -> ConfigError {
+    ConfigError::SkillIo {
+        agent: id.clone(),
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn skill_issue(id: &AgentId, n: usize, message: String) -> ConfigError {
+    let issue = ValidationIssue {
+        path: format!("agents.{}.skills[{n}]", id.0),
+        message,
+    };
+    ConfigError::Invalid {
+        summary: format!("{}: {}", issue.path, issue.message),
+        issues: vec![issue],
+    }
+}
+
+/// Frames the skill's name, its file count, then every regular file under
+/// it as (sorted relative path, bytes): a byte moved between two files moves
+/// the hash, and the count keeps one skill's trailing files from reading as
+/// the next skill's leading frames. Only regular files and directories are
+/// walked — a symlink or any other entry fails the load naming it, so
+/// nothing outside the tree is hashed and a cycle cannot occur. Each file is
+/// read whole: skills are small text trees, and the load runs once per run.
+fn hash_skill_dir(id: &AgentId, root: &Path, hash_input: &mut Vec<u8>) -> Result<(), ConfigError> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = root.file_name().unwrap_or_default();
+    push_framed(hash_input, name.as_bytes());
+    let mut files = Vec::new();
+    collect_regular_files(id, root, root, &mut files)?;
+    files.sort();
+    push_framed(hash_input, &(files.len() as u64).to_be_bytes());
+    for rel in files {
+        let path = root.join(&rel);
+        let bytes = std::fs::read(&path).map_err(|source| skill_io(id, &path, source))?;
+        push_framed(hash_input, rel.as_os_str().as_bytes());
+        push_framed(hash_input, &bytes);
+    }
+    Ok(())
+}
+
+fn collect_regular_files(
+    id: &AgentId,
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), ConfigError> {
+    let listing = std::fs::read_dir(dir).map_err(|source| skill_io(id, dir, source))?;
+    for entry in listing {
+        let path = entry.map_err(|source| skill_io(id, dir, source))?.path();
+        let kind = std::fs::symlink_metadata(&path)
+            .map_err(|source| skill_io(id, &path, source))?
+            .file_type();
+        if kind.is_dir() {
+            collect_regular_files(id, root, &path, out)?;
+        } else if kind.is_file() {
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            out.push(rel);
+        } else {
+            let issue = ValidationIssue {
+                path: format!("agents.{}.skills", id.0),
+                message: format!(
+                    "'{}' inside a declared skill is not a regular file or directory \
+                     (a symlink?); skills are plain file trees — replace it with a copy",
+                    path.display()
+                ),
+            };
+            return Err(ConfigError::Invalid {
+                summary: format!("{}: {}", issue.path, issue.message),
+                issues: vec![issue],
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Resolves every agent's `mcp = [...]` against the user's declarations. Agents
+/// with no names are skipped entirely — no source file is read for them.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Mcp`] when the home directory is unknown or an
+/// agent's names cannot be resolved.
+fn resolve_agent_mcp(
+    agents: &BTreeMap<AgentId, AgentConfig>,
+) -> Result<BTreeMap<AgentId, McpServers>, ConfigError> {
+    let mut resolved = BTreeMap::new();
+    let Some((first_id, _)) = agents.iter().find(|(_, cfg)| !cfg.mcp.is_empty()) else {
+        return Ok(resolved);
+    };
+    let sources = McpSources::from_env().ok_or_else(|| ConfigError::Mcp {
+        agent: first_id.clone(),
+        source: McpError::NoHome,
+    })?;
+    for (id, cfg) in agents {
+        if cfg.mcp.is_empty() {
+            continue;
+        }
+        let servers = resolve_mcp_servers(&sources, &cfg.dir, &cfg.mcp).map_err(|source| {
+            ConfigError::Mcp {
+                agent: id.clone(),
+                source,
+            }
+        })?;
+        resolved.insert(id.clone(), servers);
+    }
+    Ok(resolved)
+}
+
+/// A compiled output declaration alongside the bytes the freeze hash must cover.
 struct FrozenOutput {
     contract: Arc<crate::schema::OutputContract>,
     /// `Some` when the schema came from a `schema_file`.
     schema_bytes: Option<Vec<u8>>,
 }
 
-/// Compiles `[trigger.output]` when declared. A `schema_file`'s bytes join the
-/// tempo.toml bytes in the freeze hash, so editing an external schema is an
-/// edit to the workflow.
-fn compile_output(
-    trigger: Option<&TriggerConfig>,
+/// Compiles one output declaration; the returned `schema_bytes` are `Some`
+/// when the schema came from a `schema_file`, so the caller can fold them
+/// into the freeze hash — editing an external schema is an edit to the
+/// workflow.
+fn compile_contract(
+    flow: &FlowName,
+    target: &AgentId,
+    output: &OutputConfig,
     source_path: &Path,
-) -> Result<Option<FrozenOutput>, ConfigError> {
-    let Some((trigger, output)) = trigger.and_then(|t| t.output.as_ref().map(|o| (t, o))) else {
-        return Ok(None);
-    };
+) -> Result<FrozenOutput, ConfigError> {
+    let issue_path = format!("flows.{}.output", flow.0);
+    let issue_path = issue_path.as_str();
     let mut schema_bytes: Option<Vec<u8>> = None;
     let schema = match (&output.schema, &output.schema_file) {
         (Some(inline), None) => inline.clone(),
@@ -473,47 +983,59 @@ fn compile_output(
             let base = source_path.parent().unwrap_or_else(|| Path::new("."));
             let absolute = base.join(relative);
             let bytes = std::fs::read(&absolute).map_err(|e| {
-                invalid_output(format!(
-                    "cannot read schema_file '{}': {e}; the path is resolved relative to \
-                     the tempo.toml — create the file or fix the path",
-                    absolute.display()
-                ))
+                invalid_output(
+                    issue_path,
+                    format!(
+                        "cannot read schema_file '{}': {e}; the path is resolved \
+                         relative to the tempo.toml — create the file or fix the path",
+                        absolute.display()
+                    ),
+                )
             })?;
             let value = serde_json::from_slice(&bytes).map_err(|e| {
-                invalid_output(format!(
-                    "schema_file '{}' is not valid JSON: {e}",
-                    absolute.display()
-                ))
+                invalid_output(
+                    issue_path,
+                    format!(
+                        "schema_file '{}' is not valid JSON: {e}",
+                        absolute.display()
+                    ),
+                )
             })?;
             schema_bytes = Some(bytes);
             value
         }
         // validate_workflow already rejected both sources and neither.
-        (Some(_), Some(_)) | (None, None) => return Err(unresolved_schema_source()),
+        (Some(_), Some(_)) | (None, None) => return Err(unresolved_schema_source(issue_path)),
     };
-    let target = trigger.edge.to.clone();
-    let contract = crate::schema::OutputContract::compile(schema, target, output.max_repairs)
-        .map_err(|e| invalid_output(format!("trigger.output schema: {e}")))?;
-    Ok(Some(FrozenOutput {
+    let contract = crate::schema::OutputContract::compile(
+        schema,
+        flow.clone(),
+        target.clone(),
+        output.max_repairs,
+    )
+    .map_err(|e| invalid_output(issue_path, format!("output schema: {e}")))?;
+    Ok(FrozenOutput {
         contract: Arc::new(contract),
         schema_bytes,
-    }))
+    })
 }
 
-fn invalid_output(message: String) -> ConfigError {
+fn invalid_output(path: &str, message: String) -> ConfigError {
+    let summary = format!("{path}: {message}");
     ConfigError::Invalid {
         issues: vec![ValidationIssue {
-            path: "trigger.output".to_string(),
-            message: message.clone(),
+            path: path.to_string(),
+            message,
         }],
-        summary: message,
+        summary,
     }
 }
 
 /// `validate_workflow` guarantees exactly one schema source, so this is a
 /// `CoreTempo` bug — reported as one rather than panicking mid-load.
-fn unresolved_schema_source() -> ConfigError {
+fn unresolved_schema_source(path: &str) -> ConfigError {
     invalid_output(
+        path,
         "internal: schema source not resolved despite validation; report this".to_string(),
     )
 }
@@ -680,7 +1202,7 @@ impl FrozenWorkflow {
              Use the `tempo` CLI (already on your PATH):\n\
              \n\
              - tempo ask <agent> \"<message>\" — ask a question. It prints a message id \
-             (like m-a3f91c2e) and returns immediately. End your turn after asking; the \
+             (like m-a3f91c2e5d0b7f14) and returns immediately. End your turn after asking; the \
              reply arrives later as a new prompt starting with: \
              [CoreTempo reply to <id> from <agent> — code 0|1] <reply body>\n\
              - tempo send <agent> \"<message>\" — fire-and-forget; no reply will come.\n\
@@ -692,6 +1214,10 @@ impl FrozenWorkflow {
              failure), then continue with any follow-up work.\n\
              Prompts starting with [CoreTempo <id> from <sender>] without 'reply expected' \
              need no reply.\n\
+             A header that also names a flow — [CoreTempo <id> from http, flow <name> — \
+             reply expected] — is that flow's kickoff: if an output contract for <name> \
+             appears below, your code-0 reply to it MUST match that flow's schema. A \
+             header without a flow is not a kickoff and owes no contract.\n\
              Never invent message ids; only reply to ids you actually received.\n\
              Never send acknowledgements, sign-offs, or thanks. If a message requires no \
              new work from you, do nothing and end your turn.\n\
@@ -744,8 +1270,10 @@ impl FrozenWorkflow {
                  you must perform these, in order:{steps}\nDo not skip these steps."
             );
         }
-        if let Some(contract) = self.output.as_ref().filter(|c| c.target == *agent) {
-            push_output_contract(&mut prompt, contract);
+        for (name, flow) in &self.flows {
+            if let Some(contract) = flow.output.as_ref().filter(|c| c.target == *agent) {
+                push_output_contract(&mut prompt, name, contract);
+            }
         }
         Some(prompt)
     }
@@ -754,21 +1282,37 @@ impl FrozenWorkflow {
 /// Appends the schema block that tells the trigger's target agent how to shape
 /// its HTTP-origin reply — the counterpart the router's validate-and-repair
 /// loop (Task 6) enforces against.
-fn push_output_contract(prompt: &mut String, contract: &crate::schema::OutputContract) {
+///
+/// Each block names its flow: two flows may contract the same agent, and a
+/// whole-pool run composes every one of them into that agent's prompt. Runtime
+/// binding is per kickoff (`Router::bind_kickoff_contract`), so only one applies
+/// to any given reply — and since amendment 31 the kickoff's own header names
+/// its flow, so the block tells the agent to match the two by name rather than
+/// to guess and repair off the rejection.
+fn push_output_contract(
+    prompt: &mut String,
+    flow: &FlowName,
+    contract: &crate::schema::OutputContract,
+) {
     use std::fmt::Write as _;
 
     let schema = serde_json::to_string_pretty(&contract.schema).unwrap_or_default();
     let _ = write!(
         prompt,
-        "\n\nOutput contract — when you reply to an ask whose sender is \
-         an http caller, the reply body MUST be a single JSON value \
-         matching this JSON Schema:\n{schema}\nReply with ONLY the JSON \
-         — no prose, no markdown fences. The reliable way: write the \
-         JSON to a file, then run `tempo reply <id> --code 0 \
-         --json-file <path>`. A reply that does not match is rejected \
-         with the validation errors; fix the JSON and reply again. If \
-         you cannot produce this shape, reply with --code 1 and a \
-         plain-text explanation instead."
+        "\n\nOutput contract for flow '{flow}' — when an http caller \
+         kicks off the '{flow}' flow, your code-0 reply to its ask MUST \
+         be a single JSON value matching this JSON Schema:\n{schema}\n\
+         Reply with ONLY the JSON — no prose, no markdown fences. The \
+         reliable way: write the JSON to a file, then run `tempo reply \
+         <id> --code 0 --json-file <path>`. Only '{flow}' kickoffs are \
+         held to this schema; other asks you receive are not. That \
+         kickoff's prompt names its flow — it starts \
+         [CoreTempo <id> from http, flow {flow} — reply expected] — so \
+         use this schema for that ask and no other. If a reply is \
+         rejected anyway, repair it against the validation errors in the \
+         rejection. If you cannot produce this shape, reply with --code \
+         1 and a plain-text explanation instead.",
+        flow = flow.0,
     );
 }
 

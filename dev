@@ -5,6 +5,7 @@
 #   ./dev headless     coretempod against ./tempo.toml
 #   ./dev headless F   coretempod against workflow file F
 #   ./dev check        every gate: rust tests, clippy, fmt, svelte-check, lint, vitest, client tsc/oxlint/vitest
+#   ./dev live         the real-claude round trip (#3): needs a logged-in claude, spends tokens
 #
 # The desktop app embeds the backend: Tauri starts vite (via beforeDevCommand in
 # tauri.conf.json) and the Rust core runs in-process. There is no separate
@@ -95,12 +96,21 @@ run_check() {
   printf '\nall gates passed\n'
 }
 
+run_live() {
+  cd "$ROOT"
+  printf '==> cargo build --workspace (agents get the tempo beside coretempod)\n'
+  cargo build --workspace
+  printf '==> live claude test\n'
+  cargo test -p coretempo-daemon --test live_claude -- --ignored --nocapture
+}
+
 case "${1:-app}" in
 app) shift $(($# > 0 ? 1 : 0)) && run_app "$@" ;;
 headless) shift && run_headless "$@" ;;
+live) run_live ;;
 check) run_check ;;
 -h | --help | help)
   sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   ;;
-*) die "unknown mode '$1' (expected: app, headless, check)" ;;
+*) die "unknown mode '$1' (expected: app, headless, check, live)" ;;
 esac

@@ -54,7 +54,7 @@ Always compiled (no `server` feature):
 | `router/sinks.rs` | per-origin reply sinks (PTY inject / bus event / long-poll wake) |
 | `router/ttl.rs` | ask TTL sweeper → `failed` |
 | `store/mod.rs` | SQLite (rusqlite bundled, WAL): dedicated writer thread, mpsc commands + oneshot replies |
-| `store/schema.rs` | DDL: `messages`, `runs`, `agent_events` |
+| `store/schema.rs` | DDL: `messages`, `runs` (`agent_events` dropped — amendment 30) |
 | `api/mod.rs` | axum router assembly + serve on resolved bind:port |
 | `api/auth.rs` | bearer-token layer (constant-time), Host validation, JSON content-type guard, `api.json` writer |
 | `api/messages.rs` | `/v1/messages*` handlers incl. `?wait` long-poll |
@@ -181,7 +181,7 @@ pub struct AgentInfo {                  // GET /v1/agents element
     pub id: AgentId,
     pub state: AgentState,              // raw (undebounced) state
     pub pending_asks: u64,              // asks SENT BY this agent, not yet terminal
-    pub exit_code: Option<i32>,         // set only when state == exited
+    pub exit: Option<AgentExit>,        // set only when state == exited (amendment 42)
 }
 
 pub struct AgentDetail {                // GET /v1/agents/{id}
@@ -212,7 +212,7 @@ pub enum EventPayload {
     AgentStateChanged { agent: AgentId, state: AgentState },  // debounced signal is internal-only
 
     #[serde(rename = "agent.lifecycle")]
-    AgentLifecycle { agent: AgentId, phase: LifecyclePhase, exit_code: Option<i32> },
+    AgentLifecycle { agent: AgentId, phase: LifecyclePhase, exit: Option<AgentExit> },
 
     #[serde(rename = "message.created")]
     MessageCreated { message: MessageRecord },          // fat: full record snapshot
@@ -233,7 +233,7 @@ Example wire forms:
 ```json
 {"seq":1,"ts":"2026-08-01T17:00:00Z","type":"run.started","run_id":"r-1f2e3d4c","workflow_name":"core-tempo-dev","started_at":"2026-08-01T17:00:00Z"}
 {"seq":6,"ts":"…","type":"agent.state","agent":"builder","state":"working"}
-{"seq":7,"ts":"…","type":"agent.lifecycle","agent":"docs","phase":"exited","exit_code":1}
+{"seq":7,"ts":"…","type":"agent.lifecycle","agent":"docs","phase":"exited","exit":{"code":1}}
 {"seq":9,"ts":"…","type":"message.created","message":{ …full MessageRecord… }}
 {"seq":12,"ts":"…","type":"message.status","message":{ …full MessageRecord… }}
 {"seq":41,"ts":"…","type":"bus.reset"}
@@ -262,7 +262,6 @@ pub struct WorkflowSection {
 pub struct ServerSection {
     pub bind: Option<IpAddr>,                     // default 127.0.0.1
     pub token_file: Option<PathBuf>,
-    #[serde(default)] pub allowed_origins: Vec<String>,  // future remote UI; empty = no CORS
     pub log: Option<String>,                      // tracing EnvFilter string
 }
 
@@ -399,7 +398,9 @@ pub trait ClearGate: Send + Sync + 'static {
 ### 3.2 Injection templates (exact format strings)
 
 Injection = write the rendered text into the PTY, then `\r` to submit.
-`{sender}` renders `Origin` as: `Agent(id)` → the bare id; `User` → `user`; `Http(_)` → `http`.
+`{sender}` renders `Origin` as: `Agent(id)` → the bare id; `User` → `user`; `Http(_)` and
+`Trigger(_)` → `http` (amendment 38: the trigger variant is an observer-side discriminator; the
+`flow` clause is what the agent reads).
 
 ```text
 ask   → [CoreTempo {id} from {sender} — reply expected] {body}
@@ -410,6 +411,10 @@ send  → [CoreTempo {id} from {sender}] {body}
 
 (ask template is one injection: two lines joined by `\n`. The full protocol primer lives in the
 generated `--append-system-prompt`, not in injections.)
+
+Amendment 31 adds one variant: a **flow kickoff** renders `{sender}` as `{sender}, flow {name}`,
+so `[CoreTempo m-a3f91c2e from http, flow nightly — reply expected] {body}` (and the same clause in
+the `send` template). Nothing else changes position — the id still follows `[CoreTempo `.
 
 ---
 
@@ -946,4 +951,420 @@ frozen alongside the sections above:
     `Origin::Http(<request-id>)` (`core/src/api/auth.rs`), so the UI's kickoff
     correlation can open a lifecycle row for a non-trigger HTTP message until a
     dedicated origin discriminator lands (tracked follow-up; a reload clears
-    such rows since the snapshot reseeds from the hub).
+    such rows since the snapshot reseeds from the hub). *Closed by amendment
+    38: kickoffs carry `Origin::Trigger`.*
+25. **Store run-scoping (multi-flow phase 1, 2026-08-12 spec §3).** `MessageId`
+    is now `m-` + 16 lowercase hex (was 8). `Store::open(path: &Path, run_id:
+    RunId) -> Result<Store, StoreError>` takes the scoping run id; every
+    message and agent event the handle writes is stamped with it.
+    `messages` and `agent_events` gain a nullable `run_id TEXT` column, added
+    in place by `ALTER TABLE` on open for any database that predates it
+    (v1.0.0 databases lack the column); `PRAGMA user_version = 1` marks a
+    database once migrated. `MessageRecord` (the wire shape) is unchanged —
+    `run_id` lives only in the store layer. `Store::pending_to_agent`/
+    `Store::pending_asks` filter on `run_id = ?`, excluding NULL legacy rows,
+    so concurrent runs sharing one database file never sweep each other's
+    traffic and pre-migration rows are inert rather than misattributed.
+    Consequence: non-terminal `messages` rows left by an earlier run —
+    including every pre-migration NULL-`run_id` row — are no longer swept by
+    any later run's restart handling; they stay non-terminal in the shared
+    file until a future reconciliation pass.
+    **Superseded in part by amendment 27**: that pass landed in phase 3 as
+    `Store::reconcile_orphans`, which fails such rows on every open when they
+    carry no `run_id` or belong to a run that stopped cleanly. Rows left by a
+    *crashed* run are still kept, so the "stays non-terminal" wording holds
+    only for those.
+26. **Multi-flow phase 2 (2026-08-12 spec §1–2):** the top-level `[trigger]` is
+    removed. `WorkflowFile` gains `flows: BTreeMap<FlowName, FlowConfig>`
+    (`FlowConfig { agents, trigger, output }`; `TriggerConfig` no longer carries
+    `output`). `AgentConfig` gains `concurrency: exclusive|shared` (default
+    exclusive); `ServerSection` gains `max_concurrent_runs` (default 2, 1..=16,
+    file-only). `FrozenWorkflow` drops `output` and gains
+    `flows: BTreeMap<FlowName, FrozenFlow>` (`members`, `trigger_type`, `edge`,
+    `message`, compiled `output`), `for_flow(&FlowName) -> Option<FrozenWorkflow>`
+    (derived member-subset; hash/source unchanged), and
+    `webhook_output()` (**deleted in amendment 29** — the in-turn repair gate
+    reads a per-kickoff contract instead). The freeze hash covers the
+    tempo.toml bytes plus every flow's `schema_file` bytes in flow-name order.
+    `trigger::startup_kickoff`/`single_webhook_flow` return
+    `Result<Option<...>, String>` and refuse multi-on_start / multi-webhook
+    files until the scheduler and per-flow routes land (**both deleted in
+    amendment 29**, along with `single_on_start_flow` and
+    `conflicting_webhook_output`: nothing auto-fires, so no caller remains).
+    Wire: `WorkflowFile`
+    JSON now carries `flows` and per-agent `concurrency`
+    (`app/src/lib/types.ts` `FlowModel` mirrors it).
+27. **Multi-flow phase 3 (2026-08-12 spec §4–5):** serve schedules flows
+    concurrently. `TriggerHub.in_flight` is keyed by `FlowName`:
+    `try_begin(&FlowName)`, `begin(&FlowName, &str)`, `in_flight(&FlowName)`,
+    `in_flight_by_flow()`; `finish` unchanged. New `core::locks::AgentLocks`
+    (`new(&pool)`, `acquire(&BTreeSet<AgentId>) -> MemberGuards`, sorted
+    acquisition, read=shared/write=exclusive); `ApiContext` gains
+    `agent_locks: Arc<AgentLocks>` (warm lock table, spec §5) and `Run` keeps
+    the same `Arc`: `Run::lock_flow(&FlowName) -> Option<MemberGuards>` is how
+    a warm `on_start` kickoff (bare run and desktop alike) takes that table,
+    holding the guards across the kickoff *and* its watcher, so both warm
+    entry points serialize on an `exclusive` member. Router gains
+    `total_pending_asks_among`/`open_turns_among` (member-scoped quiescence;
+    the unscoped pair is removed). `Run::watch_inputs_for_flow` scopes a
+    watcher to a flow's members + contract. `trigger::single_on_start_flow`
+    mirrors `single_webhook_flow`; `startup_kickoff`'s mixed-file refusal
+    (amendment 26's e70a3f4 follow-up) is narrowed, not removed: the
+    flow-scoped batch watcher resolves disjoint agents and webhook flows
+    with no output contract, but the router's in-turn repair contract stays
+    workflow-wide, so `startup_kickoff` still refuses a webhook output
+    contract whose target agent is also an on_start member (a7b4dcb) until
+    4b's per-kickoff plumbing lifts it. Warm `fire_flow`
+    pre-validates cheap invariants before lock acquisition (sync 4xx:
+    unknown flow 404 `unknown_flow`, on_start 400, payload, per-flow 409);
+    post-lock failures settle asynchronously as `kickoff_rejected`. Serve:
+    `POST /v1/flows/{name}/trigger` added (404 `unknown_flow`); bare
+    `POST /v1/trigger` shims to the single webhook flow (removed in 4b);
+    health reports `queue_depth` (total) + `running`, `current_run_id`
+    removed; `queue_full` is per flow. Store: `Store::open` runs under
+    `spawn_blocking`; shutdown checkpoint busy → debug skip;
+    `idx_messages_run_status` created post-migration; startup
+    reconciliation fails non-terminal rows of NULL-`run_id` or stopped runs
+    (#30; crashed-run rows deliberately kept). `list_agent_events` stays
+    unscoped by decision (cross-run history is the point of the shared
+    file).
+28. **Multi-flow phase 4a (2026-08-12 spec §6–§8):** bare `coretempod run` /
+    desktop ▶ Run is a warm whole-pool run; nothing auto-fires.
+    `coretempod run <config> --flow <name>` spawns the flow's member subset via
+    `FrozenWorkflow::for_flow` (on_start: fires the configured message holding
+    the flow's locks, exits 0/1; webhook: warm with the flow armed); a subset
+    run's API `WorkflowFile` view is narrowed to the frozen roster. Desktop
+    commands `run_flows() -> Vec<FlowInfo { name, type, target }>` and
+    `fire_flow(name) -> String` (the hub trigger id; errors: `unknown_flow`,
+    `invalid_request` — webhook flows, and the shared-contract-target refusal
+    relocated here from `startup_kickoff`, now caller-less until 4b deletes
+    it — and `trigger_in_flight`). Canvas node ids are keyed:
+    `§trigger:<flow>` / `§output:<flow>`; `addFlow` creates `flow-N` spanning
+    the roster. `@coretempo/client` 2.0.0 requires `flow` and targets
+    `POST /v1/flows/{name}/trigger` (the warm-run route lands in phase 4b;
+    serve already answers it). `core::export::ExportTarget { Serve, Batch {
+    flow }, WarmRun }` + `export_target(file, flow)` replace
+    `template_trigger`; `tempo export --flow <on_start>` emits a `run --flow`
+    batch unit.
+29. **Multi-flow phase 4b (2026-08-12 spec §5):** warm and serve APIs expose
+    `POST /v1/flows/{name}/trigger` (unknown name → 404 `unknown_flow` naming
+    declared flows; a declared on_start flow → 400 pointing at `run --flow`;
+    per-flow 409 `trigger_in_flight` warm, per-flow 429 `queue_full` serve) and
+    `GET /v1/flows` → `[FlowView { name, type, target, queue_depth, running }]`.
+    `Health` gains `queued: {flow: depth}` and `running`; `ServeHealth`'s
+    `queue_depth` total is replaced by the same `queued` map. Bare
+    `POST /v1/trigger` is removed; its 404 names the flows and the new route.
+    `GET /v1/trigger/{id}` is unchanged (ids are global). The in-turn 422
+    repair binds its contract per kickoff rather than per workflow, because a
+    contract keyed by target agent cannot tell two flows' kickoffs apart once
+    both target the same agent — the schema of whichever flow was declared
+    first would gate the other's reply. So the router reads a per-kickoff
+    contract (`Router::bind_kickoff_contract`, keyed by the kickoff's
+    `Origin::Http` id, bound before `create_message`, dropped at settle); the
+    addressee-match clause is gone and `FrozenWorkflow::webhook_output()` is
+    deleted, so `Run::watch_inputs` returns `output: None` and flow scoping
+    comes only from `watch_inputs_for_flow`. The shared-contract-target
+    refusal (a7b4dcb,
+    relocated to the desktop `fire_flow` in 4a) is retired: an on_start kickoff
+    binds no contract, so a webhook flow's schema cannot reach it.
+    `ActiveRun.kickoff` becomes `kickoffs: BTreeMap<FlowName, JoinHandle>` so
+    `run_stop` aborts every fired flow's watcher. Deleted as dead:
+    `trigger::startup_kickoff`, `trigger::conflicting_webhook_output`,
+    `trigger::single_on_start_flow`, `trigger::single_webhook_flow`,
+    `FrozenWorkflow::webhook_output`. Serve's listener outlives its queues, so
+    a trigger arriving while the daemon drains gets 503 `shutting_down` rather
+    than 429 `queue_full`; accept and close-and-drain share a per-flow
+    interlock, so an accepted trigger is always either drained (failed
+    `daemon_shutdown`) or refused.
+30. **Capstone cleanups (issue #41).** The `agent_events` table is deleted, not
+    deprecated: nothing outside its own tests ever read a row back, so
+    `Store::insert_agent_event`, `Store::list_agent_events` and
+    `store::AgentEventRecord` are gone with it, and amendment 27's
+    "`list_agent_events` stays unscoped by decision" is moot. Migrations are
+    append-only, so the drop is schema version 2: `store::migrate` (renamed from
+    `migrate_run_id`) brings any database up to `SCHEMA_VERSION`, adding
+    `messages.run_id` when `user_version < 1` and running
+    `DROP TABLE IF EXISTS agent_events` when it is below 2. Amendment 25's
+    "`messages` and `agent_events` gain a nullable `run_id`" therefore holds for
+    `messages` only. Freeze hash: each contributing flow's name and `schema_file`
+    bytes are appended behind their own length rather than concatenated raw, so
+    two adjacent schema files can no longer build the input a different split of
+    the same bytes would — the coverage amendment 26 describes is unchanged, but
+    the hash of any workflow that declares a `schema_file` moves.
+    `enable_wal` returns the
+    journal mode the file ended up in (the pragma reports a refusal in its
+    result row instead of failing) and `Store::open` warns on anything but WAL.
+31. **A flow kickoff names its flow in the injected header (#42).** §3.2's
+    `{sender}` gains an optional flow clause: a kickoff renders
+    `[CoreTempo {id} from http, flow {name} — reply expected] {body}` (and
+    `[CoreTempo {id} from http, flow {name}] {body}` for a `send` kickoff).
+    Ordinary agent-to-agent and user-origin messages, and every reply, are
+    unchanged — the label means "this is a flow kickoff", so an unlabelled
+    header is never one. Both trigger types are labelled: `on_start` kickoffs
+    bind no contract, but leaving them bare would keep exactly one ambiguous
+    case, and one rule is cheaper for the agent than two. The name rides as a
+    render-time argument, not on the record: `Router::create_kickoff(FlowKickoff
+    { flow, from, to, kind, body })` sits beside the unchanged
+    `create_message(from, to, kind, body)`, and `MessageRecord` keeps its §2.2
+    shape (no store column, no API field, no `@coretempo/client` change).
+    `Origin::Http` is *not* extended — its string form (`http:<id>`) is the
+    store's `from` column, the API's `from` field, and the key
+    `bind_kickoff_contract` uses, so a flow inside it would touch all three for
+    a prompt-format change. `OutputContract` gains `flow: FlowName` (from
+    `compile`), which is what lets the 422 name the schema that rejected:
+    `render_rejection(errors, attempts_left, flow)` now reads "does not match
+    the output schema of flow '<name>' (the flow named in that ask's
+    [CoreTempo …] line)". The primer explains the labelled header, and each
+    output-contract prompt block (amendment: commit 8206357) now points at its
+    own flow's header rather than telling the agent to guess and repair off the
+    rejection. Nothing parses the header back out: obligation turns, met-step
+    recording and the auto-clear gate all key on `MessageRecord`
+    (`create_message`'s own bookkeeping), and the only reader of injected text
+    anywhere is the test fake agent's `m-[0-9a-f]+` match, whose position is
+    unchanged.
+32. **Parked-dialog signal + `allow` (#26, spec 2026-08-17 §3).**
+    `AgentConfig.allow: Vec<String>` (verbatim permission rules appended
+    after the `Bash(...)` entries); generated settings carry six hooks;
+    `ReportedState::{Blocked, Unblocked}` and
+    `ReportStateRequest.tool: Option<String>`;
+    `PtySource::report_blocked/report_unblocked/blocked/blocked_count`;
+    `EventPayload::AgentBlocked { agent, blocked, tool }` (`agent.blocked`);
+    `AgentInfo.blocked: bool`, `Health.blocked: usize` — all serde-default,
+    additive.
+33. **MCP opt-in (#2, spec 2026-08-17 §2).** `AgentConfig.mcp: Vec<String>`
+    (server names, serde-default `[]`); `pub type McpServers =
+    BTreeMap<String, serde_json::Value>`; `FrozenWorkflow.mcp_servers:
+    BTreeMap<AgentId, McpServers>` (only opted-in agents; joins `hash` in
+    canonical JSON after the flow schema files); `AgentEnv.mcp_paths:
+    BTreeMap<AgentId, PathBuf>`; `ConfigError::Mcp { agent, source: McpError }`;
+    spawn args end `--strict-mcp-config [--mcp-config <path>]`. Additive.
+34. **Trust preflight (#1, spec 2026-08-17 §1).** `ServerSection.trust_agent_dirs:
+    bool` (serde-default false); `user_config::UserConfig { trust_agent_dirs }`
+    from `~/.coretempo/config.toml` (`CORETEMPO_CONFIG` override), loaded by
+    the binaries only; `trust::{trust_root, TrustStore, TrustError, TrustPolicy,
+    preflight, TrustGate}`; `RunOptions.trust: TrustPolicy` (default no grant);
+    `RunError::Trust(TrustError)`; `pty::SpawnGate` + `PtyManager::set_spawn_gate`;
+    desktop command `run_untrusted_dirs(config_path) -> Vec<String>` and
+    `run_start(config_path, trust_confirmed: bool)` — the confirmation becomes
+    that run's `TrustPolicy`. Additive except the `run_start` parameter (its
+    only caller is `app/src/lib/ipc.ts`).
+35. **Serve token + body-less POSTs (#57).** `api::auth::TokenHint {Run,
+    Serve}`, and `require_bearer(token, headers, hint)` takes it (its only
+    outside caller is `daemon/src/serve.rs`, which passes `Serve`). The 401
+    `unauthorized` body is unchanged in run mode; in serve mode it names
+    `CORETEMPO_TOKEN`, `--token-file`/`CORETEMPO_TOKEN_FILE` and `[server]
+    token_file` instead of `api.json`, which serve never writes.
+    `coretempod serve` now fails at startup when
+    `ResolvedServer::token_provisioned` is false, before it binds anything.
+    The JSON content-type guard accepts a POST that declares no body (no
+    `Transfer-Encoding`, absent or zero `Content-Length`) and no
+    `Content-Type`; a declared non-JSON type, or a body without
+    `Content-Type: application/json`, is still 415.
+36. **The owed-ask watchdog (#55, #56, spec 2026-08-17 §4).** `MessageRecord`
+    gains `reason: Option<String>`, `reason_code: Option<String>` (serde
+    default, `null` unless `status = failed`); SQLite schema version 3 adds
+    the two nullable `messages` columns additively, existing rows read back
+    as `None`. `Router::fail_message` takes a `FailReason { code: &'static
+    str, reason: String }`; codes are exactly `timeout | blocked_on_permission
+    | agent_exited | agent_restarted`, plus `orphaned` from the startup
+    orphan sweep (amendment 30's `reconcile_orphans`, unchanged otherwise).
+    `pty::Blocked { since: tokio::time::Instant, tool: Option<String> }`
+    replaces the handle's `blocked: bool`; `PtyManager::blocked_since` reads
+    it and `StateSource` gains `fn blocked_since(&self, &AgentId) ->
+    Option<Blocked>` (default `None`) so the router can read it without a PTY
+    dependency. `report_blocked` now accepts a report at raw `working` **or
+    `idle`** (still dropped at `starting`/`restarting`/`exited`); a repeat
+    while already set is a no-op and does not move `since`; `unblocked`, a
+    raw-state *change* to `working`/`idle`, restart, exit and shutdown all
+    still clear it — an `idle` report no longer clears the flag when the
+    agent is already idle, so a subagent's dialog stays visible after the
+    parent's own `Stop` has already fired. `InjectionQueue` gains `fn
+    reconsider(&self, &AgentId)` (default no-op) / `QueueCmd::Reconsider`: the
+    worker re-runs `ClearGate::on_stable_idle` at debounced idle exactly as a
+    state-transition would, minus the drain, and acts only on a `Nudge` — a
+    poke never types `/clear` and a non-idle target is ignored. `Router`
+    gains `WatchdogTiming { reply_nudge_backoff: [Duration; 4], blocked_grace:
+    Duration }` with `DEFAULT_REPLY_NUDGE_BACKOFF = [60, 120, 240, 240]s` and
+    `DEFAULT_BLOCKED_GRACE = 90s`, plus `Router::set_watchdog_timing` (test
+    knob only — no config surface). `agent.stalled` keeps firing once per
+    nudge round: the first idle observed after a nudge, while the reply is
+    still owed; `agent.nudged` fires once per nudge sent. The 1 s TTL
+    sweeper runs `sweep_expired` (unchanged) then a second pass over `owed`:
+    an agent blocked past `blocked_grace` fails every owed ask
+    `blocked_on_permission` naming the tool and does not touch the agent; an
+    agent whose debounced state is `Exited` fails every owed ask `agent_exited`
+    (previously these waited on TTL, since `drive_message` stops watching
+    after `working`); otherwise, once an owed agent's backoff has elapsed,
+    the sweeper calls `injector.reconsider` rather than nudging directly —
+    the queue worker is still the only place a nudge or `/clear` is decided.
+    `workflow.completed.reason_code` (trigger watcher) now prefers the
+    record's `reason_code` when it is one of the four watchdog codes
+    (`blocked_on_permission | timeout | agent_restarted | agent_exited`);
+    otherwise it falls back to the watcher's own synthesised `agent_failed`
+    as before. Additive throughout except `fail_message`'s new parameter
+    (`InjectError` maps to `agent_exited`/`agent_restarted` in its place, no
+    `inject_failed`).
+    *Amendment 2026-08-18:* `ReportStateRequest` gains `agent_id:
+    Option<String>` (serde default) and `pty::Blocked` gains `agent_id:
+    Option<String>` — the hook payload's `agent_id`, `None` for the main
+    session — carried on both the `blocked` and `unblocked` reports, and
+    `PtyManager::report_unblocked(&AgentId, Option<String>)` clears the flag
+    only when the two match, so a sibling Claude Code helper agent's
+    `PostToolBatch` cannot cancel another agent's dialog. `sweep_owed`'s poke
+    walk additionally pokes an owed agent with no `ReplyNudgeState` at all whose
+    debounced state is `Idle` and whose oldest owed ask is older than
+    `reply_nudge_backoff[0]` — the case a `HoldQuiet` at a blocked idle
+    transition leaves behind — and never pokes a blocked agent.
+37. **Isolated agent config (#67, spec 2026-08-24).** `AgentConfig` gains
+    `isolated_config: bool` (serde default false) and `skills: Vec<PathBuf>`
+    (serde default empty; paths relative to the `tempo.toml` directory,
+    `~`-expanded at freeze like `dir`). `validate_workflow` rejects `skills`
+    without `isolated_config`, blank or nameless entries, and duplicate
+    basenames; `load_workflow` rejects a non-directory or a directory without
+    `SKILL.md` (`ConfigError::Invalid`, path `agents.<id>.skills[<n>]`) and an
+    unreadable or non-regular entry inside a skill dir (`ConfigError::SkillIo`
+    / `Invalid`), with the texts in spec §1.
+    `FrozenAgent`/`AgentConfig` in `FrozenWorkflow` carry the resolved skill
+    paths. Freeze hash: after the MCP frames, per isolated agent with skills
+    in agent-id order, `push_framed(agent_id)` then per skill in declaration
+    order `push_framed(name)` + `push_framed(file_count as u64 BE)` + for
+    each regular file in sorted relative-path order `push_framed(rel_path)`
+    + `push_framed(bytes)` (name and path as raw OS bytes); any symlink or
+    non-regular entry inside a skill dir fails the load, and any other IO
+    failure (unreadable parent, entry or file) is `ConfigError::SkillIo`
+    naming that entry. New module
+    `core::claude_config`: `write_agent_config_dirs(runs_dir, run_id,
+    &FrozenWorkflow) -> Result<BTreeMap<AgentId, PathBuf>, ClaudeConfigError>`
+    creates `<runs_dir>/<run_id>/claude-config-<agent_id>/` (0700) holding
+    `.claude.json` = `{"hasCompletedOnboarding":true}`, `settings.json` =
+    `{"autoMemoryEnabled":false,"skipDangerousModePermissionPrompt":true}`,
+    and `skills/<name>` symlinks — never a credentials file; returns the
+    map for isolated agents only. `operator_credential_store() ->
+    Option<PathBuf>` = `$CLAUDE_SECURESTORAGE_CONFIG_DIR`, else
+    `operator_config_dir()`. `AgentEnv` gains `config_dirs:
+    BTreeMap<AgentId, PathBuf>` and `credential_store: Option<PathBuf>`;
+    `spawn_spec` adds `("CLAUDE_CONFIG_DIR", dir)` and, when
+    `credential_store` is `Some`, `("CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    store)` to `env` for agents in the map and touches nothing otherwise.
+    (Amended after PR #71: the original `credentials_source` symlink was
+    replaced by Claude Code's temp+rename credential write, verified live on
+    2.1.241.) `TrustGate::new(store, policy)` becomes
+    `TrustGate::new(store, policy, mirrors: BTreeMap<AgentId, TrustStore>)`;
+    `before_spawn` runs the operator-store preflight unchanged, then
+    `grant`s the root into the agent's mirror store when one exists.
+    `AgentDetail` gains `isolated_config: bool` and `skills: Vec<String>`
+    (the frozen absolute paths). `RunError::SourceChanged`'s text names
+    declared skills alongside schema files and MCP selections. Tauri
+    `AgentModel`/`merge_agent` round-trip both keys (optionals only when
+    non-default). Additive throughout.
+38. **Trigger kickoffs carry their own origin (#24).** `Origin` gains
+    `Trigger(String)`, wire form `trigger:<hex>` where the hex is the trigger
+    hub id minus `t-`; `FromStr`/`Display`/serde round-trip it beside the
+    existing forms and `OriginParseError` names it. Every flow kickoff —
+    warm `POST /v1/flows/{name}/trigger` (`core/src/api/trigger.rs`), serve
+    cold starts (`daemon/src/serve.rs`), `coretempod run --flow`
+    (`daemon/src/main.rs`) and the desktop fire (`app/src-tauri/src/
+    commands.rs`, which now goes through `Router::create_kickoff` so its
+    header names the flow like the others) — is created with it.
+    `Origin::Http(<request-id>)` remains what a plain authenticated
+    `POST /v1/messages` gets and is never a kickoff: the output-schema gate
+    (`bind_kickoff_contract` / `reject_off_schema` / `settle`) keys on
+    `Trigger` only, so an HTTP ask that happens to share a hex is not gated.
+    The injected `{sender}` for `Trigger` is still `http` (§3.2), so agents
+    see byte-identical headers. UI: the Run tab and graph output box
+    correlate on `trigger:` only; the feed chip renders `trigger:` as
+    `trigger` and `http:` as `external`; `isExternal` accepts both. The
+    amendment-24 looseness is closed. Additive on the wire; a client that
+    parses `from` must accept the new prefix.
+39. **`Run` gains `port()` (#8).** `Run::port() -> u16` returns the port the
+    API listener actually bound — under `RunOptions::ephemeral_port` the one
+    the kernel picked, not the configured `[workflow] port`. It is the same
+    value written to `api.json` and handed to agents as `CORETEMPO_PORT`, so
+    an in-process caller no longer reads api.json back to learn the address.
+    Additive; nothing on the wire changes.
+40. **The PTY SSE `id:` is the resume cursor, not the chunk start (#7).**
+    `core/src/api/sse.rs` emits `id: <start + len>` — where the next chunk
+    begins — while `data.seq` stays the chunk's first byte, so §6.2's "`id:`
+    mirrors it" no longer holds and amendment 9's caveat is closed:
+    `Last-Event-ID` and `?since=<cursor>` take the same value and both resume
+    byte-exactly, with no re-delivered chunk. Amendment 20's parenthetical
+    (resubscribe by `?since=<start + len>` after a lagging subscriber is
+    dropped) is likewise superseded — the header alone is exact now. A client
+    that stored the old `id:` as its resume point re-reads the last chunk once,
+    which is what it already did. `/v1/events` is unchanged: bus events are
+    single units, so `id: <seq>` and `replay_since(seq)` (strictly greater
+    than) were already exact.
+41. **`allowed_origins` removed (#6).** `ServerSection` drops
+    `allowed_origins: Vec<String>`. It parsed since day one and was never
+    read: no CORS layer exists anywhere, so the key emitted no header and
+    only looked like a setting. `deny_unknown_fields` now makes a file that
+    still sets it fail to load, and `validate_workflow` appends a note to
+    serde's unknown-field error saying it was removed, that CoreTempo emits
+    no CORS headers, and that a cross-origin browser goes through a reverse
+    proxy serving the API same-origin (rewriting `Host`, which the API
+    validates). Tauri `merge_server_section` no longer writes the key and
+    the TS `WorkflowModel["server"]` mirror drops it. Breaking for any
+    tempo.toml that set it; nothing behavioural changes, because nothing
+    ever depended on the value.
+
+42. **Signal deaths are reported as the signal, not as code 1 (#90).**
+    `AgentInfo.exit_code: Option<i32>` and
+    `AgentLifecycle { exit_code: Option<i32> }` become
+    `exit: Option<AgentExit>`, with
+    `enum AgentExit { Code(i32), Signal(String) }` serialised externally
+    tagged: `{"code": 3}` or `{"signal": "Terminated"}`. `Signal` carries
+    the name `strsignal(3)` gives (portable-pty converts the number before
+    handing it back); `Code(-1)` is the pre-existing value for a `wait` that
+    itself failed. `PtyManager::exit_code` → `PtyManager::exit(&AgentId) ->
+    Result<Option<AgentExit>, PtyError>`, and the `api::PtySource` trait
+    method renames with it. The `agent_events` table this doc's §5 once
+    listed was already deleted (amendment 30), so nothing persists the
+    value. Breaking on the wire for anything reading `exit_code` from
+    `GET /v1/agents` or the `agent.lifecycle` event; `@coretempo/client`
+    never exposed it. Desktop: `AgentExit = { code } | { signal }` in
+    `types.ts`, and the dead-pane overlay reads `[exited 3]` /
+    `[killed: Terminated]` (`exitLabel`).
+43. **Stop and restart wait for the agent process to exit (#94).**
+    `PtyManager::shutdown` and `PtyManager::restart` keep their signatures
+    but now return only once the signalled `claude` has been reaped:
+    SIGHUP, then SIGKILL after `pty::EXIT_GRACE` (5 s), then `wait`. The
+    reaper thread completes a per-session `oneshot` after recording the
+    exit, so `PtyManager::exit` is populated by the time `shutdown`
+    returns. `Run::stop` is unchanged in shape and can now remove the run
+    dir (`cleanup_run_dir`) without racing Claude Code's session-end
+    write, and a restart no longer spawns the replacement into the managed
+    `CLAUDE_CONFIG_DIR` while the old process is still writing to it.
+    `Run::stop` may therefore take up to `EXIT_GRACE` per wedged agent
+    (agents are reaped concurrently). `core` gains a direct `libc`
+    dependency for the SIGKILL; portable-pty only sends SIGHUP.
+44. **The `PermissionRequest` hook answers the dialog by default.**
+    `AgentConfig` gains `on_permission_prompt: PermissionPrompt` (`enum
+    PermissionPrompt { Deny, Wait }`, serde lowercase, default `deny`).
+    Under `deny` the generated settings' `PermissionRequest` hook runs
+    `tempo state refused` instead of `tempo state blocked`: it prints
+    `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+    "decision": {"behavior": "deny", "message": …}}}` on stdout (exit 0
+    always — the decision must not depend on the API) and reports
+    `ReportedState::Refused` (`{"state":"refused","tool":…,"agent_id":…}`)
+    best-effort. `PtySource`/`PtyManager` gain
+    `report_refused(&AgentId, Option<String>)`, which logs at warn and
+    publishes the new `EventPayload::AgentPermissionRefused { agent, tool }`
+    (wire `agent.permission_refused`, `?agent=` filterable, never
+    always-pass). No blocked flag is set and `agent.blocked` is not
+    published for a refusal. `wait` keeps the pre-amendment behaviour
+    exactly. Desktop `types.ts` carries the event; the UI does nothing
+    with it yet. Files without the key freeze to the same hash (the hash
+    covers file bytes).
+45. **Refusals carry an input summary, and the desktop shows them.**
+    `ReportStateRequest` gains `input: Option<String>` (with `refused`
+    only): `tempo state refused` derives it from the hook payload's
+    `tool_input` — the Bash `command`, else a `file_path`, else the whole
+    input as compact JSON — capped at 200 bytes with a trailing `…`; the
+    server caps at the same length. `PtySource::report_refused` and
+    `PtyManager::report_refused` take `(agent, tool, input)`;
+    `EventPayload::AgentPermissionRefused` gains `input: Option<String>`
+    (wire key `input`, `#[serde(default)]`), and the warn line carries it.
+    Desktop: `types.ts` `Refusal { tool, input, ts }`,
+    `agentsState.refused: Record<agent, Refusal>` set by the event and
+    cleared on resync, rendered as a ⛔ badge (roster and graph node) whose
+    title is the refused tool and input plus the allow-rule hint.

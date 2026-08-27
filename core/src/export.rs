@@ -1,23 +1,103 @@
 //! Templates emitted by `tempo export` (spec §10). Pure string generation —
 //! compiled without the `server` feature so the CLI's types-only build can use it.
 
-use crate::types::config::TriggerType;
+use crate::types::FlowName;
+use crate::types::config::{TriggerType, WorkflowFile};
 
-/// The service's `ExecStart` line and `Restart=` line, chosen by trigger.
+/// What `tempo export` deploys, resolved from the flows map and the optional
+/// `--flow` pick (multi-flow spec §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportTarget {
+    /// ≥1 webhook flow, no `--flow`: a standing `coretempod serve` unit.
+    Serve,
+    /// `--flow <name>` naming an `on_start` flow: a batch unit running
+    /// `coretempod run <config> --flow <name>`.
+    Batch { flow: FlowName },
+    /// No flows: the plain warm-run unit.
+    WarmRun,
+}
+
+fn flow_roster(file: &WorkflowFile) -> String {
+    file.flows
+        .keys()
+        .map(|f| f.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolves the deployment shape. Errors are written for the CLI to print
+/// verbatim: they name the flows and the fix.
 ///
-/// `webhook` serves triggers over HTTP and should come back up after any
-/// failure. `on_start` and the no-trigger default run once per invocation, so
-/// `on-failure` is right for them — but a successful `on_start` batch run
-/// exits 0, which `on-failure` would leave stopped; `always` makes this unit
-/// a re-running batch worker instead.
-fn service_lines(config_path: &str, trigger: Option<TriggerType>) -> (String, &'static str) {
-    match trigger {
-        Some(TriggerType::Webhook) => (
+/// # Errors
+/// Unknown `--flow`; `--flow` naming a webhook flow (its deployment is the
+/// serve unit); on_start-only files exported without `--flow`.
+pub fn export_target(file: &WorkflowFile, flow: Option<&str>) -> Result<ExportTarget, String> {
+    let Some(name) = flow else {
+        return export_target_default(file);
+    };
+    let flow_name = FlowName(name.to_string());
+    let Some(config) = file.flows.get(&flow_name) else {
+        let declared = if file.flows.is_empty() {
+            "this workflow declares no [flows.<name>] sections".to_string()
+        } else {
+            format!("declared flows: {}", flow_roster(file))
+        };
+        return Err(format!(
+            "no flow named '{name}'; {declared} — pick one of them, or drop \
+             --flow to export the workflow's default unit"
+        ));
+    };
+    match config.trigger.trigger_type {
+        TriggerType::OnStart => Ok(ExportTarget::Batch { flow: flow_name }),
+        TriggerType::Webhook => Err(format!(
+            "flow '{name}' is a webhook flow; webhook flows deploy as the \
+             standing serve unit a plain `tempo export` already emits — \
+             --flow picks an on_start flow for a batch unit"
+        )),
+    }
+}
+
+/// `export_target`'s no-`--flow` arm: any webhook flow wins the serve unit; otherwise
+/// a declared `on_start` flow needs `--flow` to pick one; no flows keeps the warm-run unit.
+fn export_target_default(file: &WorkflowFile) -> Result<ExportTarget, String> {
+    let mut saw_on_start = false;
+    for config in file.flows.values() {
+        match config.trigger.trigger_type {
+            TriggerType::Webhook => return Ok(ExportTarget::Serve),
+            TriggerType::OnStart => saw_on_start = true,
+        }
+    }
+    if !saw_on_start {
+        return Ok(ExportTarget::WarmRun);
+    }
+    let on_start = file
+        .flows
+        .iter()
+        .filter(|(_, f)| f.trigger.trigger_type == TriggerType::OnStart)
+        .map(|(n, _)| n.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "every flow in this workflow is on_start ({on_start}); a batch \
+         unit needs to know which one to run — re-run with --flow <name>"
+    ))
+}
+
+/// The service's `ExecStart` line and `Restart=` line, chosen by target.
+///
+/// `Serve` serves triggers over HTTP and should come back up after any
+/// failure. `Batch` and `WarmRun` run once per invocation, so `on-failure`
+/// is right for `WarmRun` — but a successful `Batch` run exits 0, which
+/// `on-failure` would leave stopped; `always` makes this unit a re-running
+/// batch worker instead.
+fn service_lines(config_path: &str, target: &ExportTarget) -> (String, &'static str) {
+    match target {
+        ExportTarget::Serve => (
             format!("ExecStart=%h/.local/bin/coretempod serve {config_path}"),
             "Restart=on-failure",
         ),
-        Some(TriggerType::OnStart) => (
-            format!("ExecStart=%h/.local/bin/coretempod run {config_path}"),
+        ExportTarget::Batch { flow } => (
+            format!("ExecStart=%h/.local/bin/coretempod run {config_path} --flow {flow}"),
             "# a successful batch run exits 0; on-failure would leave it stopped — always\n\
              # makes this a re-running batch worker. Cost: each restart spawns the full\n\
              # agent roster against a paid API, so an enabled unit runs a complete\n\
@@ -25,7 +105,7 @@ fn service_lines(config_path: &str, trigger: Option<TriggerType>) -> (String, &'
              # from a systemd .timer instead, for scheduled batches.\n\
              Restart=always",
         ),
-        None => (
+        ExportTarget::WarmRun => (
             format!("ExecStart=%h/.local/bin/coretempod run {config_path}"),
             "Restart=on-failure",
         ),
@@ -35,12 +115,8 @@ fn service_lines(config_path: &str, trigger: Option<TriggerType>) -> (String, &'
 /// systemd *user* unit (agents need the user's credentials and home directory).
 /// `config_path` must be the absolute path of the exported `tempo.toml`.
 #[must_use]
-pub fn systemd_unit(
-    workflow_name: &str,
-    config_path: &str,
-    trigger: Option<TriggerType>,
-) -> String {
-    let (exec_start, restart) = service_lines(config_path, trigger);
+pub fn systemd_unit(workflow_name: &str, config_path: &str, target: &ExportTarget) -> String {
+    let (exec_start, restart) = service_lines(config_path, target);
     format!(
         "# CoreTempo systemd user unit for workflow '{workflow_name}'.\n\
          # Install: cp this file to ~/.config/systemd/user/coretempo-{workflow_name}.service\n\
@@ -69,15 +145,24 @@ pub fn systemd_unit(
 /// Build context: this export directory containing `tempo.toml` plus static-musl
 /// `coretempod` and `tempo` binaries (see `docs/build-musl.md`).
 #[must_use]
-pub fn dockerfile(trigger: Option<TriggerType>) -> String {
-    let subcommand = if trigger == Some(TriggerType::Webhook) {
-        "serve"
-    } else {
-        "run"
+pub fn dockerfile(target: &ExportTarget) -> String {
+    let entrypoint = match target {
+        ExportTarget::Serve => {
+            "ENTRYPOINT [\"/usr/local/bin/coretempod\", \"serve\", \"/workflow/tempo.toml\"]\n"
+                .to_string()
+        }
+        ExportTarget::Batch { flow } => format!(
+            "ENTRYPOINT [\"/usr/local/bin/coretempod\", \"run\", \"/workflow/tempo.toml\", \
+             \"--flow\", \"{flow}\"]\n"
+        ),
+        ExportTarget::WarmRun => {
+            "ENTRYPOINT [\"/usr/local/bin/coretempod\", \"run\", \"/workflow/tempo.toml\"]\n"
+                .to_string()
+        }
     };
     // A public serve bind 403s any caller whose Host header isn't localhost, loopback,
     // or the bind IP literal — only relevant once this image actually serves webhooks.
-    let host_note = if trigger == Some(TriggerType::Webhook) {
+    let host_note = if *target == ExportTarget::Serve {
         "# A public serve bind also 403s any caller whose Host header isn't localhost,\n\
          # loopback, or this container's bind IP literal — put it behind a reverse proxy\n\
          # that rewrites Host, or tunnel to a loopback bind instead.\n"
@@ -103,6 +188,6 @@ pub fn dockerfile(trigger: Option<TriggerType>) -> String {
          {host_note}\
          ENV CORETEMPO_BIND=0.0.0.0\n\
          EXPOSE 4820\n\
-         ENTRYPOINT [\"/usr/local/bin/coretempod\", \"{subcommand}\", \"/workflow/tempo.toml\"]\n"
+         {entrypoint}"
     )
 }

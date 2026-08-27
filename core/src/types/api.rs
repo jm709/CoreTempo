@@ -5,10 +5,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::time::Timestamp;
+#[cfg(feature = "server")]
 use crate::trigger::TriggerView;
 use crate::types::agent::{AgentDetail, AgentInfo, AgentState};
-use crate::types::config::WorkflowFile;
-use crate::types::id::{AgentId, RunId, Token};
+use crate::types::config::{TriggerType, WorkflowFile};
+use crate::types::id::{AgentId, FlowName, RunId, Token};
 use crate::types::message::{MessageKind, MessageRecord};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,28 +25,42 @@ pub struct ReplyRequest {
     pub body: String,
 }
 
-/// The two states an agent may report about itself (`POST /v1/agents/{id}/state`).
-/// Lifecycle states (`starting`, `exited`, `restarting`) are the supervisor's to set,
-/// so they are not accepted here.
+/// What an agent's hooks may report about itself (`POST /v1/agents/{id}/state`).
+/// `working`/`idle` are turn boundaries; `blocked`/`unblocked` are the permission
+/// dialog going up and being answered, which leaves the turn open (spec
+/// 2026-08-17 §3); `refused` is the hook having answered the dialog itself with
+/// a deny (amendment 44) — nothing is waiting. Lifecycle states (`starting`,
+/// `exited`, `restarting`) are the supervisor's to set, so they are not
+/// accepted here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportedState {
     Working,
     Idle,
-}
-
-impl From<ReportedState> for AgentState {
-    fn from(state: ReportedState) -> AgentState {
-        match state {
-            ReportedState::Working => AgentState::Working,
-            ReportedState::Idle => AgentState::Idle,
-        }
-    }
+    Blocked,
+    Unblocked,
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportStateRequest {
     pub state: ReportedState,
+    /// The `tool_name` from the `PermissionRequest` hook payload; `blocked` and
+    /// `refused` carry it.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// A short summary of the hook payload's `tool_input` (the Bash command,
+    /// a file tool's path, else compact JSON), capped at 200 bytes; only
+    /// `refused` carries it — it names the allow rule that is missing.
+    #[serde(default)]
+    pub input: Option<String>,
+    /// The `agent_id` from the hook payload, naming the Claude Code (sub)agent
+    /// the hook fired for; `None` for the main session. `blocked` and
+    /// `unblocked` both carry it, so an `unblocked` report from a sibling helper
+    /// agent cannot clear another agent's dialog (spec 2026-08-17 §4.2
+    /// amendment).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// `POST /v1/agents/{id}/state` response: the state now on the raw state channel.
@@ -84,6 +99,32 @@ pub struct Health {
     pub version: String,
     pub run_id: RunId,
     pub uptime_secs: u64,
+    /// Per-flow queue depths (multi-flow spec §5); every declared flow is
+    /// listed, `on_start` flows at 0. Empty for a flowless run.
+    #[serde(default)]
+    pub queued: BTreeMap<FlowName, usize>,
+    /// Total live triggered work: running cold-started runs (serve) or
+    /// in-flight warm triggers.
+    #[serde(default)]
+    pub running: usize,
+    /// Agents the `PermissionRequest` hook currently flags as blocked.
+    #[serde(default)]
+    pub blocked: usize,
+}
+
+/// One flow's live status for `GET /v1/flows` (multi-flow spec §5). Warm runs
+/// have no queue, so `queue_depth` is 0 there and `running` is that flow's
+/// in-flight trigger (0/1); in serve mode both count real queued/live work —
+/// a trigger counts as queued from acceptance until its run starts, waits on
+/// the flow's member locks and the concurrency cap included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowView {
+    pub name: FlowName,
+    #[serde(rename = "type")]
+    pub trigger_type: TriggerType,
+    pub target: AgentId,
+    pub queue_depth: usize,
+    pub running: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -134,7 +175,10 @@ pub struct Snapshot {
     /// Event dedup floor: the frontend ignores `coretempo:event` payloads with `seq <= last_seq`.
     pub last_seq: u64,
     /// Trigger history for this run, oldest first (hub-capped at 100). Empty when
-    /// the workflow has fired no kickoffs.
+    /// the workflow has fired no kickoffs. Absent from the types-only (non-`server`)
+    /// build: `TriggerView` lives in the server-only `trigger` module, and no
+    /// types-only consumer (the CLI) reads a `Snapshot`.
+    #[cfg(feature = "server")]
     pub triggers: Vec<TriggerView>,
 }
 
@@ -144,10 +188,11 @@ mod tests {
 
     use crate::time::Timestamp;
     use crate::types::api::{
-        ApiErrorBody, ApiErrorDetail, ApiFile, CreateMessageRequest, Health, ReplyRequest, RunInfo,
-        Snapshot,
+        ApiErrorBody, ApiErrorDetail, ApiFile, CreateMessageRequest, FlowView, Health,
+        ReplyRequest, ReportStateRequest, ReportedState, RunInfo, Snapshot,
     };
-    use crate::types::id::{AgentId, RunId, Token};
+    use crate::types::config::TriggerType;
+    use crate::types::id::{AgentId, FlowName, RunId, Token};
     use crate::types::message::MessageKind;
 
     #[test]
@@ -191,11 +236,49 @@ mod tests {
             version: "0.1.0".to_string(),
             run_id: RunId("r-1f2e3d4c".to_string()),
             uptime_secs: 7,
+            queued: BTreeMap::new(),
+            running: 0,
+            blocked: 0,
         };
         let json = serde_json::to_value(&h).expect("ser");
         assert_eq!(json["status"], "ok");
         assert_eq!(json["run_id"], "r-1f2e3d4c");
         assert_eq!(json["uptime_secs"], 7);
+        assert_eq!(json["blocked"], 0);
+    }
+
+    #[test]
+    fn flow_view_serializes_with_a_type_key() {
+        let view = FlowView {
+            name: FlowName("post".to_string()),
+            trigger_type: TriggerType::Webhook,
+            target: AgentId("smm".to_string()),
+            queue_depth: 3,
+            running: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(&view).expect("serializes"),
+            serde_json::json!({
+                "name": "post", "type": "webhook", "target": "smm",
+                "queue_depth": 3, "running": 1
+            })
+        );
+    }
+
+    #[test]
+    fn health_carries_per_flow_depths_and_a_running_count() {
+        let health = Health {
+            status: "ok".to_string(),
+            version: "1.0.0".to_string(),
+            run_id: RunId("r-1f2e3d4c".to_string()),
+            uptime_secs: 5,
+            queued: BTreeMap::from([(FlowName("post".to_string()), 2)]),
+            running: 1,
+            blocked: 0,
+        };
+        let json = serde_json::to_value(&health).expect("serializes");
+        assert_eq!(json["queued"]["post"], 2);
+        assert_eq!(json["running"], 1);
     }
 
     #[test]
@@ -251,6 +334,29 @@ mod tests {
         assert!(json["triggers"].as_array().expect("array").is_empty());
         let back: Snapshot = serde_json::from_value(json).expect("parse");
         assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn report_state_request_parses_every_reported_word() {
+        let blocked: ReportStateRequest =
+            serde_json::from_value(serde_json::json!({"state": "blocked", "tool": "Read"}))
+                .expect("parse");
+        assert_eq!(blocked.state, ReportedState::Blocked);
+        assert_eq!(blocked.tool.as_deref(), Some("Read"));
+
+        let unblocked: ReportStateRequest =
+            serde_json::from_value(serde_json::json!({"state": "unblocked"})).expect("parse");
+        assert_eq!(unblocked.state, ReportedState::Unblocked);
+        assert_eq!(unblocked.tool, None);
+
+        let working: ReportStateRequest =
+            serde_json::from_value(serde_json::json!({"state": "working"})).expect("parse");
+        assert_eq!(working.state, ReportedState::Working);
+        assert_eq!(working.tool, None);
+
+        let idle: ReportStateRequest =
+            serde_json::from_value(serde_json::json!({"state": "idle"})).expect("parse");
+        assert_eq!(idle.state, ReportedState::Idle);
     }
 
     #[test]

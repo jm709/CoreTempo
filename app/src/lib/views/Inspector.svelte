@@ -4,8 +4,8 @@
   } from "../types";
   import { coerceNumber, duplicateEdgeError } from "./graphEditing";
   import {
-    moveEdge, OUTPUT_NODE_ID, removeAgent, removeEdge, removeOutput, removeTrigger, renameAgent,
-    setEdgeKind, TRIGGER_NODE_ID, WORKFLOW_NODE_ID,
+    moveEdge, outputNodeFlow, removeAgent, removeEdge, removeFlow, removeOutput,
+    renameAgent, setEdgeKind, triggerNodeFlow, WORKFLOW_NODE_ID,
   } from "./graphModel";
   import { inlineSchemaSummary } from "./triggerHelpers";
 
@@ -17,9 +17,12 @@
   let renameError = $state<string | null>(null);
   let edgeError = $state<string | null>(null);
 
-  // The three "§" node ids are not agents; everything else selected is an agent id.
+  // The "§" node ids are not agents: the workflow node, and a trigger/output node keyed by
+  // flow name; everything else selected is an agent id.
+  const triggerFlow = $derived(selected === null ? null : triggerNodeFlow(selected));
+  const outputFlow = $derived(selected === null ? null : outputNodeFlow(selected));
   const agentId = $derived(
-    selected === WORKFLOW_NODE_ID || selected === TRIGGER_NODE_ID || selected === OUTPUT_NODE_ID
+    selected === WORKFLOW_NODE_ID || triggerFlow !== null || outputFlow !== null
       ? null
       : selected,
   );
@@ -101,11 +104,10 @@
 <aside class="inspector">
   {#if selected === WORKFLOW_NODE_ID}
     {@render workflowForm()}
-  {:else if selected === TRIGGER_NODE_ID && model.trigger !== null}
-    {@render triggerForm(model.trigger)}
-  {:else if selected === OUTPUT_NODE_ID && model.trigger !== null &&
-    model.trigger.output !== undefined}
-    {@render outputForm(model.trigger.output)}
+  {:else if triggerFlow !== null && model.flows[triggerFlow] !== undefined}
+    {@render triggerForm(triggerFlow, model.flows[triggerFlow]!.trigger)}
+  {:else if outputFlow !== null && model.flows[outputFlow]?.output !== undefined}
+    {@render outputForm(outputFlow, model.flows[outputFlow]!.output!)}
   {:else if agent !== null && agentId !== null}
     {@render agentForm(agentId, agent)}
   {:else}
@@ -183,6 +185,15 @@
     <span class="mono key">auto_clear</span>
   </label>
 
+  {#if a.isolated_config}
+    <div class="field">
+      <span class="mono key">isolated_config</span>
+      <span class="mono ro">
+        true{a.skills.length ? ` · skills: ${a.skills.join(", ")}` : ""}
+      </span>
+    </div>
+  {/if}
+
   <label class="field">
     <span class="mono key">prompt</span>
     <textarea
@@ -257,14 +268,14 @@
   >
 {/snippet}
 
-{#snippet triggerForm(t: TriggerModel)}
-  <div class="label">Trigger</div>
+{#snippet triggerForm(name: string, t: TriggerModel)}
+  <div class="label">Trigger — flows.{name}</div>
   <div class="field">
     <span class="mono key">type</span>
     <span class="mono ro">
       {t.type === "on_start"
-        ? "on_start — fires when the run starts"
-        : "webhook — fires on POST /v1/trigger"}
+        ? "on_start — fires from the Run tab or `run --flow`"
+        : `webhook — fires on POST /v1/flows/${name}/trigger`}
     </span>
   </div>
 
@@ -310,15 +321,15 @@
   <button
     class="mono danger"
     onclick={() => {
-      removeTrigger(model);
+      removeFlow(model, name);
       selected = null;
       onchanged();
-    }}>delete trigger</button
+    }}>delete flow</button
   >
 {/snippet}
 
-{#snippet outputForm(o: OutputModel)}
-  <div class="label">Output</div>
+{#snippet outputForm(name: string, o: OutputModel)}
+  <div class="label">Output — flows.{name}.output</div>
   {#if o.schema !== undefined}
     <div class="field">
       <span class="mono key">schema</span>
@@ -359,7 +370,7 @@
   <button
     class="mono danger"
     onclick={() => {
-      removeOutput(model);
+      removeOutput(model, name);
       selected = null;
       onchanged();
     }}>delete output</button

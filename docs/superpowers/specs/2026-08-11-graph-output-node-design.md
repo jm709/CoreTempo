@@ -174,10 +174,10 @@ in the stopped editor. The box and the Run tab always agree.
 
 Like the agent nodes' live overlay, the box keys off the current run's store
 regardless of whether the on-disk file still matches the frozen run config;
-that is existing graph behaviour, not new to this node. The overlay also
-inherits the documented `http:<hex>` looseness (contracts amendment 24): a
-plain authenticated `POST /v1/messages` can open a lifecycle the same way it
-opens one in the Run tab.
+that is existing graph behaviour, not new to this node. The overlay
+correlates kickoffs the same way the Run tab does — on the `trigger:<hex>`
+origin (contracts amendment 38), so a plain authenticated `POST /v1/messages`
+never opens one.
 
 ## Toolbar and inspector
 

@@ -1,7 +1,7 @@
 #![expect(clippy::unwrap_used, reason = "tests assert on known-good values")]
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,7 +14,7 @@ use coretempo_core::time::Timestamp;
 use coretempo_core::types::agent::AgentState;
 use coretempo_core::types::config::{AgentConfig, FrozenWorkflow};
 use coretempo_core::types::event::EventPayload;
-use coretempo_core::types::id::{AgentId, MessageId};
+use coretempo_core::types::id::{AgentId, MessageId, RunId};
 use coretempo_core::types::message::{MessageKind, MessageRecord, MessageStatus, Origin};
 use tokio::sync::{oneshot, watch};
 
@@ -119,15 +119,7 @@ fn workflow(ids: &[&str], ttl: Duration) -> Arc<FrozenWorkflow> {
     for id in ids {
         agents.insert(
             agent(id),
-            AgentConfig {
-                dir: PathBuf::from("/tmp"),
-                prompt: "test agent".to_string(),
-                model: None,
-                permission_mode: None,
-                auto_clear: true,
-                edges: Vec::new(),
-                tools: Vec::new(),
-            },
+            AgentConfig::new(PathBuf::from("/tmp"), "test agent"),
         );
     }
     Arc::new(FrozenWorkflow {
@@ -138,7 +130,8 @@ fn workflow(ids: &[&str], ttl: Duration) -> Arc<FrozenWorkflow> {
         idle_debounce: Duration::from_secs(2),
         scrollback: 5_000,
         agents,
-        output: None,
+        mcp_servers: BTreeMap::new(),
+        flows: BTreeMap::new(),
     })
 }
 
@@ -149,8 +142,14 @@ struct Harness {
     bus: EventBus,
 }
 
-fn harness_with(agents: &[&str], ttl: Duration, mode: InjectMode) -> Harness {
-    let store = Store::open(&temp_db()).unwrap();
+fn harness_on(
+    path: &Path,
+    run_id: RunId,
+    agents: &[&str],
+    ttl: Duration,
+    mode: InjectMode,
+) -> Harness {
+    let store = Store::open(path, run_id).unwrap();
     let bus = EventBus::new();
     let injector = MockInjector::new(mode);
     let states = Arc::new(FakeStates::default());
@@ -165,6 +164,16 @@ fn harness_with(agents: &[&str], ttl: Duration, mode: InjectMode) -> Harness {
         states,
         bus,
     }
+}
+
+fn harness_with(agents: &[&str], ttl: Duration, mode: InjectMode) -> Harness {
+    harness_on(
+        &temp_db(),
+        RunId("r-11111111".to_string()),
+        agents,
+        ttl,
+        mode,
+    )
 }
 
 fn harness(agents: &[&str]) -> Harness {
@@ -182,6 +191,23 @@ async fn wait_status(router: &Router, id: &MessageId, want: MessageStatus) -> Me
     let rec = router.get_message(id).await.unwrap();
     assert_eq!(rec.status, want, "timed out waiting for status");
     rec
+}
+
+/// The router persists a terminal status before it releases the asker's pending
+/// count (`fail_message`: `transition` then `settle`), so a poller can observe
+/// the status a moment before the count drops. Wait for the count too.
+async fn wait_pending_asks(router: &Router, agent: &AgentId, want: u64) {
+    for _ in 0..300 {
+        if router.pending_asks(agent) == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        router.pending_asks(agent),
+        want,
+        "timed out waiting for pending asks"
+    );
 }
 
 #[tokio::test]
@@ -353,7 +379,7 @@ async fn inject_error_fails_the_message_and_releases_pending() {
         .unwrap();
     let rec = wait_status(&h.router, &rec.id, MessageStatus::Failed).await;
     assert!(rec.completed_at.is_some());
-    assert_eq!(h.router.pending_asks(&agent("planner")), 0);
+    wait_pending_asks(&h.router, &agent("planner"), 0).await;
 }
 
 #[tokio::test]
@@ -535,10 +561,83 @@ async fn reply_to_unknown_message_errors() {
     assert!(matches!(err, RouterError::UnknownMessage(_)));
 }
 
+/// The output-schema gate binds to a kickoff by its origin hex. Only a
+/// `trigger:` origin is a kickoff: a plain HTTP ask that happens to carry the
+/// same hex is never gated (#24).
 #[tokio::test]
-async fn user_and_http_origin_asks_get_no_injection_sink() {
+async fn a_bound_contract_gates_trigger_origin_asks_only() {
     let h = harness(&["builder"]);
-    for origin in [Origin::User, Origin::Http("1f2e3d4c".to_string())] {
+    let schema = serde_json::json!({"type": "object", "required": ["name"]});
+    let contract = Arc::new(
+        coretempo_core::schema::OutputContract::compile(
+            schema,
+            coretempo_core::types::id::FlowName("hook".into()),
+            agent("builder"),
+            3,
+        )
+        .unwrap(),
+    );
+    h.router.bind_kickoff_contract("1f2e3d4c", contract.clone());
+    let plain = h
+        .router
+        .create_message(
+            Origin::Http("1f2e3d4c".to_string()),
+            agent("builder"),
+            MessageKind::Ask,
+            "q".to_string(),
+        )
+        .await
+        .unwrap();
+    wait_status(&h.router, &plain.id, MessageStatus::Injected).await;
+    let replied = h
+        .router
+        .reply(
+            Origin::Agent(agent("builder")),
+            &plain.id,
+            0,
+            "prose".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replied.status,
+        MessageStatus::Replied,
+        "an http ask is not gated"
+    );
+
+    h.router.bind_kickoff_contract("1f2e3d4c", contract);
+    let kickoff = h
+        .router
+        .create_message(
+            Origin::Trigger("1f2e3d4c".to_string()),
+            agent("builder"),
+            MessageKind::Ask,
+            "q".to_string(),
+        )
+        .await
+        .unwrap();
+    wait_status(&h.router, &kickoff.id, MessageStatus::Injected).await;
+    let err = h
+        .router
+        .reply(
+            Origin::Agent(agent("builder")),
+            &kickoff.id,
+            0,
+            "prose".to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RouterError::OutputSchema { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn user_http_and_trigger_origin_asks_get_no_injection_sink() {
+    let h = harness(&["builder"]);
+    for origin in [
+        Origin::User,
+        Origin::Http("1f2e3d4c".to_string()),
+        Origin::Trigger("1f2e3d4c".to_string()),
+    ] {
         let rec = h
             .router
             .create_message(origin, agent("builder"), MessageKind::Ask, "q".to_string())
@@ -724,6 +823,59 @@ async fn restart_fails_pending_messages_to_agent() {
     let send = wait_status(&h.router, &send.id, MessageStatus::Failed).await;
     assert!(ask.completed_at.is_some() && send.completed_at.is_some());
     assert_eq!(h.router.pending_asks(&agent("planner")), 0);
+}
+
+#[tokio::test]
+async fn restart_sweep_only_fails_its_own_runs_messages() {
+    let path = temp_db();
+    let run_a = harness_on(
+        &path,
+        RunId("r-aaaaaaaa".to_string()),
+        &["builder"],
+        Duration::from_mins(30),
+        InjectMode::Hold,
+    );
+    let run_b = harness_on(
+        &path,
+        RunId("r-bbbbbbbb".to_string()),
+        &["builder"],
+        Duration::from_mins(30),
+        InjectMode::Hold,
+    );
+
+    // One live ask to builder in each run. Hold mode keeps them non-terminal.
+    let ask_a = run_a
+        .router
+        .create_message(
+            Origin::User,
+            agent("builder"),
+            MessageKind::Ask,
+            "a".to_string(),
+        )
+        .await
+        .unwrap();
+    let ask_b = run_b
+        .router
+        .create_message(
+            Origin::User,
+            agent("builder"),
+            MessageKind::Ask,
+            "b".to_string(),
+        )
+        .await
+        .unwrap();
+
+    // builder restarts in run B: B's ask is swept, A's must survive.
+    run_b.router.on_agent_restarted(&agent("builder")).await;
+
+    let swept = wait_status(&run_b.router, &ask_b.id, MessageStatus::Failed).await;
+    assert_eq!(swept.status, MessageStatus::Failed);
+    let survivor = run_a.router.get_message(&ask_a.id).await.unwrap();
+    assert_ne!(
+        survivor.status,
+        MessageStatus::Failed,
+        "run B's restart sweep crossed into run A"
+    );
 }
 
 #[tokio::test]

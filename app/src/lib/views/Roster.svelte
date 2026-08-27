@@ -1,6 +1,6 @@
 <script lang="ts">
   import { restartAgent, toCmdError } from "../ipc";
-  import { agentsState } from "../state/agents.svelte";
+  import { agentsState, blockedTitle, refusedTitle } from "../state/agents.svelte";
   import { pendingAsksFor } from "../state/messages.svelte";
   import { uiState } from "../state/ui.svelte";
   import { jumpToAgentTerminal } from "../term/jump";
@@ -23,7 +23,13 @@
           <StatusGlyph state={a.state} />
           <span>{id}</span>
           {#if agentsState.stalled[id]}
-            <span class="stalled" title="idled with unmet workflow steps after a nudge">⚠</span>
+            <span class="stalled" title="idled again after a nudge; an owed reply keeps being re-nudged on a backoff">⚠</span>
+          {/if}
+          {#if id in agentsState.blocked}
+            <span class="blocked" title={blockedTitle(agentsState.blocked[id] ?? null)}>⏸</span>
+          {/if}
+          {#if agentsState.refused[id] !== undefined}
+            <span class="refused" title={refusedTitle(agentsState.refused[id])}>⛔</span>
           {/if}
           {#if pendingAsksFor(id) > 0}
             <span class="pending mono">{pendingAsksFor(id)}</span>
@@ -47,6 +53,8 @@
     padding: 4px 10px; text-align: left; width: 100%;
   }
   .stalled { color: var(--warn); }
+  .blocked { color: var(--err); }
+  .refused { color: var(--warn); }
   .pending {
     margin-left: auto; color: var(--accent);
     border: 1px solid var(--panel-edge); border-radius: 2px; padding: 0 4px;

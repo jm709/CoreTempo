@@ -25,7 +25,8 @@ use crate::time::Timestamp;
 use crate::trigger::TriggerHub;
 use crate::types::config::{FrozenWorkflow, WorkflowFile};
 use crate::types::{
-    AgentId, AgentState, ApiErrorBody, ApiErrorDetail, Health, RunId, Token, WorkflowResponse,
+    AgentExit, AgentId, AgentState, ApiErrorBody, ApiErrorDetail, Health, RunId, Token,
+    WorkflowResponse,
 };
 
 /// The PTY facts the API needs, abstracted so integration tests run without real PTYs.
@@ -43,11 +44,42 @@ pub trait PtySource: Send + Sync + 'static {
     /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
     fn report_state(&self, agent: &AgentId, state: AgentState) -> Result<(), PtyError>;
 
-    /// Exit code of the last session, set only while the agent is `exited`.
+    /// The agent's `PermissionRequest` hook fired: a permission dialog is up.
     ///
     /// # Errors
     /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
-    fn exit_code(&self, agent: &AgentId) -> Result<Option<i32>, PtyError>;
+    fn report_blocked(
+        &self,
+        agent: &AgentId,
+        tool: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<(), PtyError>;
+
+    /// The agent's `PermissionRequest` hook answered a dialog with a deny
+    /// (`on_permission_prompt = "deny"`): nothing is waiting, but the refused
+    /// tool and its input summary are worth an event and a log line.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    fn report_refused(
+        &self,
+        agent: &AgentId,
+        tool: Option<String>,
+        input: Option<String>,
+    ) -> Result<(), PtyError>;
+
+    /// The agent's `PostToolBatch` hook fired: the dialog was answered. Clears
+    /// only when `agent_id` matches the one the dialog was reported with.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    fn report_unblocked(&self, agent: &AgentId, agent_id: Option<String>) -> Result<(), PtyError>;
+
+    /// How the last session ended, set only while the agent is `exited`.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    fn exit(&self, agent: &AgentId) -> Result<Option<AgentExit>, PtyError>;
 
     /// Current end-of-stream byte cursor.
     ///
@@ -81,6 +113,15 @@ pub trait PtySource: Send + Sync + 'static {
     /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
     fn subscribe_debounced(&self, agent: &AgentId)
     -> Result<watch::Receiver<AgentState>, PtyError>;
+
+    /// Whether `agent` is parked on a permission dialog (spec 2026-08-17 §3).
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    fn blocked(&self, agent: &AgentId) -> Result<bool, PtyError>;
+
+    /// How many agents are parked on a permission dialog.
+    fn blocked_count(&self) -> usize;
 }
 
 /// Production `PtySource` over `PtyManager` (constructed by `Run::start`).
@@ -93,8 +134,27 @@ impl PtySource for PtyManagerSource {
     fn report_state(&self, agent: &AgentId, state: AgentState) -> Result<(), PtyError> {
         self.0.report_state(agent, state)
     }
-    fn exit_code(&self, agent: &AgentId) -> Result<Option<i32>, PtyError> {
-        self.0.exit_code(agent)
+    fn report_blocked(
+        &self,
+        agent: &AgentId,
+        tool: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<(), PtyError> {
+        self.0.report_blocked(agent, tool, agent_id)
+    }
+    fn report_refused(
+        &self,
+        agent: &AgentId,
+        tool: Option<String>,
+        input: Option<String>,
+    ) -> Result<(), PtyError> {
+        self.0.report_refused(agent, tool, input)
+    }
+    fn report_unblocked(&self, agent: &AgentId, agent_id: Option<String>) -> Result<(), PtyError> {
+        self.0.report_unblocked(agent, agent_id)
+    }
+    fn exit(&self, agent: &AgentId) -> Result<Option<AgentExit>, PtyError> {
+        self.0.exit(agent)
     }
     fn end_cursor(&self, agent: &AgentId) -> Result<Cursor, PtyError> {
         self.0.read_ring(agent, None).map(|(cursor, _)| cursor)
@@ -123,6 +183,12 @@ impl PtySource for PtyManagerSource {
     ) -> Result<watch::Receiver<AgentState>, PtyError> {
         self.0.subscribe_state_debounced(agent)
     }
+    fn blocked(&self, agent: &AgentId) -> Result<bool, PtyError> {
+        self.0.blocked(agent)
+    }
+    fn blocked_count(&self) -> usize {
+        self.0.blocked_count()
+    }
 }
 
 /// Everything the handlers need; `Clone` is cheap (Arcs + small values).
@@ -143,6 +209,18 @@ pub struct ApiContext {
     /// Trigger bookkeeping for `/v1/trigger` (spec triggers §4). Warm runs of a
     /// webhook workflow fire against the live roster.
     pub triggers: Arc<TriggerHub>,
+    /// Per-agent readers/writers locks for warm triggers (multi-flow spec §5):
+    /// a warm trigger holds its flow's member locks for its duration, so two
+    /// flows sharing an exclusive agent serialize rather than interleaving
+    /// conversations in its one live session. This run's own table — a
+    /// separate instance from the serve scheduler's; each guards its roster.
+    pub agent_locks: Arc<crate::locks::AgentLocks>,
+    /// Trips when the owning run starts stopping (`Run::stop`), and stays
+    /// tripped. A warm trigger parked on its flow's member locks races this:
+    /// past the stop the PTY manager is dead, so a kickoff created then is
+    /// typed into nothing. A dropped sender counts as stopped — the run it
+    /// belonged to is gone.
+    pub stopping: watch::Receiver<bool>,
 }
 
 /// Uniform error response: `{"error":{"code","message"}}`, message written for LLM readers.
@@ -277,12 +355,23 @@ pub(crate) fn map_router_error(error: RouterError, workflow: &FrozenWorkflow) ->
     }
 }
 
+/// A warm run has no queue, so every declared flow reports depth 0; `running`
+/// counts its in-flight triggers (multi-flow spec §5).
 async fn health(State(ctx): State<ApiContext>) -> Json<Health> {
+    let queued = ctx
+        .workflow
+        .flows
+        .keys()
+        .map(|name| (name.clone(), 0))
+        .collect();
     Json(Health {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         run_id: ctx.run_id.clone(),
         uptime_secs: ctx.started.elapsed().as_secs(),
+        queued,
+        running: ctx.triggers.in_flight_by_flow().len(),
+        blocked: ctx.pty.blocked_count(),
     })
 }
 
@@ -295,7 +384,8 @@ async fn not_found(req: axum::extract::Request) -> ApiError {
              GET /v1/messages/{{id}}, POST /v1/messages/{{id}}/reply, GET /v1/agents, \
              GET /v1/agents/{{id}}, POST /v1/agents/{{id}}/state, \
              POST /v1/agents/{{id}}/restart, GET /v1/agents/{{id}}/pty, GET /v1/events, \
-             GET /v1/workflow, GET /v1/health, POST /v1/trigger, GET /v1/trigger/{{id}}",
+             GET /v1/workflow, GET /v1/health, GET /v1/flows, \
+             POST /v1/flows/{{name}}/trigger, GET /v1/trigger/{{id}}",
             req.method(),
             req.uri().path()
         ),
@@ -326,8 +416,10 @@ pub fn build_router(ctx: ApiContext) -> axum::Router {
         .route("/v1/agents/{id}/loop-done", post(agents::loop_done))
         .route("/v1/agents/{id}/pty", get(sse::agent_pty))
         .route("/v1/events", get(sse::events))
-        .route("/v1/trigger", post(trigger::post_trigger))
+        .route("/v1/trigger", post(trigger::removed_trigger_route))
         .route("/v1/trigger/{id}", get(trigger::get_trigger))
+        .route("/v1/flows", get(trigger::list_flows))
+        .route("/v1/flows/{name}/trigger", post(trigger::post_flow_trigger))
         .route("/v1/workflow", get(get_workflow))
         .route("/v1/health", get(health))
         .fallback(not_found)

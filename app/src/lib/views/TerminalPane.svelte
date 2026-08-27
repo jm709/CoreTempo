@@ -3,7 +3,7 @@
   import { agentsState } from "../state/agents.svelte";
   import { focusTerminal, uiState } from "../state/ui.svelte";
   import { attachTerminal, focusAgentTerminal } from "../term/manager";
-  import { stateLabel } from "../format";
+  import { exitLabel, stateLabel } from "../format";
   import StatusGlyph from "./StatusGlyph.svelte";
 
   let { agentId }: { agentId: string } = $props();
@@ -58,7 +58,7 @@
   <div class="term-host" use:host></div>
   {#if agent?.state === "exited"}
     <div class="overlay mono">
-      <span>[exited {agent.exit_code ?? "?"}]</span>
+      <span>[{exitLabel(agent.exit)}]</span>
       <button class="restart" onclick={restart}>restart</button>
     </div>
   {/if}

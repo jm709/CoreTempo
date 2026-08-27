@@ -14,9 +14,9 @@ export function isTerminalStatus(s: MessageStatus): boolean {
 }
 
 export interface MessageRecord {
-  id: string;                 // "m-" + 8 lowercase hex
+  id: string;                 // "m-" + 16 lowercase hex
   kind: MessageKind;
-  from: string;               // "agent:<id>" | "user" | "http:<req-id>"
+  from: string;               // "agent:<id>" | "user" | "http:<req-id>" | "trigger:<hex>"
   to: string;                 // AgentId
   body: string;
   status: MessageStatus;
@@ -25,13 +25,20 @@ export interface MessageRecord {
   created_at: string;         // RFC 3339 UTC "…Z"
   injected_at: string | null;
   completed_at: string | null;
+  reason: string | null;      // set only when status == "failed"
+  reason_code: string | null; // set only when status == "failed"
 }
+
+// How the last session ended: a normal exit code, or the signal that killed it
+// (named as strsignal(3) describes it, e.g. "Terminated").
+export type AgentExit = { code: number } | { signal: string };
 
 export interface AgentInfo {
   id: string;
   state: AgentState;          // raw (undebounced) — UI shows truth
   pending_asks: number;
-  exit_code: number | null;   // set only when state == "exited"
+  exit: AgentExit | null;     // set only when state == "exited"
+  blocked: boolean;           // PermissionRequest hook fired; PostToolBatch/turn end clears it
 }
 
 export interface AgentDetail extends AgentInfo {
@@ -40,7 +47,16 @@ export interface AgentDetail extends AgentInfo {
   model: string | null;
   permission_mode: string | null;
   auto_clear: boolean;
+  isolated_config: boolean;
+  skills: string[];
   pty_cursor: number;
+}
+
+/** The last tool call the agent's PermissionRequest hook refused (on_permission_prompt = deny). */
+export interface Refusal {
+  tool: string | null;
+  input: string | null;   // Bash command / file path / compact JSON, ≤ 200 bytes
+  ts: string;
 }
 
 interface EventBase {
@@ -52,13 +68,17 @@ export type Event =
   | (EventBase & { type: "run.started"; run_id: string; workflow_name: string; started_at: string })
   | (EventBase & { type: "agent.state"; agent: string; state: AgentState })
   | (EventBase & {
-      type: "agent.lifecycle"; agent: string; phase: LifecyclePhase; exit_code: number | null;
+      type: "agent.lifecycle"; agent: string; phase: LifecyclePhase; exit: AgentExit | null;
     })
   | (EventBase & { type: "message.created"; message: MessageRecord })
   | (EventBase & { type: "message.status"; message: MessageRecord })
   | (EventBase & { type: "bus.reset" })
   | (EventBase & { type: "agent.nudged"; agent: string })
   | (EventBase & { type: "agent.stalled"; agent: string })
+  | (EventBase & { type: "agent.blocked"; agent: string; blocked: boolean; tool: string | null })
+  | (EventBase & {
+      type: "agent.permission_refused"; agent: string; tool: string | null; input: string | null;
+    })
   | (EventBase & { type: "reply.rejected"; message: string; agent: string; errors: string })
   | (EventBase & {
       type: "workflow.completed"; result: CompletionResult;
@@ -101,6 +121,7 @@ export interface CmdError { code: string; message: string }
 
 export type EdgeKind = "ask" | "send" | "loop";
 export interface EdgeModel { to: string; kind: EdgeKind; max_rounds?: number }
+export type AgentConcurrency = "exclusive" | "shared";
 export interface AgentModel {
   dir: string;
   prompt: string;
@@ -109,6 +130,11 @@ export interface AgentModel {
   auto_clear: boolean;
   edges: EdgeModel[];
   tools: string[];
+  allow: string[];
+  mcp: string[];
+  concurrency: AgentConcurrency;
+  isolated_config: boolean;
+  skills: string[];
 }
 export type TriggerType = "on_start" | "webhook";
 /// Mirrors OutputConfig's serde form. Exactly one of schema/schema_file is
@@ -125,6 +151,18 @@ export interface TriggerModel {
   type: TriggerType;
   edge: EdgeModel;
   message: string | null;
+}
+/// One flow of the active run, as `run_flows` reports it (Run tab fire controls).
+export interface FlowInfo {
+  name: string;
+  type: TriggerType;
+  target: string;
+}
+/// One named sub-workflow: an agent subset, its trigger edge, and an optional
+/// output contract for the webhook reply. Mirrors FlowConfig's serde form.
+export interface FlowModel {
+  agents: string[];
+  trigger: TriggerModel;
   output?: OutputModel;
 }
 export interface WorkflowModel {
@@ -134,9 +172,10 @@ export interface WorkflowModel {
   };
   server: {
     bind: string | null; token_file: string | null;
-    allowed_origins: string[]; log: string | null;
+    log: string | null;
+    max_concurrent_runs: number; trust_agent_dirs: boolean;
   };
   agents: Record<string, AgentModel>;
-  trigger: TriggerModel | null;
+  flows: Record<string, FlowModel>;
 }
 export interface ParseReport { ok: boolean; errors: ValidationIssue[]; model: WorkflowModel | null }

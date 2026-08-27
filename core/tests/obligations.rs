@@ -9,14 +9,16 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use coretempo_core::bus::EventBus;
-use coretempo_core::pty::{ClearGate, Cursor, IdleDecision, InjectError, Injected, InjectionQueue};
-use coretempo_core::router::{Router, StateSource};
+use coretempo_core::pty::{
+    Blocked, ClearGate, Cursor, IdleDecision, InjectError, Injected, InjectionQueue,
+};
+use coretempo_core::router::{Router, StateSource, WatchdogTiming};
 use coretempo_core::store::Store;
 use coretempo_core::time::Timestamp;
 use coretempo_core::types::agent::AgentState;
 use coretempo_core::types::config::{AgentConfig, Edge, EdgeKind, FrozenWorkflow};
 use coretempo_core::types::event::Event;
-use coretempo_core::types::id::{AgentId, MessageId};
+use coretempo_core::types::id::{AgentId, MessageId, RunId};
 use coretempo_core::types::message::{MessageKind, MessageRecord, MessageStatus, Origin};
 use tokio::sync::{broadcast, oneshot, watch};
 
@@ -42,6 +44,8 @@ struct MockInjector {
     probe: Mutex<Option<AgentId>>,
     router: OnceLock<Weak<Router>>,
     observed: Mutex<Vec<IdleDecision>>,
+    /// Every `reconsider` the sweeper sent, in order.
+    pokes: Mutex<Vec<AgentId>>,
 }
 
 impl MockInjector {
@@ -51,6 +55,10 @@ impl MockInjector {
 
     fn observed(&self) -> Vec<IdleDecision> {
         self.observed.lock().unwrap().clone()
+    }
+
+    fn pokes(&self) -> Vec<AgentId> {
+        self.pokes.lock().unwrap().clone()
     }
 }
 
@@ -76,11 +84,49 @@ impl InjectionQueue for MockInjector {
         }));
         rx
     }
+
+    fn reconsider(&self, target: &AgentId) {
+        self.pokes.lock().unwrap().push(target.clone());
+    }
 }
 
 #[derive(Default)]
 struct FakeStates {
     chans: Mutex<BTreeMap<AgentId, watch::Sender<AgentState>>>,
+    blocked: Mutex<BTreeMap<AgentId, Blocked>>,
+}
+
+impl FakeStates {
+    /// Parks `id` on a permission dialog for `tool`, as the agent's
+    /// `PermissionRequest` hook would.
+    fn set_blocked(&self, id: &str, tool: Option<&str>) {
+        self.blocked.lock().unwrap().insert(
+            agent(id),
+            Blocked {
+                since: tokio::time::Instant::now(),
+                tool: tool.map(str::to_string),
+                agent_id: None,
+            },
+        );
+    }
+
+    fn clear_blocked(&self, id: &str) {
+        self.blocked.lock().unwrap().remove(&agent(id));
+    }
+
+    /// Drives the debounced channel the router reads. `send_replace`, not
+    /// `send`: a receiver may well have been dropped by now (`drive_message`
+    /// stops watching an ask once it reaches `working`).
+    fn set_state(&self, id: &str, state: AgentState) {
+        if let Some(tx) = self.chans.lock().unwrap().get(&agent(id)) {
+            tx.send_replace(state);
+        }
+    }
+
+    /// What the sweeper and the gate see through `StateSource::blocked_since`.
+    fn blocked_since_public(&self, id: &str) -> Option<Blocked> {
+        self.blocked.lock().unwrap().get(&agent(id)).cloned()
+    }
 }
 
 impl StateSource for FakeStates {
@@ -91,23 +137,23 @@ impl StateSource for FakeStates {
             .get(agent)
             .map(watch::Sender::subscribe)
     }
+
+    fn blocked_since(&self, agent: &AgentId) -> Option<Blocked> {
+        self.blocked.lock().unwrap().get(agent).cloned()
+    }
 }
 
 struct Harness {
     router: Arc<Router>,
     injector: Arc<MockInjector>,
     bus: EventBus,
+    states: Arc<FakeStates>,
 }
 
 fn config(edges: Vec<Edge>) -> AgentConfig {
     AgentConfig {
-        dir: PathBuf::from("/tmp"),
-        prompt: "test agent".to_string(),
-        model: None,
-        permission_mode: None,
-        auto_clear: true,
         edges,
-        tools: Vec::new(),
+        ..AgentConfig::new(PathBuf::from("/tmp"), "test agent")
     }
 }
 
@@ -153,7 +199,8 @@ fn workflow_with_timeout(ask_timeout: Duration) -> Arc<FrozenWorkflow> {
         idle_debounce: Duration::from_secs(2),
         scrollback: 5_000,
         agents,
-        output: None,
+        mcp_servers: BTreeMap::new(),
+        flows: BTreeMap::new(),
     })
 }
 
@@ -162,7 +209,7 @@ fn harness() -> Harness {
 }
 
 fn build_harness(workflow: Arc<FrozenWorkflow>) -> Harness {
-    let store = Store::open(&temp_db()).unwrap();
+    let store = Store::open(&temp_db(), RunId("r-11111111".to_string())).unwrap();
     let bus = EventBus::new();
     let states = Arc::new(FakeStates::default());
     for id in workflow.agents.keys() {
@@ -171,12 +218,27 @@ fn build_harness(workflow: Arc<FrozenWorkflow>) -> Harness {
     }
     let injector = Arc::new(MockInjector::default());
     let router = Router::new(store, bus.clone(), injector.clone(), workflow);
-    router.set_state_source(states);
+    router.set_state_source(states.clone());
     let _ = injector.router.set(Arc::downgrade(&router));
     Harness {
         router,
         injector,
         bus,
+        states,
+    }
+}
+
+/// Millisecond-scale twin of the production backoff/grace, so the timing tests
+/// finish in well under a second.
+fn fast_timing() -> WatchdogTiming {
+    WatchdogTiming {
+        reply_nudge_backoff: [
+            Duration::from_millis(40),
+            Duration::from_millis(80),
+            Duration::from_millis(160),
+            Duration::from_millis(160),
+        ],
+        blocked_grace: Duration::from_millis(60),
     }
 }
 
@@ -217,10 +279,16 @@ async fn http_ask(h: &Harness, to: &str) -> MessageRecord {
 /// Waits out the TTL sweeper (1s interval) for `id` to expire, returning the
 /// last status seen so the caller reports what it got instead.
 async fn await_failed(h: &Harness, id: &MessageId) -> MessageStatus {
+    await_status(h, id, MessageStatus::Failed).await
+}
+
+/// Polls `id` for up to 4 s (the sweeper ticks every second), returning the
+/// last status seen so a failing assertion names what it got instead.
+async fn await_status(h: &Harness, id: &MessageId, want: MessageStatus) -> MessageStatus {
     let mut status = MessageStatus::Queued;
     for _ in 0..40 {
         status = h.router.get_message(id).await.unwrap().status;
-        if status == MessageStatus::Failed {
+        if status == want {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -512,7 +580,8 @@ fn loop_harness() -> Harness {
         idle_debounce: Duration::from_secs(2),
         scrollback: 5_000,
         agents,
-        output: None,
+        mcp_servers: BTreeMap::new(),
+        flows: BTreeMap::new(),
     }))
 }
 
@@ -659,10 +728,12 @@ async fn mark_loop_done_requires_a_loop_edge() {
 }
 
 #[tokio::test]
-async fn idle_with_owed_reply_nudges_once() {
+async fn idle_with_owed_reply_nudges_then_stalls_inside_the_backoff() {
     // An agent that went idle without answering an ask addressed to it is not
     // clearable: `/clear` would throw away the context the asker is blocked on.
     // `builder` has no edges, so nothing but the owed reply can hold the gate.
+    // The default 60 s backoff covers every idle below: one nudge, then one
+    // stall, then silence until the backoff elapses.
     let h = harness();
     let mut events = h.bus.subscribe();
     let ask = http_ask(&h, "builder").await;
@@ -683,8 +754,72 @@ async fn idle_with_owed_reply_nudges_once() {
     assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
     assert!(
         !saw_event(&mut events, "agent.stalled").await,
-        "stalled fires once per owed-reply idle"
+        "stalled fires once per nudge round"
     );
+}
+
+#[tokio::test]
+async fn owed_reply_is_renudged_on_a_backoff_and_stalls_each_round() {
+    let h = harness();
+    h.router.set_watchdog_timing(fast_timing());
+    let mut events = h.bus.subscribe();
+    let ask = http_ask(&h, "builder").await;
+    // Round 1: nudge now.
+    assert!(matches!(
+        decision(&h.router, "builder"),
+        IdleDecision::Nudge(_)
+    ));
+    assert!(saw_event(&mut events, "agent.nudged").await);
+    // Idle again inside the backoff: stalled once, then quiet.
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+    assert!(saw_event(&mut events, "agent.stalled").await);
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+    assert!(!saw_event(&mut events, "agent.stalled").await);
+    // Backoff elapsed: round 2, with the subagent hint, and stalled re-arms.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    match decision(&h.router, "builder") {
+        IdleDecision::Nudge(text) => {
+            assert!(text.contains(&ask.id.0));
+            assert!(
+                text.contains("background subagents"),
+                "round 2 hint: {text}"
+            );
+        }
+        other => panic!("expected round-2 nudge, got {other:?}"),
+    }
+    assert!(saw_event(&mut events, "agent.nudged").await);
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+    assert!(
+        saw_event(&mut events, "agent.stalled").await,
+        "stalled fires per round"
+    );
+    // Round 3 needs the longer backoff: 50 ms is not enough, 90 ms is.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(matches!(
+        decision(&h.router, "builder"),
+        IdleDecision::Nudge(_)
+    ));
+}
+
+#[tokio::test]
+async fn owed_reply_holds_quiet_while_the_agent_is_blocked() {
+    let h = harness();
+    h.router.set_watchdog_timing(fast_timing());
+    let mut events = h.bus.subscribe();
+    let _ask = http_ask(&h, "builder").await;
+    h.states.set_blocked("builder", Some("Bash"));
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+    assert!(
+        !saw_event(&mut events, "agent.nudged").await,
+        "never type into a dialog"
+    );
+    h.states.clear_blocked("builder");
+    assert!(matches!(
+        decision(&h.router, "builder"),
+        IdleDecision::Nudge(_)
+    ));
 }
 
 #[tokio::test]
@@ -743,6 +878,23 @@ async fn ttl_failure_clears_the_owed_state() {
         "the TTL sweeper must expire the ask"
     );
     assert_eq!(decision(&h.router, "builder"), IdleDecision::AllowClear);
+}
+
+/// The record says why (spec 2026-08-17 §4.3): a TTL expiry writes the
+/// `timeout` code and a reason naming the ask and the knob that governs it.
+#[tokio::test]
+async fn ttl_failure_records_a_timeout_reason() {
+    let h = build_harness(workflow_with_timeout(Duration::from_millis(1)));
+    let ask = http_ask(&h, "builder").await;
+    assert_eq!(await_failed(&h, &ask.id).await, MessageStatus::Failed);
+    let rec = h.router.get_message(&ask.id).await.unwrap();
+    assert_eq!(rec.reason_code.as_deref(), Some("timeout"));
+    let reason = rec.reason.unwrap_or_default();
+    assert!(reason.contains(&ask.id.0), "reason names the ask: {reason}");
+    assert!(
+        reason.contains("ask_timeout"),
+        "reason names the knob: {reason}"
+    );
 }
 
 #[tokio::test]
@@ -819,10 +971,306 @@ async fn owed_reply_check_precedes_turn_logic() {
 #[tokio::test]
 async fn open_turns_counts_armed_agents_and_totals_sum_asks() {
     let h = harness();
-    assert_eq!(h.router.open_turns(), 0);
-    assert_eq!(h.router.total_pending_asks(), 0);
+    let roster = [agent("builder"), agent("planner")];
+    assert_eq!(h.router.open_turns_among(&roster), 0);
+    assert_eq!(h.router.total_pending_asks_among(&roster), 0);
     arm_planner(&h).await;
-    assert_eq!(h.router.open_turns(), 1);
+    assert_eq!(h.router.open_turns_among(&roster), 1);
     let _ask = emit_ask(&h, "planner", "builder").await;
-    assert_eq!(h.router.total_pending_asks(), 1);
+    assert_eq!(h.router.total_pending_asks_among(&roster), 1);
+}
+
+/// Spec §4.2: an agent parked on a permission dialog past the grace has every
+/// owed ask failed, with the tool and the fix in the reason — and is itself
+/// left exactly as it was.
+#[tokio::test]
+async fn blocked_past_the_grace_fails_every_owed_ask_naming_the_tool() {
+    let h = harness();
+    // A grace no single tick can outrun first, so the "still working"
+    // assertion below is about the grace and not about the sweeper's cadence.
+    let patient = WatchdogTiming {
+        blocked_grace: Duration::from_secs(30),
+        ..fast_timing()
+    };
+    h.router.set_watchdog_timing(patient);
+    let first = http_ask(&h, "builder").await;
+    let second = http_ask(&h, "builder").await;
+    // The shape this fires in: the agent took the asks, went working, and
+    // parked on a dialog it will never leave on its own.
+    h.states.set_state("builder", AgentState::Working);
+    assert_eq!(
+        await_status(&h, &first.id, MessageStatus::Working).await,
+        MessageStatus::Working
+    );
+    h.states.set_blocked("builder", Some("Bash(python3 …)"));
+    tokio::time::sleep(Duration::from_millis(1100)).await; // a tick, inside the grace
+    assert_eq!(
+        h.router.get_message(&first.id).await.unwrap().status,
+        MessageStatus::Working,
+        "inside the grace the ask is left alone"
+    );
+    h.router.set_watchdog_timing(fast_timing()); // grace 60 ms: long spent
+    assert_eq!(await_failed(&h, &first.id).await, MessageStatus::Failed);
+    for id in [&first.id, &second.id] {
+        let rec = h.router.get_message(id).await.unwrap();
+        assert_eq!(rec.reason_code.as_deref(), Some("blocked_on_permission"));
+        let reason = rec.reason.unwrap_or_default();
+        assert!(
+            reason.contains("Bash(python3 …)"),
+            "reason names the tool: {reason}"
+        );
+        assert!(reason.contains("allow"), "reason names the fix: {reason}");
+    }
+    // The agent itself is untouched: still blocked, nothing typed, no poke —
+    // and the gate keeps holding while the dialog is up (#63): `/clear` would
+    // be typed into it.
+    assert!(h.states.blocked_since_public("builder").is_some());
+    assert!(h.injector.pokes().is_empty());
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+    h.states.clear_blocked("builder");
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::AllowClear);
+}
+
+#[tokio::test]
+async fn blocked_agent_with_nothing_owed_is_left_alone() {
+    let h = harness();
+    h.router.set_watchdog_timing(fast_timing());
+    h.states.set_blocked("builder", Some("Read"));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(h.injector.pokes().is_empty());
+    assert!(
+        h.states.blocked_since_public("builder").is_some(),
+        "flag untouched"
+    );
+}
+
+/// `drive_message` stops watching an ask once it reaches `working`, so an exit
+/// after that point is the sweeper's to notice (spec §4.1) — otherwise the ask
+/// stays owed until its TTL.
+#[tokio::test]
+async fn exited_agent_has_its_owed_asks_failed() {
+    let h = harness();
+    let ask = http_ask(&h, "builder").await;
+    h.states.set_state("builder", AgentState::Working);
+    assert_eq!(
+        await_status(&h, &ask.id, MessageStatus::Working).await,
+        MessageStatus::Working
+    );
+    h.states.set_state("builder", AgentState::Exited);
+    assert_eq!(await_failed(&h, &ask.id).await, MessageStatus::Failed);
+    let rec = h.router.get_message(&ask.id).await.unwrap();
+    assert_eq!(rec.reason_code.as_deref(), Some("agent_exited"));
+}
+
+#[tokio::test]
+async fn sweeper_pokes_the_worker_once_the_backoff_elapses() {
+    let h = harness();
+    h.router.set_watchdog_timing(fast_timing());
+    let _ask = http_ask(&h, "builder").await;
+    assert!(matches!(
+        decision(&h.router, "builder"),
+        IdleDecision::Nudge(_)
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(h.injector.pokes().is_empty(), "inside the backoff: no poke");
+    // Sweeper ticks every second; wait for one past the 40 ms backoff.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(h.injector.pokes(), vec![agent("builder")]);
+}
+
+/// A poke sent while the agent is working is buffered behind whatever the queue
+/// worker is doing and lands the instant the injection is delivered — before
+/// the agent's `UserPromptSubmit` hook has moved it off idle. The nudged branch
+/// checks the debounced state for the same reason the never-nudged one does.
+#[tokio::test]
+async fn sweeper_does_not_poke_a_nudged_agent_that_is_not_idle() {
+    let h = harness();
+    h.router.set_watchdog_timing(fast_timing());
+    let _ask = http_ask(&h, "builder").await;
+    assert!(matches!(
+        decision(&h.router, "builder"),
+        IdleDecision::Nudge(_)
+    ));
+    h.states.set_state("builder", AgentState::Working);
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        h.injector.pokes().is_empty(),
+        "a working agent is never poked, backoff spent or not"
+    );
+
+    h.states.set_state("builder", AgentState::Idle);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let pokes = h.injector.pokes();
+    assert!(!pokes.is_empty(), "back at idle the re-nudge poke resumes");
+    assert!(pokes.iter().all(|a| a == &agent("builder")));
+}
+
+/// An agent that owes a reply *and* is waiting on its own downstream ask would
+/// get `HoldQuiet` from the gate every tick, so poking it once a second is pure
+/// noise for the whole downstream wait.
+#[tokio::test]
+async fn sweeper_does_not_poke_while_the_agent_awaits_its_own_ask() {
+    let h = harness();
+    h.router.set_watchdog_timing(fast_timing());
+    let _owed = http_ask(&h, "builder").await;
+    assert!(matches!(
+        decision(&h.router, "builder"),
+        IdleDecision::Nudge(_)
+    ));
+    let downstream = emit_ask(&h, "builder", "notifier").await;
+    // notifier now owes builder a reply and is poked on its own account; only
+    // builder's pokes are the subject here.
+    let builder_pokes = || {
+        h.injector
+            .pokes()
+            .iter()
+            .filter(|a| *a == &agent("builder"))
+            .count()
+    };
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        builder_pokes(),
+        0,
+        "builder waits on its own ask; the gate would hold quiet anyway"
+    );
+
+    h.router
+        .reply(
+            Origin::Agent(agent("notifier")),
+            &downstream.id,
+            0,
+            "ok".to_string(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        builder_pokes() > 0,
+        "the settled downstream ask resumes the poke"
+    );
+}
+
+/// Live 2026-08-18: an agent that idles *while blocked* gets `HoldQuiet`, so no
+/// nudge state is ever created. Once the dialog clears it sits idle with the ask
+/// still owed and nothing wakes it — the sweeper only poked agents that already
+/// had nudge state. It must poke an owed idle agent that was never nudged too;
+/// the worker then runs the gate, which performs round 1.
+#[tokio::test]
+async fn sweeper_pokes_an_owed_idle_agent_that_was_never_nudged() {
+    let h = harness();
+    h.router.set_watchdog_timing(fast_timing());
+    let mut events = h.bus.subscribe();
+    let _ask = http_ask(&h, "builder").await;
+    h.states.set_blocked("builder", Some("Bash"));
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+    assert!(
+        !saw_event(&mut events, "agent.nudged").await,
+        "HoldQuiet leaves no nudge state behind"
+    );
+    h.states.clear_blocked("builder");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(h.injector.pokes(), vec![agent("builder")]);
+}
+
+/// The other half: an agent still parked on the dialog is never poked, inside
+/// the grace or past it. Typing into a dialog is never right, and the fail-fast
+/// owns that case.
+#[tokio::test]
+async fn sweeper_does_not_poke_an_agent_still_on_the_dialog() {
+    let h = harness();
+    // A grace 1.1 s cannot outrun, so the tick sees a blocked agent, not a
+    // failed ask.
+    h.router.set_watchdog_timing(WatchdogTiming {
+        blocked_grace: Duration::from_secs(30),
+        ..fast_timing()
+    });
+    let ask = http_ask(&h, "builder").await;
+    h.states.set_blocked("builder", Some("Bash"));
+    assert_eq!(decision(&h.router, "builder"), IdleDecision::HoldQuiet);
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        h.injector.pokes().is_empty(),
+        "inside the grace, a blocked agent is left alone"
+    );
+    assert_eq!(
+        h.router.get_message(&ask.id).await.unwrap().status,
+        MessageStatus::Injected,
+        "and the ask is still owed, not failed by the grace"
+    );
+}
+
+/// The never-nudged branch runs the same backoff clock as the re-nudge, off the
+/// ask's own age. An agent handed an ask a moment ago still reads debounced-idle
+/// until its `UserPromptSubmit` hook fires, and the sweeper ticks every second —
+/// poking there would nudge it for the message it is in the act of answering.
+#[tokio::test]
+async fn a_freshly_owed_idle_agent_is_not_poked_before_the_first_backoff() {
+    let h = harness();
+    h.router.set_watchdog_timing(WatchdogTiming {
+        reply_nudge_backoff: [Duration::from_secs(30); 4],
+        ..fast_timing()
+    });
+    // Idle (the harness default), owed, never nudged — branch (b)'s shape, but
+    // the ask is seconds old, not minutes.
+    let _ask = http_ask(&h, "builder").await;
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        h.injector.pokes().is_empty(),
+        "the ask is younger than one backoff"
+    );
+}
+
+/// Expiry runs first in the same tick, so a dead ask leaves `owed` before the
+/// poke walk can ask the worker to re-nudge for it (spec §4.1).
+#[tokio::test]
+async fn expiry_precedes_the_poke() {
+    let h = build_harness(workflow_with_timeout(Duration::from_millis(1)));
+    h.router.set_watchdog_timing(fast_timing());
+    let ask = http_ask(&h, "builder").await;
+    // Arms the re-nudge state, so a poke is due on the very tick that expires
+    // the ask: only the ordering keeps it from being sent.
+    assert!(matches!(
+        decision(&h.router, "builder"),
+        IdleDecision::Nudge(_)
+    ));
+    assert_eq!(await_failed(&h, &ask.id).await, MessageStatus::Failed);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        h.injector.pokes().is_empty(),
+        "a dead ask is never poked for"
+    );
+}
+
+/// #63: an armed turn on an agent parked on a permission dialog holds quiet —
+/// the nudge would be typed into the dialog — and does not spend the turn's
+/// one nudge, so it goes out once the dialog is gone.
+#[tokio::test]
+async fn armed_turn_holds_quiet_while_blocked_without_spending_the_nudge() {
+    let h = harness();
+    let mut events = h.bus.subscribe();
+    h.router
+        .create_message(
+            Origin::User,
+            agent("planner"),
+            MessageKind::Send,
+            "go".to_string(),
+        )
+        .await
+        .unwrap();
+    h.states.set_blocked("planner", Some("Bash"));
+    assert_eq!(decision(&h.router, "planner"), IdleDecision::HoldQuiet);
+    assert!(
+        !saw_event(&mut events, "agent.nudged").await,
+        "never type into a dialog"
+    );
+    h.states.clear_blocked("planner");
+    match decision(&h.router, "planner") {
+        IdleDecision::Nudge(text) => assert!(text.contains("tempo ask builder")),
+        other => panic!("expected the deferred nudge, got {other:?}"),
+    }
 }

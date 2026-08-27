@@ -1,6 +1,7 @@
-//! Id newtypes. Formats (frozen): agent ids match `^[a-z0-9][a-z0-9_-]{0,31}$`;
-//! message ids are `m-` + 8 lowercase hex; run ids `r-` + 8 lowercase hex;
-//! tokens are 64 lowercase hex chars (32 random bytes).
+//! Id newtypes. Formats (frozen): agent ids and flow names match
+//! `^[a-z0-9][a-z0-9_-]{0,31}$`; message ids are `m-` + 16 lowercase hex;
+//! run ids `r-` + 8 lowercase hex; tokens are 64 lowercase hex chars (32
+//! random bytes).
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,24 @@ pub struct RunId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Token(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FlowName(pub String);
+
+impl FlowName {
+    /// Flow names use the agent-id charset: `^[a-z0-9][a-z0-9_-]{0,31}$`.
+    #[must_use]
+    pub fn is_valid(s: &str) -> bool {
+        AgentId::is_valid(s)
+    }
+}
+
+impl std::fmt::Display for FlowName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 impl AgentId {
     /// Validates the frozen agent-id pattern `^[a-z0-9][a-z0-9_-]{0,31}$`.
@@ -73,10 +92,10 @@ fn random_hex(byte_count: usize) -> String {
 
 #[cfg(feature = "server")]
 impl MessageId {
-    /// `m-` + 8 lowercase hex from 4 random bytes.
+    /// `m-` + 16 lowercase hex from 8 random bytes.
     #[must_use]
     pub fn generate() -> MessageId {
-        MessageId(format!("m-{}", random_hex(4)))
+        MessageId(format!("m-{}", random_hex(8)))
     }
 }
 
@@ -100,7 +119,7 @@ impl Token {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::id::{AgentId, MessageId, RunId, Token};
+    use crate::types::id::{AgentId, FlowName, MessageId, RunId, Token};
 
     #[test]
     fn agent_id_validation() {
@@ -121,12 +140,13 @@ mod tests {
         assert_eq!(AgentId("builder".into()).to_string(), "builder");
         assert_eq!(MessageId("m-a3f91c2e".into()).to_string(), "m-a3f91c2e");
         assert_eq!(RunId("r-1f2e3d4c".into()).to_string(), "r-1f2e3d4c");
+        assert_eq!(FlowName("post".into()).to_string(), "post");
     }
 
     #[test]
     fn generated_ids_have_frozen_shapes() {
         let m = MessageId::generate().0;
-        assert_eq!(m.len(), 10);
+        assert_eq!(m.len(), 18);
         assert!(m.starts_with("m-"));
         assert!(
             m[2..]

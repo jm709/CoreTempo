@@ -5,7 +5,7 @@
   import { boot, startRun, stopRun } from "./lib/session";
   import { agentsState, runningCount } from "./lib/state/agents.svelte";
   import { runState } from "./lib/state/run.svelte";
-  import { releaseCapture, toggleRunCenter, uiState } from "./lib/state/ui.svelte";
+  import { releaseCapture, runGate, toggleRunCenter, uiState } from "./lib/state/ui.svelte";
   import { jumpToAgentTerminal } from "./lib/term/jump";
   import { blurAllTerminals } from "./lib/term/manager";
   import Dock from "./lib/views/Dock.svelte";
@@ -21,6 +21,7 @@
   let runError = $state<string | null>(null);
 
   const showGrid = $derived(runState.phase === "running" || runState.phase === "stopping");
+  const gate = $derived(runGate(runState.phase, uiState.editorPath, uiState.editorDirty));
   // Graph needs an open workflow file; a run adopted at boot always sets
   // editorPath from the snapshot, so this only pins terminals in edge cases.
   const runView = $derived(uiState.editorPath === null ? "terminals" : uiState.runCenter);
@@ -111,12 +112,11 @@
       {uiState.editorPath ?? runState.info?.workflow_path ?? "no workflow"}
     </span>
     {#if runError !== null}<span class="err">{runError}</span>{/if}
+    {#if gate.hint !== null}<span class="hint">{gate.hint}</span>{/if}
     <button
       class="runbtn"
       class:running={showGrid}
-      disabled={runState.phase === "starting" ||
-        runState.phase === "stopping" ||
-        (!showGrid && uiState.editorPath === null)}
+      disabled={gate.disabled}
       onclick={() => {
         void onRunClick();
       }}
@@ -200,7 +200,9 @@
   .brand { color: var(--accent); }
   .wf { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .err { color: var(--err); }
+  .hint { margin-left: auto; color: var(--text-dim); }
   .runbtn { margin-left: auto; color: var(--accent); }
+  .hint + .runbtn { margin-left: 0; }
   .runbtn.running { color: var(--err); }
   .meta { color: var(--text-dim); }
   .viewtoggle { display: flex; gap: 2px; }

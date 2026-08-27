@@ -11,6 +11,7 @@ const askBase = {
 export const askQueued: MessageRecord = {
   ...askBase, status: "queued", code: null, reply: null,
   created_at: "2026-08-01T17:03:11Z", injected_at: null, completed_at: null,
+  reason: null, reason_code: null,
 };
 export const askInjected: MessageRecord = {
   ...askQueued, status: "injected", injected_at: "2026-08-01T17:03:12Z",
@@ -25,9 +26,13 @@ export const sendQueued: MessageRecord = {
   id: "m-b7c21d0e", kind: "send", from: "agent:planner", to: "docs",
   body: "Document the /v1/messages endpoint.", status: "queued", code: null, reply: null,
   created_at: "2026-08-01T17:05:02Z", injected_at: null, completed_at: null,
+  reason: null, reason_code: null,
 };
 export const sendFailed: MessageRecord = {
   ...sendQueued, status: "failed", completed_at: "2026-08-01T17:05:10Z",
+  reason: "agent 'docs' exited before it completed this message; check its pane, " +
+    "restart it, then fire again",
+  reason_code: "agent_exited",
 };
 
 export const recordedRun: Event[] = [
@@ -42,14 +47,14 @@ export const recordedRun: Event[] = [
   { seq: 8, ts: "2026-08-01T17:04:42Z", type: "agent.state", agent: "builder", state: "idle" },
   { seq: 9, ts: "2026-08-01T17:05:02Z", type: "message.created", message: sendQueued },
   { seq: 10, ts: "2026-08-01T17:05:09Z", type: "agent.lifecycle", agent: "docs",
-    phase: "exited", exit_code: 1 },
+    phase: "exited", exit: { code: 1 } },
   { seq: 11, ts: "2026-08-01T17:05:10Z", type: "message.status", message: sendFailed },
   { seq: 12, ts: "2026-08-01T17:05:11Z", type: "agent.state", agent: "planner", state: "idle" },
 ];
 
 const agentDefaults = {
-  pending_asks: 0, exit_code: null, model: null, permission_mode: null,
-  auto_clear: true, pty_cursor: 0,
+  pending_asks: 0, exit: null, model: null, permission_mode: null,
+  auto_clear: true, isolated_config: false, skills: [], pty_cursor: 0, blocked: false,
 };
 
 export const snapshotRunning: Snapshot = {

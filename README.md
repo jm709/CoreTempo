@@ -23,9 +23,11 @@ work is done.
 - Edges declared in the workflow file become numbered delegation steps in each
   agent's prompt and are enforced at runtime: an agent that idles with unmet
   steps gets one nudge, then is flagged as stalled.
-- An optional `[trigger]` section makes a workflow self-starting: inject a
-  kickoff message at launch, or accept webhook kickoffs over HTTP with a
-  JSON-Schema-validated reply (`coretempod serve`).
+- Named `[flows.<name>]` sections make a workflow self-starting: each is an
+  independent sub-workflow — an agent subset with its own trigger and output
+  contract. `on_start` flows fire at launch (`coretempod run --flow <name>`,
+  or the desktop Run tab's fire control); `webhook` flows accept HTTP kickoffs
+  with a JSON-Schema-validated reply (`coretempod serve`).
 
 ## Requirements
 

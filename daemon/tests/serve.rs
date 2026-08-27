@@ -9,291 +9,37 @@
 //! `coretempod serve` end to end (spec triggers §3): a standing listener that
 //! cold-starts one run per trigger, FIFO, against a scripted fake agent.
 
-use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+mod support;
+
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-const DAEMON: &str = env!("CARGO_BIN_EXE_coretempod");
+use support::{
+    TOKEN, WEBHOOK, agent, daemon_command, daemon_command_without_token, json_of, log_file,
+    scratch, serving, wait_for_child_exit, wait_for_exit,
+};
 
-/// A fake `claude`: reports turn boundaries like the real hooks do and answers
-/// every ask it is given. Speaks HTTP over bash's `/dev/tcp` so the test needs
-/// no client binary on PATH.
-const FAKE_AGENT: &str = r#"#!/bin/bash
-me="$CORETEMPO_AGENT_ID"
-post() {
-  exec 3<>"/dev/tcp/127.0.0.1/$CORETEMPO_PORT" || return 1
-  printf 'POST %s HTTP/1.1\r\nHost: 127.0.0.1\r\n' "$1" >&3
-  printf 'Authorization: Bearer %s\r\n' "$CORETEMPO_TOKEN" >&3
-  printf 'X-CoreTempo-Agent: %s\r\n' "$me" >&3
-  printf 'Content-Type: application/json\r\nContent-Length: %d\r\n' "${#2}" >&3
-  printf 'Connection: close\r\n\r\n%s' "$2" >&3
-  cat <&3 >/dev/null
-  exec 3>&-
-}
-post "/v1/agents/$me/state" '{"state":"idle"}'
-last=""
-while IFS= read -r line; do
-  [[ "$line" =~ (m-[0-9a-f]+) ]] || continue
-  id="${BASH_REMATCH[1]}"
-  [ "$id" = "$last" ] && continue
-  last="$id"
-  post "/v1/agents/$me/state" '{"state":"working"}'
-  sleep "${FAKE_AGENT_DELAY:-0}"
-  post "/v1/messages/$id/reply" '{"code":0,"body":"ok"}'
-  post "/v1/agents/$me/state" '{"state":"idle"}'
-done
-"#;
+/// One agent, no flows: validation needs at least one agent, serve needs a
+/// webhook flow.
+const AGENT_ONLY: &str = "[agents.worker]\ndir = \"{dir}\"\nprompt = \"You reply.\"\n";
 
-const TOKEN: &str = "ab12cd34ef56ab78cd90ef12ab34cd56ef78ab90cd12ef34ab56cd78ef90ab12";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn agent() -> ureq::Agent {
-    let cfg = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_mins(1)))
-        .build();
-    ureq::Agent::new_with_config(cfg)
-}
-
-struct Scratch {
-    root: PathBuf,
-    config: PathBuf,
-    home: PathBuf,
-    bin: PathBuf,
-}
-
-/// A scratch home, a fake `claude` on PATH, and a tempo.toml with `trigger`.
-fn scratch(name: &str, trigger: &str) -> Scratch {
-    let root = std::env::temp_dir().join(format!("coretempo-serve-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let home = root.join("home");
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&bin).unwrap();
-
-    let fake = bin.join("claude");
-    std::fs::write(&fake, FAKE_AGENT).unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(root.join("token"), TOKEN).unwrap();
-
-    let config = root.join("tempo.toml");
-    std::fs::write(
-        &config,
-        format!(
-            // The file's port is never bound in serve mode — the listener takes
-            // --port and each triggered run binds an ephemeral one — so this is
-            // a literal rather than another racy free_port().
-            "[workflow]\nname = \"serve-{name}\"\nport = 4820\ndb = \"{db}\"\n\
-             ask_timeout_minutes = 1\nidle_debounce_seconds = 0.3\n\
-             [agents.worker]\ndir = \"{dir}\"\nprompt = \"You reply.\"\n{trigger}",
-            db = root.join("tempo.db").display(),
-            dir = root.display(),
-        ),
-    )
-    .unwrap();
-    Scratch {
-        root,
-        config,
-        home,
-        bin,
-    }
-}
-
-const WEBHOOK: &str = "[trigger]\ntype = \"webhook\"\nedge = { to = \"worker\", kind = \"ask\" }\n";
-
-struct Serving {
-    child: Child,
-    port: u16,
-    scratch: Scratch,
-}
-
-impl Drop for Serving {
-    fn drop(&mut self) {
-        // Interrupt rather than kill: the daemon owns PTY children, and SIGKILL
-        // would orphan them.
-        let _ = Command::new("kill")
-            .arg("-INT")
-            .arg(self.child.id().to_string())
-            .stderr(Stdio::null())
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_)) | Err(_)) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn daemon_command(scratch: &Scratch, sub: &str, port: u16, delay: &str) -> Command {
-    let mut cmd = Command::new(DAEMON);
-    let path = std::env::var("PATH").unwrap_or_default();
-    cmd.arg(sub)
-        .arg(&scratch.config)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--token-file")
-        .arg(scratch.root.join("token"))
-        .env("HOME", &scratch.home)
-        .env("PATH", format!("{}:{path}", scratch.bin.display()))
-        .env("FAKE_AGENT_DELAY", delay)
-        .env("RUST_LOG", "info");
-    cmd
-}
-
-fn log_file(root: &Path, name: &str) -> std::fs::File {
-    std::fs::File::create(root.join(name)).unwrap()
-}
-
-/// Starts `coretempod serve` and waits for its health endpoint.
-fn serving(name: &str, delay: &str) -> Serving {
-    let scratch = scratch(name, WEBHOOK);
-    let port = free_port();
-    let child = daemon_command(&scratch, "serve", port, delay)
-        .stdout(Stdio::from(log_file(&scratch.root, "out.log")))
-        .stderr(Stdio::from(log_file(&scratch.root, "err.log")))
-        .spawn()
-        .unwrap();
-    let serving = Serving {
-        child,
-        port,
-        scratch,
-    };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if let Ok((200, body)) = serving.get("/v1/health") {
-            assert_eq!(body["status"], "ok", "health: {body}");
-            return serving;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "serve never became healthy; stderr:\n{}",
-        serving.stderr_text()
-    );
-}
-
-impl Serving {
-    fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port)
-    }
-
-    /// Both daemon logs: tracing goes to stdout, anyhow's exit error to stderr.
-    fn stderr_text(&self) -> String {
-        let read =
-            |name: &str| std::fs::read_to_string(self.scratch.root.join(name)).unwrap_or_default();
-        format!("{}{}", read("out.log"), read("err.log"))
-    }
-
-    fn get(&self, path: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-        self.get_as(path, Some(TOKEN))
-    }
-
-    /// GET with an explicit bearer token, or none at all.
-    fn get_as(&self, path: &str, token: Option<&str>) -> anyhow::Result<(u16, serde_json::Value)> {
-        let mut req = agent().get(self.url(path));
-        if let Some(token) = token {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-        let mut res = req.call()?;
-        let status = res.status().as_u16();
-        Ok((status, json_of(res.body_mut().read_to_string()?)))
-    }
-
-    fn fire(&self, query: &str, body: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-        self.fire_as(query, body, Some(TOKEN))
-    }
-
-    /// POST a trigger with an explicit bearer token, or none at all.
-    fn fire_as(
-        &self,
-        query: &str,
-        body: &str,
-        token: Option<&str>,
-    ) -> anyhow::Result<(u16, serde_json::Value)> {
-        let mut req = agent()
-            .post(self.url(&format!("/v1/trigger{query}")))
-            .header("Content-Type", "text/plain");
-        if let Some(token) = token {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-        let mut res = req.send(body)?;
-        let status = res.status().as_u16();
-        Ok((status, json_of(res.body_mut().read_to_string()?)))
-    }
-
-    /// GET with a `Host` the daemon should not answer to.
-    fn get_with_host(&self, path: &str, host: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-        let mut res = agent()
-            .get(self.url(path))
-            .header("Authorization", format!("Bearer {TOKEN}"))
-            .header("Host", host)
-            .call()?;
-        let status = res.status().as_u16();
-        Ok((status, json_of(res.body_mut().read_to_string()?)))
-    }
-
-    /// Fires a trigger, asserting it was accepted, and returns its id.
-    fn fire_ok(&self, body: &str) -> String {
-        let (status, json) = self.fire("", body).unwrap();
-        assert_eq!(status, 202, "trigger rejected: {json}");
-        json["trigger_id"].as_str().unwrap().to_string()
-    }
-
-    fn status_of(&self, id: &str) -> serde_json::Value {
-        self.get(&format!("/v1/trigger/{id}")).unwrap().1
-    }
-
-    /// Polls until `id` is no longer queued or running.
-    fn settled(&self, id: &str) -> serde_json::Value {
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while Instant::now() < deadline {
-            let body = self.status_of(id);
-            let status = body["status"].as_str().unwrap_or_default();
-            if status != "queued" && status != "running" {
-                return body;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!(
-            "trigger {id} never settled; stderr:\n{}",
-            self.stderr_text()
-        );
-    }
-
-    fn interrupt(&self) {
-        let ok = Command::new("kill")
-            .arg("-INT")
-            .arg(self.child.id().to_string())
-            .status()
-            .unwrap();
-        assert!(ok.success(), "could not signal the daemon");
-    }
-}
-
-fn json_of(text: String) -> serde_json::Value {
-    serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
-}
+/// Two flows, both `on_start`: serve has nothing to listen for, but unlike
+/// [`AGENT_ONLY`] the caller has flows to run — the refusal has to name them.
+const ON_START_ONLY: &str = "[agents.worker]\ndir = \"{dir}\"\nprompt = \"You reply.\"\n\
+                             [flows.nightly]\nagents = [\"worker\"]\n\
+                             trigger = { type = \"on_start\", message = \"go\", \
+                             edge = { to = \"worker\", kind = \"ask\" } }\n\
+                             [flows.weekly]\nagents = [\"worker\"]\n\
+                             trigger = { type = \"on_start\", message = \"go\", \
+                             edge = { to = \"worker\", kind = \"ask\" } }\n";
 
 #[test]
 fn a_trigger_cold_starts_a_run_and_reports_the_reply() -> anyhow::Result<()> {
     let serve = serving("basic", "0");
     let (status, health) = serve.get("/v1/health")?;
     assert_eq!(status, 200);
-    assert_eq!(health["queue_depth"], 0);
-    assert!(health["current_run_id"].is_null(), "health: {health}");
+    assert_eq!(health["queued"]["main"], 0, "health: {health}");
+    assert_eq!(health["running"], 0, "health: {health}");
 
     let id = serve.fire_ok("please do the thing");
     assert!(id.starts_with("t-"), "id: {id}");
@@ -303,9 +49,18 @@ fn a_trigger_cold_starts_a_run_and_reports_the_reply() -> anyhow::Result<()> {
     assert_eq!(done["code"], 0);
     assert_eq!(done["reply"], "ok");
 
+    // Amendment 31 (#42): a cold-started kickoff names its flow, same as a warm
+    // one — the serve path builds it through the same `create_kickoff`.
+    let prompts =
+        std::fs::read_to_string(serve.scratch.root.join("prompts.log")).unwrap_or_default();
+    assert!(
+        prompts.contains("from http, flow main"),
+        "the kickoff typed at the agent names its flow; prompts:\n{prompts}"
+    );
+
     // The run was torn down: no agents are held between triggers.
     let (_, health) = serve.get("/v1/health")?;
-    assert!(health["current_run_id"].is_null(), "health: {health}");
+    assert_eq!(health["running"], 0, "health: {health}");
     // And its artifact directory was cleaned up, so a long-lived daemon does not
     // accumulate one per trigger.
     let runs = serve.scratch.home.join(".coretempo/runs");
@@ -345,10 +100,10 @@ fn health_is_open_but_triggers_need_the_token() -> anyhow::Result<()> {
     // None of the refused requests queued anything.
     let (_, health) = serve.get("/v1/health")?;
     assert_eq!(
-        health["queue_depth"], 0,
+        health["queued"]["main"], 0,
         "a refused trigger queued: {health}"
     );
-    assert!(health["current_run_id"].is_null(), "health: {health}");
+    assert_eq!(health["running"], 0, "health: {health}");
 
     // A Host the daemon does not answer to is refused even with the token:
     // this is what blocks DNS-rebinding at the public port.
@@ -359,6 +114,28 @@ fn health_is_open_but_triggers_need_the_token() -> anyhow::Result<()> {
     // And the real token still works, so the checks are not refusing everything.
     let id = serve.fire_ok("do the thing");
     assert_eq!(serve.settled(&id)["status"], "completed");
+    Ok(())
+}
+
+#[test]
+fn a_serve_401_points_at_the_daemons_own_token() -> anyhow::Result<()> {
+    // #57: api.json belongs to interactive runs. A serve daemon writes none and
+    // never repoints `current`, so pointing a 401'd caller there sends it to a
+    // stale token from somebody else's run.
+    let serve = serving("401-hint", "0");
+    let (status, body) = serve.fire_as("", "let me in", None)?;
+    assert_eq!(status, 401, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("runs/current"),
+        "serve keeps no api.json under runs/current: {message}"
+    );
+    for hint in ["CORETEMPO_TOKEN", "token_file"] {
+        assert!(
+            message.contains(hint),
+            "the 401 must name '{hint}': {message}"
+        );
+    }
     Ok(())
 }
 
@@ -455,10 +232,10 @@ fn an_edited_workflow_fails_the_trigger_not_the_daemon() -> anyhow::Result<()> {
 
 #[test]
 fn serve_refuses_a_workflow_without_a_webhook_trigger() {
-    let scratch = scratch("no-trigger", "");
-    let out = daemon_command(&scratch, "serve", free_port(), "0")
-        .output()
-        .unwrap();
+    // A workflow with an agent but no flows at all: serve has nothing to listen
+    // for and must say so.
+    let scratch = scratch("no-trigger", AGENT_ONLY);
+    let out = daemon_command(&scratch, "serve", 0, "0").output().unwrap();
     assert!(!out.status.success(), "serve accepted a plain workflow");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -468,13 +245,62 @@ fn serve_refuses_a_workflow_without_a_webhook_trigger() {
 }
 
 #[test]
+fn serve_refuses_an_on_start_only_workflow_naming_its_flows() {
+    // The flows exist, they just fire at launch: the caller needs their names
+    // and the command that runs one, not the webhook advice the flowless case
+    // gets (spec §6 — "naming what it found").
+    let scratch = scratch("on-start-only", ON_START_ONLY);
+    let out = daemon_command(&scratch, "serve", 0, "0").output().unwrap();
+    assert!(
+        !out.status.success(),
+        "serve accepted an on_start-only file"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nightly") && stderr.contains("weekly"),
+        "the refusal must name the on_start flows it found: {stderr}"
+    );
+    let run_one = format!("coretempod run {} --flow nightly", scratch.config.display());
+    assert!(
+        stderr.contains(&run_one),
+        "the refusal must point at a runnable `{run_one}`: {stderr}"
+    );
+}
+
+#[test]
+fn serve_refuses_to_start_without_a_provisioned_token() {
+    // #57: serve writes no api.json and never repoints ~/.coretempo/runs/current,
+    // so a generated token reaches nobody — the daemon would listen and 401
+    // every trigger forever. It has to refuse at startup instead, naming all
+    // three ways to provision one.
+    let scratch = scratch("no-token", WEBHOOK);
+    let mut child = daemon_command_without_token(&scratch, "serve", 0, "0")
+        .stdout(Stdio::from(log_file(&scratch.root, "out.log")))
+        .stderr(Stdio::from(log_file(&scratch.root, "err.log")))
+        .spawn()
+        .unwrap();
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(20));
+    let stderr = std::fs::read_to_string(scratch.root.join("err.log")).unwrap_or_default();
+    assert!(
+        !status.success(),
+        "serve started with no token anyone could send: {stderr}"
+    );
+    for hint in ["CORETEMPO_TOKEN", "--token-file", "token_file", "headless"] {
+        assert!(
+            stderr.contains(hint),
+            "the refusal must name '{hint}': {stderr}"
+        );
+    }
+}
+
+#[test]
 fn interrupting_the_daemon_fails_the_queued_triggers() -> anyhow::Result<()> {
     let mut serve = serving("shutdown", "6");
     let _running = serve.fire_ok("one");
 
     // A long-poll on the queued trigger: ctrl-c must answer it rather than drop
     // the connection.
-    let url = serve.url("/v1/trigger?wait=45");
+    let url = serve.url("/v1/flows/main/trigger?wait=45");
     let waiter = std::thread::spawn(move || {
         let mut res = agent()
             .post(url)
@@ -525,20 +351,6 @@ fn interrupting_the_daemon_fails_the_queued_triggers() -> anyhow::Result<()> {
         "only the in-flight trigger may have started a run; logs:\n{logs}"
     );
     Ok(())
-}
-
-fn wait_for_exit(serve: &mut Serving, within: Duration) -> std::process::ExitStatus {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if let Some(status) = serve.child.try_wait().expect("wait on the daemon") {
-            return status;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!(
-        "the daemon did not exit within {within:?}; stderr:\n{}",
-        serve.stderr_text()
-    );
 }
 
 #[test]

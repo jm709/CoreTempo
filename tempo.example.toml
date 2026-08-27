@@ -11,29 +11,40 @@
 name = "example"
 # db = "./tempo.db"            # message log (default: ./tempo.db)
 # port = 4820                  # local API port
-# ask_timeout_minutes = 30     # an ask with no reply fails after this
+# ask_timeout_minutes = 30     # an ask with no reply fails after this (sooner,
+#                              # with a reason, if the target is parked on a
+#                              # permission dialog)
 # idle_debounce_seconds = 2.0  # stable-idle dwell before /clear and send-acks
 # scrollback = 5000            # terminal history lines per pane (~1 KiB x lines x agents)
 
 [server]
 # bind = "127.0.0.1"           # non-loopback requires a provisioned token
 # log = "info"                 # tracing EnvFilter string
+# max_concurrent_runs = 2      # serve mode: ceiling on simultaneously live runs (1-16)
+# trust_agent_dirs = false     # true lets CoreTempo mark each agent's git root trusted in
+#                              # ~/.claude.json (also settable in ~/.coretempo/config.toml);
+#                              # otherwise an untrusted dir refuses the run naming it
 
-# Make the workflow self-starting (optional). on_start kicks off at launch;
-# webhook + `coretempod serve` starts a run per POST /v1/trigger call.
-# [trigger]
-# type = "on_start"
-# edge = { to = "planner", kind = "ask" }
-# message = "Plan the implementation."
+# Declare named flows (optional): each [flows.<name>] is an independent
+# sub-workflow — an agent subset, a trigger, and (for webhooks) an output
+# contract. Nothing fires on its own. A bare `coretempod run` (and the desktop
+# app's Run) starts every agent and waits; fire an on_start flow with
+# `coretempod run tempo.toml --flow plan` (its subset only, exiting 0/1 when the
+# kickoff completes) or the desktop app's ▶ on the flow. A webhook flow fires on
+# POST /v1/flows/<name>/trigger — `coretempod serve` answers that route by
+# cold-starting a run per call; a warm run answers it too.
+# [flows.plan]
+# agents = ["planner", "builder"]      # non-empty, edge-closed subset of [agents.*]
+# trigger = { type = "on_start", edge = { to = "planner", kind = "ask" }, message = "Plan the implementation." }
 
 # Or accept kickoffs over HTTP, optionally with a structured-output contract
-# ([trigger.output] requires type = "webhook" with an ask edge; the reply is
-# validated against the schema and delivered parsed to the caller — and shown
-# in the desktop app's Run tab):
-# [trigger]
-# type = "webhook"
-# edge = { to = "planner", kind = "ask" }
-# [trigger.output]                       # reply must match this JSON Schema;
+# ([flows.<name>.output] requires type = "webhook" with an ask edge; the reply
+# is validated against the schema and delivered parsed to the caller — and
+# shown in the desktop app's Run tab):
+# [flows.review]
+# agents = ["planner", "builder"]
+# trigger = { type = "webhook", edge = { to = "planner", kind = "ask" } }
+# [flows.review.output]                  # reply must match this JSON Schema;
 # schema_file = "schemas/result.json"    # path relative to this file (or use
 #                                        # an inline `schema = { ... }` table).
 # max_repairs = 2                        # rejections before the trigger fails
@@ -45,6 +56,8 @@ You are the planning agent. You break work into tasks and delegate them to the
 builder, then review what comes back. Do not write code yourself.
 """
 # model = "opus"
+# concurrency = "exclusive"    # "shared" lets sessions overlap across runs —
+#                              # only for agents that never mutate their dir
 # Deterministic delegation: composed into the prompt as required steps and
 # enforced by the server (nudge instead of /clear when skipped). Kinds: "ask"
 # (one round-trip), "send" (one-way handoff), "loop" (supervised iteration —
@@ -64,7 +77,32 @@ You implement tasks sent to you by the planner. Reply with a one-paragraph
 summary of what you changed, using code 0 on success and 1 if you were blocked.
 """
 # permission_mode = "acceptEdits"
+# on_permission_prompt = "deny"  # what the agent's PermissionRequest hook does with a tool
+#                                # call no allow rule covers: "deny" (default) refuses it
+#                                # in-turn with a message naming the fix, so the agent
+#                                # carries on; "wait" leaves the dialog up for a human.
 # tools = ["pat"]              # extra CLI allowlist: Bash(pat:*) in generated settings
+# allow = ["WebSearch", "WebFetch"]   # extra Claude Code permission rules, written verbatim
+# mcp = ["context7"]           # MCP servers by name, resolved from ~/.claude.json,
+#                              # ~/.mcp.json or the agent dir's .mcp.json; agents spawn
+#                              # with --strict-mcp-config so nothing else leaks in
+# Pair `mcp` with an `allow` rule per MCP tool the agent calls — MCP permissions are
+# per tool (`mcp__<server>__<tool>`), so naming the server is not permission to use it:
+#   mcp   = ["context7"]
+#   allow = ["mcp__context7__resolve-library-id"]
+# Without the rule the first MCP call parks on Claude Code's in-turn permission dialog:
+# CoreTempo publishes agent.blocked (⏸ + the tool name) and the agent reads `working`
+# forever — never idle, so it is never nudged or stalled, and nothing auto-recovers it.
+
+# Every agent inherits the operator's ~/.claude by default: global CLAUDE.md,
+# settings.json (hooks, plugins, model), every installed skill and plugin,
+# and — when dir is the operator's own repo — the shared auto-memory dir.
+# isolated_config = true        # spawn against a CoreTempo-managed CLAUDE_CONFIG_DIR instead:
+#                               # only the login (shared with yours), the repo's CLAUDE.md/.claude,
+#                               # and what CoreTempo passes (hooks, allow, mcp). No memory, no plugins.
+# skills = ["./skills/handoff"] # skill dirs (each with a SKILL.md) relative to this file,
+#                               # linked into that config dir; requires isolated_config. Their
+#                               # files join the freeze hash like schema files.
 
 # ── Pattern: connecting an agent to an app API (an "API source") ──────────
 # When an agent must drive a local app's HTTP API correctly, keep the
@@ -80,5 +118,5 @@ summary of what you changed, using code 0 on success and 1 if you were blocked.
 #     parks on Claude Code's approval dialog and hangs the agent;
 #   - POST JSON bodies with `-d @file.json` — inline JSON breaks on quotes;
 #   - if the app is unreachable, reply with --code 1 and a one-line reason.
-# Worked example: the gp-research workflow in adding-to-DC
-# (research/tempo.toml).
+# The payoff: the app's schema and its validation cannot drift apart, and no
+# workflow prompt goes stale when the request shape changes.

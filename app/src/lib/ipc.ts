@@ -1,7 +1,8 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
-  CmdError, Event, MessageKind, MessageRecord, ParseReport, RunInfo, Snapshot, WorkflowModel,
+  CmdError, Event, FlowInfo, MessageKind, MessageRecord, ParseReport, RunInfo, Snapshot,
+  WorkflowModel,
 } from "./types";
 
 export const CORE_EVENT = "coretempo:event";
@@ -18,9 +19,13 @@ export function snapshot(): Promise<Snapshot> {
   return invoke("snapshot");
 }
 
-export function runStart(configPath: string): Promise<RunInfo> {
+export function runUntrustedDirs(configPath: string): Promise<string[]> {
+  return invoke("run_untrusted_dirs", { config_path: configPath });
+}
+
+export function runStart(configPath: string, trustConfirmed: boolean): Promise<RunInfo> {
   // Wire arg keys are snake_case: the shell declares rename_all = "snake_case".
-  return invoke("run_start", { config_path: configPath });
+  return invoke("run_start", { config_path: configPath, trust_confirmed: trustConfirmed });
 }
 
 export function runStop(): Promise<void> {
@@ -93,6 +98,16 @@ export function workflowMerge(text: string, model: WorkflowModel): Promise<strin
 
 export function sendChat(to: string, kind: MessageKind, body: string): Promise<MessageRecord> {
   return invoke("send_chat", { to, kind, body });
+}
+
+export function runFlows(): Promise<FlowInfo[]> {
+  return invoke("run_flows");
+}
+
+/** Returns the hub trigger id ("t-<hex>") — the fired kickoff's lifecycle
+ * arrives via bus events; the id is for correlation. */
+export function fireFlow(name: string): Promise<string> {
+  return invoke("fire_flow", { name });
 }
 
 export async function onCoreEvent(handler: (ev: Event) => void): Promise<() => void> {

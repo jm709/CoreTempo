@@ -10,9 +10,9 @@ The `[trigger.output]` feature (2026-08-06 design) delivers a validated, parsed
 `output` object to HTTP callers — but the desktop app is a black box while that
 happens. The only in-app signal is a one-line status-bar banner ("workflow replied
 (code 0)") with no reply text, no `output`, and no visibility into the schema-repair
-loop; each trigger overwrites it, and a reload loses even that. The adding-to-DC
-integration exercises the full trigger path today and gets nothing visual in
-CoreTempo.
+loop; each trigger overwrites it, and a reload loses even that. An external
+integration driving the full trigger path over HTTP therefore gets nothing
+visual in CoreTempo.
 
 This feature adds a third dock tab that shows each trigger's full lifecycle and
 renders the validated `output` visually. The design constraint that shaped every
@@ -53,8 +53,8 @@ per run — every warm-run `POST /v1/trigger` spawns its own `watch_completion`
 (`core/src/api/trigger.rs`), as do serve-mode cold starts (`daemon/src/serve.rs`)
 and the desktop `on_start` path (`app/src-tauri/src/commands.rs`), and
 `watch_completion` itself publishes the event (`core/src/trigger.rs`). The kickoff
-is already observable in the UI as `message.created` with `from = "http:<hex>"`
-(trigger id `t-<hex>`). The only data missing from the bus is terminal.
+is already observable in the UI as `message.created` with `from = "trigger:<hex>"`
+(trigger id `t-<hex>`; `http:<hex>` until contracts amendment 38). The only data missing from the bus is terminal.
 
 `WorkflowCompleted` gains additive fields:
 
@@ -78,12 +78,11 @@ so a second event adds surface without adding information. Riding the existing b
 also means headless observers get the enrichment through SSE `/v1/events` for free
 — the plumbing is reusable infrastructure, not desktop-only.
 
-The `http:<hex>` origin is not exclusive to trigger kickoffs: any authenticated
-`POST /v1/messages` without an `X-CoreTempo-Agent` header also gets
-`Origin::Http(<request-id>)` (`core/src/api/auth.rs`), so the UI's kickoff
-correlation can open a lifecycle row for a non-trigger HTTP message until a
-dedicated origin discriminator lands (tracked follow-up; a reload clears such
-rows since the snapshot reseeds from the hub).
+Kickoffs originally shared the `http:<hex>` origin with any authenticated
+`POST /v1/messages` lacking an `X-CoreTempo-Agent` header, so a manual
+`tempo ask` could open a phantom lifecycle row. Contracts amendment 38 (#24)
+gives kickoffs their own `trigger:<hex>` origin; the correlation matches that
+prefix only.
 
 ## Snapshot: surviving reload
 
@@ -140,9 +139,9 @@ Keys are deterministic (alphabetical), so layout is stable across runs. The
 node-type decision logic lives in a plain-TS helper (`triggerHelpers.ts`) so it is
 unit-testable like `feedHelpers.ts`; `OutputRenderer.svelte` recurses over the
 helper's classification. Styling via existing tokens (`styles/tokens.css`) and
-scoped CSS — no new dependencies. Calibration target: adding-to-DC's output is a
-flat-ish object, so the key/value card is the primary form; tables, prose blocks
-and the fallback keep other shapes presentable rather than optimal.
+scoped CSS — no new dependencies. Calibration target: the typical contract
+returns a flat-ish object, so the key/value card is the primary form; tables,
+prose blocks and the fallback keep other shapes presentable rather than optimal.
 
 ## Docs
 

@@ -1,4 +1,5 @@
-//! `/v1/agents*` handlers: roster (raw state + `pending_asks`), detail, reported
+//! `/v1/agents*` handlers: roster (raw state + `pending_asks` — asks the agent
+//! SENT that are not yet terminal, not asks addressed to it), detail, reported
 //! state, async restart.
 
 use axum::Json;
@@ -12,7 +13,8 @@ use crate::types::agent::{AgentDetail, AgentInfo, AgentState};
 use crate::types::config::AgentConfig;
 use crate::types::message::Origin;
 use crate::types::{
-    AgentId, AgentListResponse, AgentStateResponse, ReportStateRequest, RestartResponse,
+    AgentId, AgentListResponse, AgentStateResponse, ReportStateRequest, ReportedState,
+    RestartResponse,
 };
 
 fn roster_agent<'a>(ctx: &'a ApiContext, id: &AgentId) -> Result<&'a AgentConfig, ApiError> {
@@ -24,12 +26,13 @@ fn roster_agent<'a>(ctx: &'a ApiContext, id: &AgentId) -> Result<&'a AgentConfig
 
 fn agent_info(ctx: &ApiContext, id: &AgentId) -> Result<AgentInfo, ApiError> {
     let state = ctx.pty.state(id).map_err(ApiError::internal)?;
-    let exit_code = ctx.pty.exit_code(id).map_err(ApiError::internal)?;
+    let exit = ctx.pty.exit(id).map_err(ApiError::internal)?;
     Ok(AgentInfo {
         id: id.clone(),
         state,
         pending_asks: ctx.router.pending_asks(id),
-        exit_code,
+        exit,
+        blocked: ctx.pty.blocked(id).map_err(ApiError::internal)?,
     })
 }
 
@@ -57,12 +60,19 @@ pub(crate) async fn get_agent(
         model: config.model,
         permission_mode: config.permission_mode,
         auto_clear: config.auto_clear,
+        isolated_config: config.isolated_config,
+        skills: config
+            .skills
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         pty_cursor,
     }))
 }
 
 /// Reported state from the agent's own hooks (`SessionStart`/`Stop` → idle,
-/// `UserPromptSubmit` → working). Only the agent itself may report: the identity in
+/// `UserPromptSubmit` → working, `PermissionRequest` → blocked, `PostToolBatch`
+/// → unblocked). Only the agent itself may report: the identity in
 /// `X-CoreTempo-Agent` must equal `{id}`, mirroring the reply handler's replier rule.
 pub(crate) async fn report_state(
     State(ctx): State<ApiContext>,
@@ -72,8 +82,11 @@ pub(crate) async fn report_state(
 ) -> Result<Response, ApiError> {
     let req: ReportStateRequest = serde_json::from_slice(&body).map_err(|error| {
         ApiError::invalid(format!(
-            "malformed state body: {error}; expected {{\"state\":\"working\"}} or \
-             {{\"state\":\"idle\"}} — an agent reports only those two states"
+            "malformed state body: {error}; expected \
+             {{\"state\":\"working\"|\"idle\"|\"blocked\"|\"unblocked\"|\"refused\"}} \
+             (optional \"tool\" with blocked or refused, optional \"input\" with \
+             refused, optional \"agent_id\" with either of blocked and unblocked) — an \
+             agent's hooks report only those"
         ))
     })?;
     let id = AgentId(id);
@@ -90,11 +103,34 @@ pub(crate) async fn report_state(
             ),
         ));
     }
-    let state: AgentState = req.state.into();
-    ctx.pty
-        .report_state(&id, state)
-        .map_err(ApiError::internal)?;
+    // A hook with no tool_name/agent_id sends "" rather than omitting the field.
+    let hook_agent = trimmed_capped(req.agent_id, 64);
+    match req.state {
+        ReportedState::Working => ctx.pty.report_state(&id, AgentState::Working),
+        ReportedState::Idle => ctx.pty.report_state(&id, AgentState::Idle),
+        ReportedState::Blocked => {
+            ctx.pty
+                .report_blocked(&id, trimmed_capped(req.tool, 128), hook_agent)
+        }
+        ReportedState::Unblocked => ctx.pty.report_unblocked(&id, hook_agent),
+        ReportedState::Refused => ctx.pty.report_refused(
+            &id,
+            trimmed_capped(req.tool, 128),
+            trimmed_capped(req.input, 200),
+        ),
+    }
+    .map_err(ApiError::internal)?;
+    let state = ctx.pty.state(&id).map_err(ApiError::internal)?;
     Ok(Json(AgentStateResponse { agent: id, state }).into_response())
+}
+
+/// Normalises a hook-supplied string: blank (the shape a hook with no value
+/// sends) becomes `None`, and anything longer than `max` chars is truncated so
+/// a malformed payload cannot grow the roster response without bound.
+fn trimmed_capped(value: Option<String>, max: usize) -> Option<String> {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.chars().take(max).collect::<String>())
 }
 
 /// `POST /v1/agents/{id}/loop-done` (edge-semantics spec): the calling agent

@@ -12,7 +12,27 @@ export type ReasonCode =
   | "kickoff_rejected"
   | "internal"
   | "workflow_changed"
+  | "blocked_on_permission"
+  | "agent_restarted"
   | (string & {});
+
+/**
+ * Every failure code core documents today. The `ReasonCode` union ends in
+ * `(string & {})` so a bogus literal still type-checks — this array is what
+ * actually pins the documented set, and `satisfies` fails the build if a member
+ * is not one of the named variants.
+ */
+export const KNOWN_REASON_CODES = [
+  "schema_validation_failed",
+  "agent_failed",
+  "timeout",
+  "agent_exited",
+  "agent_restarted",
+  "blocked_on_permission",
+  "kickoff_rejected",
+  "internal",
+  "workflow_changed",
+] as const satisfies readonly ReasonCode[];
 
 /** 202 body: the result arrives later via GET /v1/trigger/{id}. */
 export interface TriggerAccepted {

@@ -5,7 +5,9 @@
     reason = "each integration-test crate uses a subset of this harness"
 )]
 
-use std::collections::BTreeMap;
+pub mod run;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,9 +24,10 @@ use coretempo_core::store::Store;
 use coretempo_core::time::Timestamp;
 use coretempo_core::trigger::TriggerHub;
 use coretempo_core::types::config::{
-    AgentConfig, FrozenWorkflow, ServerSection, TriggerConfig, WorkflowFile, WorkflowSection,
+    AgentConfig, FlowConfig, FrozenFlow, FrozenWorkflow, ServerSection, TriggerConfig, TriggerType,
+    WorkflowFile, WorkflowSection,
 };
-use coretempo_core::types::{AgentId, AgentState, RunId, Token};
+use coretempo_core::types::{AgentExit, AgentId, AgentState, FlowName, RunId, Token};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// Injection stub: resolves every enqueue immediately with an advancing cursor.
@@ -61,15 +64,28 @@ impl InjectionQueue for StubInjector {
     }
 }
 
-type FakeAgent = (AgentState, Option<i32>, Vec<PtyChunk>);
+type FakeAgent = (AgentState, Option<AgentExit>, Vec<PtyChunk>);
 
 /// In-memory `PtySource`. Tests preload states/chunks and can push live chunks afterwards.
+/// One `report_refused` call: the agent, the tool, and the input summary.
+pub type RefusedReport = (AgentId, Option<String>, Option<String>);
+
 pub struct FakePty {
     pub agents: Mutex<BTreeMap<AgentId, FakeAgent>>,
     pub restarts: Mutex<Vec<AgentId>>,
     pub senders: Mutex<Vec<(AgentId, mpsc::Sender<PtyChunk>)>>,
     pub queue_depths: Mutex<BTreeMap<AgentId, u64>>,
     pub debounced: Mutex<BTreeMap<AgentId, watch::Sender<AgentState>>>,
+    pub blocked: Mutex<BTreeSet<AgentId>>,
+    /// Every `report_blocked` call, so tests can see the forwarded tool name.
+    pub blocked_reports: Mutex<Vec<(AgentId, Option<String>)>>,
+    /// Every `report_unblocked` call with the hook `agent_id` it carried.
+    pub unblocked_reports: Mutex<Vec<(AgentId, Option<String>)>>,
+    /// Every `report_refused` call with the tool and input summary the hook named.
+    pub refused_reports: Mutex<Vec<RefusedReport>>,
+    /// The hook `agent_id` of every `report_blocked` call, in the same order as
+    /// `blocked_reports`.
+    pub blocked_agent_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl FakePty {
@@ -80,6 +96,11 @@ impl FakePty {
             senders: Mutex::new(Vec::new()),
             queue_depths: Mutex::new(BTreeMap::new()),
             debounced: Mutex::new(BTreeMap::new()),
+            blocked: Mutex::new(BTreeSet::new()),
+            blocked_reports: Mutex::new(Vec::new()),
+            unblocked_reports: Mutex::new(Vec::new()),
+            refused_reports: Mutex::new(Vec::new()),
+            blocked_agent_ids: Mutex::new(Vec::new()),
         })
     }
 
@@ -87,7 +108,7 @@ impl FakePty {
         &self,
         id: &str,
         state: AgentState,
-        exit_code: Option<i32>,
+        exit: Option<AgentExit>,
         chunks: Vec<(u64, &[u8])>,
     ) {
         let chunks = chunks
@@ -98,7 +119,7 @@ impl FakePty {
             })
             .collect();
         if let Ok(mut agents) = self.agents.lock() {
-            agents.insert(AgentId(id.to_string()), (state, exit_code, chunks));
+            agents.insert(AgentId(id.to_string()), (state, exit, chunks));
         }
     }
 
@@ -114,6 +135,48 @@ impl FakePty {
                 }
             }
         }
+    }
+
+    pub fn set_blocked(&self, id: &str, on: bool) {
+        if let Ok(mut blocked) = self.blocked.lock() {
+            let agent = AgentId(id.to_string());
+            if on {
+                blocked.insert(agent);
+            } else {
+                blocked.remove(&agent);
+            }
+        }
+    }
+
+    pub fn blocked_reports(&self) -> Vec<(AgentId, Option<String>)> {
+        self.blocked_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default()
+    }
+
+    /// Hook `agent_id`s forwarded with each `report_blocked`, in call order.
+    pub fn blocked_agent_ids(&self) -> Vec<Option<String>> {
+        self.blocked_agent_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every `report_refused` call with the tool and input summary it carried.
+    pub fn refused_reports(&self) -> Vec<RefusedReport> {
+        self.refused_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every `report_unblocked` call with the hook `agent_id` it carried.
+    pub fn unblocked_reports(&self) -> Vec<(AgentId, Option<String>)> {
+        self.unblocked_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default()
     }
 
     fn lookup(&self, agent: &AgentId) -> Result<FakeAgent, PtyError> {
@@ -141,8 +204,51 @@ impl PtySource for FakePty {
         entry.0 = state;
         Ok(())
     }
-    fn exit_code(&self, agent: &AgentId) -> Result<Option<i32>, PtyError> {
-        self.lookup(agent).map(|(_, code, _)| code)
+    fn report_blocked(
+        &self,
+        agent: &AgentId,
+        tool: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<(), PtyError> {
+        self.lookup(agent)?;
+        self.blocked_reports
+            .lock()
+            .map_err(|_| poisoned())?
+            .push((agent.clone(), tool));
+        self.blocked_agent_ids
+            .lock()
+            .map_err(|_| poisoned())?
+            .push(agent_id);
+        self.blocked
+            .lock()
+            .map_err(|_| poisoned())?
+            .insert(agent.clone());
+        Ok(())
+    }
+    fn report_refused(
+        &self,
+        agent: &AgentId,
+        tool: Option<String>,
+        input: Option<String>,
+    ) -> Result<(), PtyError> {
+        self.lookup(agent)?;
+        self.refused_reports
+            .lock()
+            .map_err(|_| poisoned())?
+            .push((agent.clone(), tool, input));
+        Ok(())
+    }
+    fn report_unblocked(&self, agent: &AgentId, agent_id: Option<String>) -> Result<(), PtyError> {
+        self.lookup(agent)?;
+        self.unblocked_reports
+            .lock()
+            .map_err(|_| poisoned())?
+            .push((agent.clone(), agent_id));
+        self.blocked.lock().map_err(|_| poisoned())?.remove(agent);
+        Ok(())
+    }
+    fn exit(&self, agent: &AgentId) -> Result<Option<AgentExit>, PtyError> {
+        self.lookup(agent).map(|(_, exit, _)| exit)
     }
     fn end_cursor(&self, agent: &AgentId) -> Result<Cursor, PtyError> {
         let (_, _, chunks) = self.lookup(agent)?;
@@ -192,6 +298,14 @@ impl PtySource for FakePty {
             .or_insert_with(|| watch::channel(state).0);
         Ok(sender.subscribe())
     }
+    fn blocked(&self, agent: &AgentId) -> Result<bool, PtyError> {
+        self.lookup(agent)?;
+        let blocked = self.blocked.lock().map_err(|_| poisoned())?;
+        Ok(blocked.contains(agent))
+    }
+    fn blocked_count(&self) -> usize {
+        self.blocked.lock().map_or(0, |blocked| blocked.len())
+    }
 }
 
 pub fn temp_path(name: &str) -> PathBuf {
@@ -204,34 +318,62 @@ pub fn temp_path(name: &str) -> PathBuf {
 }
 
 fn agent_config() -> AgentConfig {
-    AgentConfig {
-        dir: PathBuf::from("/tmp"),
-        prompt: "test agent".to_string(),
-        model: None,
-        permission_mode: None,
-        auto_clear: true,
-        edges: Vec::new(),
-        tools: Vec::new(),
-    }
+    AgentConfig::new(PathBuf::from("/tmp"), "test agent")
 }
 
 pub fn test_workflow() -> (Arc<FrozenWorkflow>, Arc<WorkflowFile>) {
     workflow_with(None)
 }
 
-fn workflow_with(trigger: Option<TriggerConfig>) -> (Arc<FrozenWorkflow>, Arc<WorkflowFile>) {
-    workflow_from(agent_config(), trigger)
+fn workflow_with(flow: Option<(FlowName, FlowConfig)>) -> (Arc<FrozenWorkflow>, Arc<WorkflowFile>) {
+    workflow_from(agent_config(), flow.into_iter().collect(), None)
+}
+
+/// The frozen shape of one declared flow; `output` is the compiled contract the
+/// output tests install, `None` everywhere else.
+fn frozen_flow(flow: &FlowConfig, output: Option<Arc<OutputContract>>) -> FrozenFlow {
+    FrozenFlow {
+        members: flow.agents.iter().cloned().collect(),
+        trigger_type: flow.trigger.trigger_type,
+        edge: flow.trigger.edge.clone(),
+        message: flow.trigger.message.clone(),
+        output,
+    }
 }
 
 /// Same two-agent roster, with `planner`'s config supplied by the caller —
-/// the loop-done tests give planner a loop edge to builder.
+/// the loop-done tests give planner a loop edge to builder. `output` is frozen
+/// onto every declared flow.
 fn workflow_from(
     planner: AgentConfig,
-    trigger: Option<TriggerConfig>,
+    declared: Vec<(FlowName, FlowConfig)>,
+    output: Option<&Arc<OutputContract>>,
+) -> (Arc<FrozenWorkflow>, Arc<WorkflowFile>) {
+    let declared = declared
+        .into_iter()
+        .map(|flow| (flow, output.cloned()))
+        .collect();
+    workflow_from_contracts(planner, declared)
+}
+
+/// One declared flow and the contract to freeze onto it, if any.
+type DeclaredFlow = ((FlowName, FlowConfig), Option<Arc<OutputContract>>);
+
+/// [`workflow_from`] with a contract per flow: its single-contract argument
+/// cannot express two flows carrying different schemas.
+fn workflow_from_contracts(
+    planner: AgentConfig,
+    declared: Vec<DeclaredFlow>,
 ) -> (Arc<FrozenWorkflow>, Arc<WorkflowFile>) {
     let mut agents = BTreeMap::new();
     agents.insert(AgentId("builder".to_string()), agent_config());
     agents.insert(AgentId("planner".to_string()), planner);
+    let frozen_flows = declared
+        .iter()
+        .map(|((name, flow), contract)| (name.clone(), frozen_flow(flow, contract.clone())))
+        .collect();
+    let flows: BTreeMap<FlowName, FlowConfig> =
+        declared.into_iter().map(|(flow, _)| flow).collect();
     let frozen = FrozenWorkflow {
         name: "test".to_string(),
         hash: "0".repeat(64),
@@ -240,7 +382,8 @@ fn workflow_from(
         idle_debounce: Duration::from_secs(2),
         scrollback: 5_000,
         agents: agents.clone(),
-        output: None,
+        mcp_servers: BTreeMap::new(),
+        flows: frozen_flows,
     };
     let file = WorkflowFile {
         workflow: WorkflowSection {
@@ -253,7 +396,7 @@ fn workflow_from(
         },
         server: ServerSection::default(),
         agents,
-        trigger,
+        flows,
     };
     (Arc::new(frozen), Arc::new(file))
 }
@@ -263,6 +406,9 @@ pub struct TestHandles {
     pub router: Arc<Router>,
     pub fake_pty: Arc<FakePty>,
     pub injector: Arc<StubInjector>,
+    /// The context's stop signal, held here so a test can trip it the way
+    /// `Run::stop` does — and so it outlives a test that drops the runtime.
+    pub stopping: watch::Sender<bool>,
     /// `Router::new` spawns background drivers, so the runtime is created first and
     /// shared with `start`/`TestServer`.
     pub rt: Arc<tokio::runtime::Runtime>,
@@ -282,54 +428,146 @@ pub fn test_ctx_with_planner_loop() -> anyhow::Result<(ApiContext, TestHandles)>
         }],
         ..agent_config()
     };
-    ctx_from(workflow_from(planner, None))
+    ctx_from(workflow_from(planner, Vec::new(), None))
 }
 
 /// The contract the output-schema tests install: `builder` must answer with
 /// `{"name": <string>}` and nothing else.
-fn output_contract(max_repairs: u32) -> anyhow::Result<OutputContract> {
+fn output_contract(flow: &FlowName, max_repairs: u32) -> anyhow::Result<OutputContract> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": { "name": { "type": "string" } },
         "required": ["name"],
         "additionalProperties": false
     });
-    OutputContract::compile(schema, AgentId("builder".to_string()), max_repairs)
-        .map_err(|e| anyhow::anyhow!("test schema must compile: {e}"))
+    OutputContract::compile(
+        schema,
+        flow.clone(),
+        AgentId("builder".to_string()),
+        max_repairs,
+    )
+    .map_err(|e| anyhow::anyhow!("test schema must compile: {e}"))
+}
+
+/// The webhook flow the output tests hang their contract on: both agents,
+/// kicked off at `builder`.
+fn output_flow() -> (FlowName, FlowConfig) {
+    (
+        FlowName("hook".to_string()),
+        FlowConfig {
+            agents: vec![
+                AgentId("builder".to_string()),
+                AgentId("planner".to_string()),
+            ],
+            trigger: TriggerConfig {
+                trigger_type: TriggerType::Webhook,
+                edge: coretempo_core::types::config::Edge {
+                    to: AgentId("builder".to_string()),
+                    kind: coretempo_core::types::config::EdgeKind::Ask,
+                    max_rounds: None,
+                },
+                message: None,
+            },
+            output: None,
+        },
+    )
 }
 
 /// A context whose frozen workflow carries an output contract targeting
 /// `builder`, for the router's reply validation.
 pub fn test_ctx_with_output(max_repairs: u32) -> anyhow::Result<(ApiContext, TestHandles)> {
-    let (frozen, file) = workflow_with(None);
-    let frozen = FrozenWorkflow {
-        output: Some(Arc::new(output_contract(max_repairs)?)),
-        ..(*frozen).clone()
-    };
-    ctx_from((Arc::new(frozen), file))
+    let flow = output_flow();
+    let contract = Arc::new(output_contract(&flow.0, max_repairs)?);
+    ctx_from(workflow_from(agent_config(), vec![flow], Some(&contract)))
 }
 
-/// A context whose workflow declares `trigger`, for the `/v1/trigger` endpoints.
-pub fn test_ctx_with_trigger(trigger: TriggerConfig) -> anyhow::Result<(ApiContext, TestHandles)> {
-    ctx_with(Some(trigger))
+/// A context whose workflow declares one flow, for the `/v1/trigger` endpoints.
+pub fn test_ctx_with_flow(
+    flow: (FlowName, FlowConfig),
+) -> anyhow::Result<(ApiContext, TestHandles)> {
+    ctx_with(Some(flow))
 }
 
-/// A context that declares `trigger` and carries an output contract targeting
+/// A context that declares one flow and carries an output contract targeting
 /// `builder`, for the trigger boundary's schema validation.
-pub fn test_ctx_with_trigger_and_output(
-    trigger: TriggerConfig,
+pub fn test_ctx_with_flow_and_output(
+    flow: (FlowName, FlowConfig),
     max_repairs: u32,
 ) -> anyhow::Result<(ApiContext, TestHandles)> {
-    let (frozen, file) = workflow_with(Some(trigger));
-    let frozen = FrozenWorkflow {
-        output: Some(Arc::new(output_contract(max_repairs)?)),
-        ..(*frozen).clone()
-    };
-    ctx_from((Arc::new(frozen), file))
+    let contract = Arc::new(output_contract(&flow.0, max_repairs)?);
+    ctx_from(workflow_from(agent_config(), vec![flow], Some(&contract)))
 }
 
-fn ctx_with(trigger: Option<TriggerConfig>) -> anyhow::Result<(ApiContext, TestHandles)> {
-    ctx_from(workflow_with(trigger))
+/// A context whose workflow declares `flows`, for the multi-flow trigger paths.
+pub fn test_ctx_with_flows(
+    flows: Vec<(FlowName, FlowConfig)>,
+) -> anyhow::Result<(ApiContext, TestHandles)> {
+    ctx_from(workflow_from(agent_config(), flows, None))
+}
+
+/// One webhook flow over `builder` alone, named `name` — the shape the warm
+/// cross-flow tests declare twice.
+pub fn builder_webhook_flow(name: &str) -> (FlowName, FlowConfig) {
+    (
+        FlowName(name.to_string()),
+        FlowConfig {
+            agents: vec![AgentId("builder".to_string())],
+            trigger: TriggerConfig {
+                trigger_type: TriggerType::Webhook,
+                edge: coretempo_core::types::config::Edge {
+                    to: AgentId("builder".to_string()),
+                    kind: coretempo_core::types::config::EdgeKind::Ask,
+                    max_rounds: None,
+                },
+                message: None,
+            },
+            output: None,
+        },
+    )
+}
+
+/// One declared flow and the contract frozen onto it.
+pub type FlowWithContract = ((FlowName, FlowConfig), Arc<OutputContract>);
+
+/// A webhook flow over `builder` named `name`, plus the compiled contract to
+/// freeze onto it.
+///
+/// # Errors
+/// The schema failing to compile under draft 2020-12.
+pub fn webhook_flow_with_schema(
+    name: &str,
+    schema: serde_json::Value,
+    max_repairs: u32,
+) -> anyhow::Result<FlowWithContract> {
+    let contract = OutputContract::compile(
+        schema,
+        FlowName(name.to_string()),
+        AgentId("builder".to_string()),
+        max_repairs,
+    )
+    .map_err(|e| anyhow::anyhow!("test schema must compile: {e}"))?;
+    Ok((builder_webhook_flow(name), Arc::new(contract)))
+}
+
+/// Like [`test_ctx_with_flows`], but each flow carries its own frozen contract.
+pub fn test_ctx_with_flow_contracts(
+    flows: Vec<FlowWithContract>,
+) -> anyhow::Result<(ApiContext, TestHandles)> {
+    let flows = flows
+        .into_iter()
+        .map(|(flow, contract)| (flow, Some(contract)))
+        .collect();
+    ctx_from(workflow_from_contracts(agent_config(), flows))
+}
+
+/// Two webhook flows ("a" and "b") both spanning `builder` (exclusive by
+/// default), for the warm cross-flow serialization tests.
+pub fn test_ctx_with_two_webhook_flows() -> anyhow::Result<(ApiContext, TestHandles)> {
+    test_ctx_with_flows(vec![builder_webhook_flow("a"), builder_webhook_flow("b")])
+}
+
+fn ctx_with(flow: Option<(FlowName, FlowConfig)>) -> anyhow::Result<(ApiContext, TestHandles)> {
+    ctx_from(workflow_with(flow))
 }
 
 fn ctx_from(
@@ -342,7 +580,7 @@ fn ctx_from(
             .build()?,
     );
     let bus = EventBus::new();
-    let store = Store::open(&temp_path("db.sqlite"))?;
+    let store = Store::open(&temp_path("db.sqlite"), RunId("r-11111111".to_string()))?;
     let injector = StubInjector::new();
     let guard = rt.enter();
     let router = Router::new(
@@ -355,6 +593,8 @@ fn ctx_from(
     let fake_pty = FakePty::new();
     fake_pty.set_agent("planner", AgentState::Idle, None, Vec::new());
     fake_pty.set_agent("builder", AgentState::Idle, None, Vec::new());
+    let agent_locks = Arc::new(coretempo_core::locks::AgentLocks::new(&workflow.agents));
+    let (stopping, stopping_rx) = watch::channel(false);
     let ctx = ApiContext {
         router: router.clone(),
         pty: fake_pty.clone() as Arc<dyn PtySource>,
@@ -369,6 +609,8 @@ fn ctx_from(
         bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         port: 0,
         triggers: TriggerHub::new(),
+        agent_locks,
+        stopping: stopping_rx,
     };
     Ok((
         ctx,
@@ -377,6 +619,7 @@ fn ctx_from(
             router,
             fake_pty,
             injector,
+            stopping,
             rt,
         },
     ))

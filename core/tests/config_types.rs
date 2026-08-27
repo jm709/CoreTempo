@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use coretempo_core::types::config::{EdgeKind, WorkflowFile};
+use coretempo_core::types::config::{AgentConfig, EdgeKind, WorkflowFile};
 use coretempo_core::types::id::AgentId;
 
 const SPEC_TOML: &str = r#"
@@ -87,7 +87,6 @@ fn defaults_apply() {
     assert!((wf.workflow.idle_debounce_seconds - 2.0).abs() < f64::EPSILON);
     assert!(wf.agents[&AgentId("a".into())].auto_clear);
     assert!(wf.server.bind.is_none());
-    assert!(wf.server.allowed_origins.is_empty());
 }
 
 #[test]
@@ -122,4 +121,47 @@ fn workflow_file_serializes_to_json() {
     let json = serde_json::to_value(&wf).unwrap();
     assert_eq!(json["workflow"]["port"], 4820);
     assert_eq!(json["agents"]["planner"]["model"], "opus");
+}
+
+#[test]
+fn isolated_config_and_skills_parse_and_default() {
+    use std::path::PathBuf;
+    let text = "[workflow]\nname = \"dev\"\n\
+                [agents.iso]\ndir = \"/tmp\"\nprompt = \"p\"\n\
+                isolated_config = true\nskills = [\"./skills/handoff\", \"~/skills/review\"]\n\
+                [agents.plain]\ndir = \"/tmp\"\nprompt = \"p\"\n";
+    let wf = coretempo_core::workflow::validate_workflow(text).unwrap();
+    let iso = &wf.agents[&AgentId("iso".into())];
+    assert!(iso.isolated_config);
+    assert_eq!(
+        iso.skills,
+        vec![
+            PathBuf::from("./skills/handoff"),
+            PathBuf::from("~/skills/review")
+        ]
+    );
+    let plain = &wf.agents[&AgentId("plain".into())];
+    assert!(!plain.isolated_config, "default is inherit");
+    assert!(plain.skills.is_empty());
+    let fresh = AgentConfig::new(PathBuf::from("/tmp"), "p");
+    assert!(!fresh.isolated_config);
+    assert!(fresh.skills.is_empty());
+}
+
+#[test]
+fn allowed_origins_is_rejected_as_removed() {
+    let issues = coretempo_core::workflow::validate_workflow(
+        "[workflow]\nname = \"x\"\n\
+         [server]\nallowed_origins = [\"http://x\"]\n\
+         [agents.a]\ndir = \"/tmp\"\nprompt = \"p\"\n",
+    )
+    .unwrap_err();
+    let message = issues
+        .iter()
+        .map(|i| i.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(message.contains("allowed_origins"), "{message}");
+    assert!(message.contains("CORS"), "{message}");
+    assert!(message.contains("reverse proxy"), "{message}");
 }

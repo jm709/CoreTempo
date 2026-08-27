@@ -47,6 +47,16 @@ fn primer_contains_role_protocol_and_roster() {
     assert!(prompt.contains("tempo reply <id> --code 0"));
     assert!(prompt.contains("reply expected"));
     assert!(prompt.contains("End your turn after asking"));
+    // Amendment 31: the primer has to say what a flow-labelled header means,
+    // or the label the kickoff now carries is noise the agent cannot act on.
+    assert!(
+        prompt.contains("[CoreTempo <id> from http, flow <name> — reply expected]"),
+        "the primer shows the labelled header: {prompt}"
+    );
+    assert!(
+        prompt.contains("A header without a flow is not a kickoff"),
+        "and says what an unlabelled one means: {prompt}"
+    );
 }
 
 #[test]
@@ -157,9 +167,9 @@ fn frozen_with_output() -> coretempo_core::types::config::FrozenWorkflow {
     let text = "[workflow]\nname = \"dev\"\n\
                 [agents.a]\ndir = \"/tmp\"\nprompt = \"You are a.\"\n\
                 [agents.b]\ndir = \"/tmp\"\nprompt = \"You are b.\"\n\
-                [trigger]\ntype = \"webhook\"\n\
-                edge = { to = \"a\", kind = \"ask\" }\n\
-                [trigger.output]\n\
+                [flows.hook]\nagents = [\"a\", \"b\"]\n\
+                trigger = { type = \"webhook\", edge = { to = \"a\", kind = \"ask\" } }\n\
+                [flows.hook.output]\n\
                 schema = { type = \"object\", required = [\"name\"] }\n\
                 max_repairs = 2\n";
     let dir = temp_dir("output");
@@ -169,6 +179,58 @@ fn frozen_with_output() -> coretempo_core::types::config::FrozenWorkflow {
     // validate first so a test failure points at the right layer
     validate_workflow(text).unwrap();
     load_workflow(&path).unwrap().1
+}
+
+/// Two webhook flows contracting the same agent: the whole-pool warm run
+/// composes both schemas into one prompt.
+fn frozen_with_two_contracts() -> coretempo_core::types::config::FrozenWorkflow {
+    let text = "[workflow]\nname = \"dev\"\n\
+                [agents.a]\ndir = \"/tmp\"\nprompt = \"You are a.\"\n\
+                [flows.alpha]\nagents = [\"a\"]\n\
+                trigger = { type = \"webhook\", edge = { to = \"a\", kind = \"ask\" } }\n\
+                [flows.alpha.output]\n\
+                schema = { type = \"object\", required = [\"verdict\"] }\n\
+                [flows.beta]\nagents = [\"a\"]\n\
+                trigger = { type = \"webhook\", edge = { to = \"a\", kind = \"ask\" } }\n\
+                [flows.beta.output]\n\
+                schema = { type = \"object\", required = [\"summary\"] }\n";
+    let dir = temp_dir("two-contracts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tempo.toml");
+    std::fs::write(&path, text).unwrap();
+    validate_workflow(text).unwrap();
+    load_workflow(&path).unwrap().1
+}
+
+#[test]
+fn two_contracts_on_one_agent_are_labelled_by_flow() {
+    let prompt = frozen_with_two_contracts()
+        .system_prompt(&AgentId("a".into()))
+        .expect("known agent");
+    // Unlabelled, the two blocks read as contradictory instructions.
+    assert!(
+        prompt.contains("Output contract for flow 'alpha'"),
+        "each block names its flow: {prompt}"
+    );
+    assert!(
+        prompt.contains("Output contract for flow 'beta'"),
+        "each block names its flow: {prompt}"
+    );
+    assert!(prompt.contains("\"verdict\"") && prompt.contains("\"summary\""));
+    assert!(
+        prompt.contains("Only 'alpha' kickoffs are held to this schema")
+            && prompt.contains("Only 'beta' kickoffs are held to this schema"),
+        "each block scopes itself to its own flow's kickoff: {prompt}"
+    );
+    assert!(
+        prompt.contains("[CoreTempo <id> from http, flow alpha — reply expected]")
+            && prompt.contains("[CoreTempo <id> from http, flow beta — reply expected]"),
+        "each block shows the header its own kickoff arrives with (amendment 31): {prompt}"
+    );
+    assert!(
+        prompt.contains("repair it against the validation errors"),
+        "the rejection stays the fallback when a labelled reply is refused: {prompt}"
+    );
 }
 
 #[test]

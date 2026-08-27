@@ -2,10 +2,11 @@
   import { Handle, Position, type NodeProps } from "@xyflow/svelte";
   import type { TriggerModel } from "../types";
 
-  let { data, selected }: NodeProps & { data: { trigger: TriggerModel } } = $props();
+  let { data, selected }: NodeProps & { data: { trigger: TriggerModel; flowName: string } } =
+    $props();
 
   const trigger = $derived(data.trigger);
-  // No target handle: the trigger starts the workflow, so nothing edges into it.
+  // No target handle: the trigger starts its flow, so nothing edges into it.
   const onStart = $derived(trigger.type === "on_start");
   // An on_start trigger with no message will not validate on save; show that here the way
   // an agent missing its dir does, rather than letting the save fail unexplained.
@@ -13,12 +14,12 @@
   const sub = $derived(
     onStart
       ? ((trigger.message ?? "").split("\n")[0] ?? "") || "no message set"
-      : "POST /v1/trigger",
+      : `POST /v1/flows/${data.flowName}/trigger`,
   );
 </script>
 
 <div class="node mono" class:selected class:incomplete>
-  <div class="title">⚡ {onStart ? "on-start" : "webhook"}</div>
+  <div class="title">⚡ {data.flowName} · {onStart ? "on-start" : "webhook"}</div>
   <div class="sub">{sub}</div>
   <Handle type="source" position={Position.Right} />
 </div>

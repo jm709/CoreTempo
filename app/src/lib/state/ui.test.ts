@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "vitest";
-import { openAgentTerminal, resetUi, toggleRunCenter, uiState } from "./ui.svelte";
+import { openAgentTerminal, resetUi, runGate, toggleRunCenter, uiState } from "./ui.svelte";
 
 describe("run center view", () => {
   beforeEach(() => {
@@ -37,5 +37,41 @@ describe("run center view", () => {
     toggleRunCenter();
     resetUi();
     expect(uiState.runCenter).toBe("graph");
+  });
+});
+
+describe("run gate", () => {
+  beforeEach(() => {
+    resetUi();
+  });
+
+  test("runs a saved workflow", () => {
+    expect(runGate("stopped", "/w/tempo.toml", false)).toEqual({ disabled: false, hint: null });
+  });
+
+  test("disables Run while the editor has unsaved edits and says why", () => {
+    expect(runGate("stopped", "/w/tempo.toml", true)).toEqual({
+      disabled: true,
+      hint: "save the workflow to run it",
+    });
+  });
+
+  test("disables Run with no workflow open, silently", () => {
+    expect(runGate("stopped", null, false)).toEqual({ disabled: true, hint: null });
+  });
+
+  test("disables the button while a run is starting or stopping", () => {
+    expect(runGate("starting", "/w/tempo.toml", false).disabled).toBe(true);
+    expect(runGate("stopping", "/w/tempo.toml", false).disabled).toBe(true);
+  });
+
+  test("unsaved edits never block Stop", () => {
+    expect(runGate("running", "/w/tempo.toml", true)).toEqual({ disabled: false, hint: null });
+  });
+
+  test("resetUi clears the dirty flag", () => {
+    uiState.editorDirty = true;
+    resetUi();
+    expect(uiState.editorDirty).toBe(false);
   });
 });

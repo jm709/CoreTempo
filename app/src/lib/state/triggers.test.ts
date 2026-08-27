@@ -6,9 +6,10 @@ import {
 
 function kickoff(over: Partial<MessageRecord> = {}): MessageRecord {
   return {
-    id: "m-a3f91c2e", kind: "ask", from: "http:11223344", to: "translator",
+    id: "m-a3f91c2e", kind: "ask", from: "trigger:11223344", to: "translator",
     body: "translate this", status: "working", code: null, reply: null,
     created_at: "2026-08-07T10:00:00Z", injected_at: null, completed_at: null,
+    reason: null, reason_code: null,
     ...over,
   };
 }
@@ -16,9 +17,10 @@ function kickoff(over: Partial<MessageRecord> = {}): MessageRecord {
 beforeEach(() => resetTriggers());
 
 describe("trigger lifecycle assembly", () => {
-  it("opens a lifecycle from an http-origin message and ignores the rest", () => {
+  it("opens a lifecycle from a trigger-origin message and ignores the rest", () => {
     beginTrigger(kickoff());
     beginTrigger(kickoff({ id: "m-2", from: "agent:planner" }));
+    beginTrigger(kickoff({ id: "m-3", from: "http:99999999" }));  // a manual `tempo ask` (#24)
     beginTrigger(kickoff());  // duplicate: same trigger id
     expect(triggersState.list).toHaveLength(1);
     const t = triggersState.list[0];
@@ -82,7 +84,7 @@ describe("trigger lifecycle assembly", () => {
           code: 0, reply: '{"ok":true}', output: { ok: true } },
         { trigger_id: "t-55667788", status: "running" },
       ],
-      [kickoff(), kickoff({ id: "m-9", from: "http:55667788", body: "second" })],
+      [kickoff(), kickoff({ id: "m-9", from: "trigger:55667788", body: "second" })],
     );
     expect(triggersState.list).toHaveLength(2);
     expect(triggersState.list[0]?.phase).toBe("completed");

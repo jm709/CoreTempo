@@ -9,6 +9,10 @@ export interface ClientOptions {
   /** e.g. "http://127.0.0.1:4820" — port and token come from the run's api.json or your deployment config. */
   baseUrl: string;
   token: string;
+  /** The [flows.<name>] section this client fires. Its trigger endpoint is
+   * POST /v1/flows/<name>/trigger; result polling (GET /v1/trigger/{id}) is
+   * flow-agnostic — trigger ids are global. */
+  flow: string;
   /** Injection point for tests or fetch polyfills; defaults to globalThis.fetch. */
   fetch?: typeof globalThis.fetch;
 }
@@ -29,11 +33,18 @@ export interface TriggerOptions<T = unknown> extends RequestOptions {
 export class CoreTempoClient {
   private readonly baseUrl: string;
   private readonly token: string;
+  private readonly triggerPath: string;
   private readonly fetchImpl: typeof globalThis.fetch;
 
   constructor(options: ClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.token = options.token;
+    if (options.flow === "") {
+      throw new TypeError(
+        "ClientOptions.flow must name a [flows.<name>] section of the workflow; it cannot be empty",
+      );
+    }
+    this.triggerPath = `/v1/flows/${encodeURIComponent(options.flow)}/trigger`;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
   }
 
@@ -42,7 +53,7 @@ export class CoreTempoClient {
     body: string,
     options: RequestOptions = {},
   ): Promise<{ triggerId: string; position: number }> {
-    const response = await this.request("/v1/trigger", {
+    const response = await this.request(this.triggerPath, {
       method: "POST",
       body,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -66,7 +77,7 @@ export class CoreTempoClient {
     options: TriggerOptions<T> = {},
   ): Promise<TriggerOutcome<T>> {
     const waitSecs = options.waitSecs ?? 30;
-    const response = await this.request(`/v1/trigger?wait=${String(waitSecs)}`, {
+    const response = await this.request(`${this.triggerPath}?wait=${String(waitSecs)}`, {
       method: "POST",
       body,
       ...(options.signal === undefined ? {} : { signal: options.signal }),

@@ -5,7 +5,7 @@
 
 mod support;
 
-use coretempo_core::types::AgentState;
+use coretempo_core::types::{AgentExit, AgentState};
 use serde_json::json;
 
 fn seeded() -> anyhow::Result<support::TestServer> {
@@ -13,9 +13,12 @@ fn seeded() -> anyhow::Result<support::TestServer> {
     handles
         .fake_pty
         .set_agent("builder", AgentState::Working, None, vec![(0, b"hello ")]);
-    handles
-        .fake_pty
-        .set_agent("planner", AgentState::Exited, Some(1), Vec::new());
+    handles.fake_pty.set_agent(
+        "planner",
+        AgentState::Exited,
+        Some(AgentExit::Code(1)),
+        Vec::new(),
+    );
     support::start(ctx, handles)
 }
 
@@ -34,10 +37,10 @@ fn roster_is_lexicographic_with_state_and_pending_asks() -> anyhow::Result<()> {
     assert_eq!(agents[0]["id"], "builder");
     assert_eq!(agents[0]["state"], "working");
     assert_eq!(agents[0]["pending_asks"], 0);
-    assert!(agents[0]["exit_code"].is_null());
+    assert!(agents[0]["exit"].is_null());
     assert_eq!(agents[1]["id"], "planner");
     assert_eq!(agents[1]["state"], "exited");
-    assert_eq!(agents[1]["exit_code"], 1);
+    assert_eq!(agents[1]["exit"], serde_json::json!({"code": 1}));
     assert_eq!(agents[1]["pending_asks"], 1);
     Ok(())
 }
@@ -53,6 +56,8 @@ fn detail_flattens_info_and_adds_frozen_config() -> anyhow::Result<()> {
     assert_eq!(body["auto_clear"], true);
     assert!(body["model"].is_null());
     assert_eq!(body["pty_cursor"], 6);
+    assert_eq!(body["isolated_config"], false);
+    assert_eq!(body["skills"], serde_json::json!([]));
     Ok(())
 }
 
@@ -92,5 +97,23 @@ fn restart_returns_202_and_kicks_pty() -> anyhow::Result<()> {
         .clone();
     assert_eq!(restarts.len(), 1);
     assert_eq!(restarts[0].0, "planner");
+    Ok(())
+}
+
+#[test]
+fn roster_reports_the_blocked_flag() -> anyhow::Result<()> {
+    let (ctx, handles) = support::test_ctx()?;
+    handles
+        .fake_pty
+        .set_agent("builder", AgentState::Working, None, Vec::new());
+    handles.fake_pty.set_blocked("builder", true);
+    let srv = support::start(ctx, handles)?;
+    let (_, body) = srv.get("/v1/agents", None)?;
+    let agents = body["agents"].as_array().cloned().unwrap_or_default();
+    assert_eq!(agents[0]["id"], "builder");
+    assert_eq!(agents[0]["blocked"], true);
+    assert_eq!(agents[1]["blocked"], false);
+    let (_, detail) = srv.get("/v1/agents/builder", None)?;
+    assert_eq!(detail["blocked"], true, "detail flattens info");
     Ok(())
 }

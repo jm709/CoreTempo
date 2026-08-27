@@ -15,7 +15,7 @@ fn workflow_json() -> String {
         r#"{"run_id":"r-1f2e3d4c","started_at":"2026-08-01T17:03:11Z","workflow":{"#,
         r#""workflow":{"name":"core-tempo-dev","db":"./tempo.db","port":4820,"#,
         r#""ask_timeout_minutes":30,"idle_debounce_seconds":2.0},"#,
-        r#""server":{"bind":"127.0.0.1","token_file":null,"allowed_origins":[],"log":"info"},"#,
+        r#""server":{"bind":"127.0.0.1","token_file":null,"log":"info"},"#,
         r#""agents":{"#,
         r#""builder":{"dir":"/home/u/projects/CoreTempo","prompt":"You implement tasks","#,
         r#""model":null,"permission_mode":"acceptEdits","auto_clear":true},"#,
@@ -23,6 +23,21 @@ fn workflow_json() -> String {
         r#""model":"opus","permission_mode":null,"auto_clear":false}}}}"#
     )
     .to_string()
+}
+
+fn workflow_json_with_on_start_flow() -> String {
+    // The landed fixture ends the inner workflow object with the agents map:
+    // splice "flows" in before the closing braces. Two braces close the
+    // agent object and the agents map before "flows" can start as their
+    // sibling key; five close trigger/flow/flows-map/workflow-file/response.
+    workflow_json().replace(
+        r#""permission_mode":null,"auto_clear":false}}}}"#,
+        concat!(
+            r#""permission_mode":null,"auto_clear":false}},"#,
+            r#""flows":{"batch":{"agents":["builder"],"trigger":{"type":"on_start","#,
+            r#""edge":{"to":"builder","kind":"ask"},"message":"go"}}}}}"#
+        ),
+    )
 }
 
 fn out_dir(name: &str) -> PathBuf {
@@ -81,5 +96,31 @@ fn export_without_a_running_server_exits_3() -> anyhow::Result<()> {
         !dir.join("tempo.toml").exists(),
         "nothing written on failure"
     );
+    Ok(())
+}
+
+#[test]
+fn export_flow_writes_a_batch_unit_for_the_named_flow() -> anyhow::Result<()> {
+    let srv = serve(vec![(200, workflow_json_with_on_start_flow())])?;
+    let dir = out_dir("flow-batch");
+    let out = tempo(
+        &["export", &dir.to_string_lossy(), "--flow", "batch"],
+        srv.port,
+        None,
+    )?;
+    assert_eq!(exit_code(&out), 0, "stderr: {}", stderr(&out));
+    let unit = std::fs::read_to_string(dir.join("coretempo.service"))?;
+    assert!(unit.contains("--flow batch"), "unit: {unit}");
+    Ok(())
+}
+
+#[test]
+fn export_of_an_on_start_only_workflow_without_flow_names_the_flows() -> anyhow::Result<()> {
+    let srv = serve(vec![(200, workflow_json_with_on_start_flow())])?;
+    let dir = out_dir("flow-missing");
+    let out = tempo(&["export", &dir.to_string_lossy()], srv.port, None)?;
+    assert_eq!(exit_code(&out), 3, "user errors exit 3: {}", stderr(&out));
+    assert!(stderr(&out).contains("batch"), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("--flow"), "stderr: {}", stderr(&out));
     Ok(())
 }

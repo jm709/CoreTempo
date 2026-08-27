@@ -19,7 +19,7 @@ fn create_ask_as_agent_returns_201_record() -> anyhow::Result<()> {
     )?;
     assert_eq!(status, 201);
     let id = body["id"].as_str().unwrap_or_default();
-    assert!(id.starts_with("m-") && id.len() == 10, "bad id: {id}");
+    assert!(id.starts_with("m-") && id.len() == 18, "bad id: {id}");
     assert_eq!(body["kind"], "ask");
     assert_eq!(body["from"], "agent:planner");
     assert_eq!(body["to"], "builder");

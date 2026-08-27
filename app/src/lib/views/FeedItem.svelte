@@ -36,6 +36,9 @@
     <div class="status" class:err={message.status === "failed"}>
       {lifecycleGlyph(message)} {message.status}
     </div>
+    {#if message.status === "failed" && message.reason}
+      <div class="reason">{message.reason}</div>
+    {/if}
     {#if message.reply !== null}
       <div class="reply">↳ {message.reply}</div>
     {/if}
@@ -57,5 +60,6 @@
   }
   .status { color: var(--info); margin-top: 2px; }
   .status.err { color: var(--err); }
+  .reason { color: var(--text-dim); margin-top: 2px; white-space: normal; word-break: break-word; }
   .reply { color: var(--ok); margin-top: 2px; }
 </style>

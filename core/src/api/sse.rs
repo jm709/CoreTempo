@@ -31,6 +31,8 @@ pub(crate) fn event_type(payload: &EventPayload) -> &'static str {
         EventPayload::AgentLifecycle { .. } => "agent.lifecycle",
         EventPayload::AgentNudged { .. } => "agent.nudged",
         EventPayload::AgentStalled { .. } => "agent.stalled",
+        EventPayload::AgentBlocked { .. } => "agent.blocked",
+        EventPayload::AgentPermissionRefused { .. } => "agent.permission_refused",
         EventPayload::MessageCreated { .. } => "message.created",
         EventPayload::MessageStatusChanged { .. } => "message.status",
         EventPayload::ReplyRejected { .. } => "reply.rejected",
@@ -68,6 +70,8 @@ impl EventFilterSpec {
             | EventPayload::AgentLifecycle { .. }
             | EventPayload::AgentNudged { .. }
             | EventPayload::AgentStalled { .. }
+            | EventPayload::AgentBlocked { .. }
+            | EventPayload::AgentPermissionRefused { .. }
             | EventPayload::MessageCreated { .. }
             | EventPayload::MessageStatusChanged { .. }
             | EventPayload::ReplyRejected { .. } => false,
@@ -97,6 +101,8 @@ impl EventFilterSpec {
             | EventPayload::AgentLifecycle { agent, .. }
             | EventPayload::AgentNudged { agent }
             | EventPayload::AgentStalled { agent }
+            | EventPayload::AgentBlocked { agent, .. }
+            | EventPayload::AgentPermissionRefused { agent, .. }
             | EventPayload::ReplyRejected { agent, .. } => agent == want,
             EventPayload::MessageCreated { message }
             | EventPayload::MessageStatusChanged { message } => {
@@ -105,7 +111,7 @@ impl EventFilterSpec {
                 }
                 match &message.from {
                     Origin::Agent(a) => a == want,
-                    Origin::User | Origin::Http(_) => false,
+                    Origin::User | Origin::Http(_) | Origin::Trigger(_) => false,
                 }
             }
             EventPayload::RunStarted { .. }
@@ -129,8 +135,9 @@ pub(crate) fn resume_point(
         None => Ok(None),
         Some(raw) => raw.parse::<u64>().map(Some).map_err(|_| {
             ApiError::invalid(format!(
-                "resume position '{raw}' is invalid; Last-Event-ID / since must be the integer \
-                 seq (events) or byte cursor (pty) of the last item you received"
+                "resume position '{raw}' is invalid; Last-Event-ID / since must be an integer: \
+                 the seq of the last event you received (events), or the byte cursor to resume \
+                 at (pty) — the last `id:` you saw, which is that chunk's start + len"
             ))
         }),
     }
@@ -277,8 +284,13 @@ struct PtyEventData {
     b64: String,
 }
 
+/// `seq` and `id:` answer different questions: `seq` is where the chunk starts,
+/// `id:` is where the next one does (`start + len`), because `Last-Event-ID`
+/// says "I have everything up to here" — mirroring `seq` would replay this
+/// chunk on every resume.
 async fn pump_pty(mut rx: mpsc::Receiver<PtyChunk>, tx: mpsc::Sender<SseEvent>) {
     while let Some(chunk) = rx.recv().await {
+        let resume_at = chunk.start.0 + chunk.bytes.len() as u64;
         let data = PtyEventData {
             seq: chunk.start.0,
             b64: b64_encode(&chunk.bytes),
@@ -287,7 +299,7 @@ async fn pump_pty(mut rx: mpsc::Receiver<PtyChunk>, tx: mpsc::Sender<SseEvent>) 
             continue;
         };
         let sse = SseEvent::default()
-            .id(chunk.start.0.to_string())
+            .id(resume_at.to_string())
             .event("pty")
             .data(json);
         if tx.send(sse).await.is_err() {
@@ -298,6 +310,8 @@ async fn pump_pty(mut rx: mpsc::Receiver<PtyChunk>, tx: mpsc::Sender<SseEvent>) 
 
 /// `GET /v1/agents/{id}/pty`: base64 raw-chunk SSE with ring-buffer replay via byte
 /// cursors. Clients detect aged-out data by `first seq > since`; no reset event here.
+/// `Last-Event-ID` and `?since=` take the same value — the cursor to resume at — so
+/// either resumes byte-exactly (contract amendment 40).
 pub(crate) async fn agent_pty(
     State(ctx): State<ApiContext>,
     Path(id): Path<String>,
@@ -348,6 +362,8 @@ mod tests {
                 created_at: Timestamp::now(),
                 injected_at: None,
                 completed_at: None,
+                reason: None,
+                reason_code: None,
             },
         }
     }
@@ -363,7 +379,7 @@ mod tests {
         assert!(!f.matches(&ev(EventPayload::AgentLifecycle {
             agent: AgentId("a".to_string()),
             phase: crate::types::event::LifecyclePhase::Exited,
-            exit_code: Some(0)
+            exit: Some(crate::types::AgentExit::Code(0))
         })));
     }
 

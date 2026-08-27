@@ -14,13 +14,13 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
 use crate::bus::EventBus;
-use crate::pty::{ClearGate, IdleDecision, InjectionQueue};
+use crate::pty::{ClearGate, IdleDecision, InjectError, InjectionQueue};
 use crate::store::{Store, StoreError};
 use crate::time::Timestamp;
 use crate::types::agent::AgentState;
 use crate::types::config::{AgentConfig, Edge, EdgeKind, FrozenWorkflow};
 use crate::types::event::EventPayload;
-use crate::types::id::{AgentId, MessageId};
+use crate::types::id::{AgentId, FlowName, MessageId};
 use crate::types::message::{MessageKind, MessageRecord, MessageStatus, Origin};
 
 /// `GET /v1/messages` default page size.
@@ -52,6 +52,18 @@ impl Default for MessageFilter {
             limit: DEFAULT_LIST_LIMIT,
         }
     }
+}
+
+/// A flow's kickoff message (amendment 31). The flow name is not part of the
+/// [`MessageRecord`]: it exists to be rendered into the injected header, which
+/// is where the target agent reads which output contract applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowKickoff {
+    pub flow: FlowName,
+    pub from: Origin,
+    pub to: AgentId,
+    pub kind: MessageKind,
+    pub body: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +106,85 @@ fn message_name(id: &MessageId) -> &str {
     &id.0
 }
 
+/// Why a message is being failed; written onto the record (spec 2026-08-17
+/// §4.3) so callers and the trigger watcher read the cause instead of guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailReason {
+    pub code: &'static str,
+    pub reason: String,
+}
+
+impl FailReason {
+    #[must_use]
+    pub fn timeout(id: &MessageId, ttl: Duration) -> FailReason {
+        FailReason {
+            code: "timeout",
+            reason: format!(
+                "ask '{}' got no reply within ask_timeout ({} s); the target never \
+                 replied — check its pane, then fire again or raise \
+                 [workflow] ask_timeout_minutes",
+                id.0,
+                ttl.as_secs()
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn restarted(agent: &AgentId) -> FailReason {
+        FailReason {
+            code: "agent_restarted",
+            reason: format!(
+                "agent '{}' was restarted before it completed this message; fire again",
+                agent.0
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn exited(agent: &AgentId) -> FailReason {
+        FailReason {
+            code: "agent_exited",
+            reason: format!(
+                "agent '{}' exited before it completed this message; check its pane, \
+                 restart it, then fire again",
+                agent.0
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn blocked(agent: &AgentId, tool: Option<&str>, grace: Duration) -> FailReason {
+        FailReason {
+            code: "blocked_on_permission",
+            reason: format!(
+                "agent '{}' has been waiting on a Claude Code permission dialog for {} \
+                 for {} s and cannot reply; add `tools = [...]`/`allow = [...]` for it \
+                 in tempo.toml (or answer the dialog in the pane) and fire again",
+                agent.0,
+                tool.unwrap_or("an undeclared tool"),
+                grace.as_secs()
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn from_inject(err: &InjectError) -> FailReason {
+        match err {
+            InjectError::AgentRestarted(agent) => FailReason::restarted(agent),
+            InjectError::AgentExited(agent) => FailReason::exited(agent),
+            InjectError::Blocked {
+                agent,
+                tool,
+                waited,
+            } => FailReason::blocked(agent, tool.as_deref(), *waited),
+            InjectError::UnknownAgent(agent) => FailReason {
+                code: "agent_exited",
+                reason: format!("agent '{}' is not in this run's roster", agent.0),
+            },
+        }
+    }
+}
+
 /// Debounced agent-state signal used to drive `injected → working` and send completion
 /// (`working → idle` ⇒ `done`). Contract ADDITION: implemented in `Run::start` by an
 /// adapter over `PtyManager::subscribe_state_debounced`, wired via
@@ -101,6 +192,10 @@ fn message_name(id: &MessageId) -> &str {
 pub trait StateSource: Send + Sync + 'static {
     /// `None` for unknown agents.
     fn subscribe_debounced(&self, agent: &AgentId) -> Option<watch::Receiver<AgentState>>;
+    /// The dialog the agent is parked on, if any (spec 2026-08-17 §4.2).
+    fn blocked_since(&self, _agent: &AgentId) -> Option<crate::pty::Blocked> {
+        None
+    }
 }
 
 /// One open obligation turn (spec §2). Keyed off the agent in `turns`.
@@ -115,11 +210,52 @@ struct TurnState {
     stalled: bool,
 }
 
-/// One nudge-then-stall budget for an agent idling with an unanswered incoming
-/// ask. Lives beside `owed` and is dropped with it.
-#[derive(Default)]
+/// Owed-ask watchdog backoff between re-nudges (spec 2026-08-17 §4.1):
+/// 60/120/240/240 s, the last entry repeating for every round past the fourth.
+pub const DEFAULT_REPLY_NUDGE_BACKOFF: [Duration; 4] = [
+    Duration::from_mins(1),
+    Duration::from_mins(2),
+    Duration::from_mins(4),
+    Duration::from_mins(4),
+];
+/// How long an agent may sit on a permission dialog before its owed asks are
+/// failed `blocked_on_permission` (spec 2026-08-17 §4.2). Shared with the
+/// queue worker's parked-injection bound (#63).
+pub const DEFAULT_BLOCKED_GRACE: Duration = crate::pty::BLOCKED_GRACE;
+
+/// Owed-ask watchdog timing (spec 2026-08-17 §4). Constants in production;
+/// tests shrink them through [`Router::set_watchdog_timing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchdogTiming {
+    pub reply_nudge_backoff: [Duration; 4],
+    pub blocked_grace: Duration,
+}
+
+impl Default for WatchdogTiming {
+    fn default() -> WatchdogTiming {
+        WatchdogTiming {
+            reply_nudge_backoff: DEFAULT_REPLY_NUDGE_BACKOFF,
+            blocked_grace: DEFAULT_BLOCKED_GRACE,
+        }
+    }
+}
+
+impl WatchdogTiming {
+    /// Wait owed after `nudges` nudges have been sent; the table's last entry
+    /// is the steady-state cadence.
+    fn backoff_after(&self, nudges: u32) -> Duration {
+        let idx = usize::try_from(nudges.max(1)).unwrap_or(1).min(4) - 1;
+        self.reply_nudge_backoff[idx]
+    }
+}
+
+/// Re-nudge bookkeeping for an agent idling with an unanswered incoming ask
+/// (spec 2026-08-17 §4.1). Lives beside `owed` and is dropped with it.
+#[derive(Debug, Clone, Copy)]
 struct ReplyNudgeState {
-    nudged: bool,
+    nudges: u32,
+    last_nudge_at: tokio::time::Instant,
+    /// True once `agent.stalled` has been published for the current round.
     stalled: bool,
 }
 
@@ -142,8 +278,10 @@ pub struct Router {
     /// idle with one gets nudged, never cleared (design 2026-08-06 companion
     /// fix — pre-existing hole, made likelier by schema rejection).
     owed: Mutex<HashMap<AgentId, HashSet<MessageId>>>,
-    /// One nudge-then-stall budget per owed-reply idle; cleared with `owed`.
+    /// Re-nudge bookkeeping per owed-reply idle; cleared with `owed`.
     owed_nudges: Mutex<HashMap<AgentId, ReplyNudgeState>>,
+    /// Owed-ask watchdog timing; the defaults except where a test shrinks them.
+    timing: Mutex<WatchdogTiming>,
     /// Loops ended by `tempo done`, keyed (owner, target); cleared when a new
     /// arming turn opens for the owner (edge-semantics spec).
     loops_done: Mutex<HashSet<(AgentId, AgentId)>>,
@@ -153,6 +291,11 @@ pub struct Router {
     /// Output-schema rejections per kickoff ask (design 2026-08-06); dropped in
     /// `settle`. In-memory by design: restart clears it with everything else.
     repairs: Mutex<HashMap<MessageId, u32>>,
+    /// Output contracts by kickoff origin (multi-flow spec §5): the in-turn
+    /// repair gate reads the kickoff's own flow contract, never a workflow-wide
+    /// one. Bound before `create_kickoff` so no reply can beat the
+    /// registration; dropped in `settle`.
+    contracts: Mutex<HashMap<String, Arc<crate::schema::OutputContract>>>,
     /// Serializes status transitions (read-modify-write against the store).
     transition: tokio::sync::Mutex<()>,
 }
@@ -191,9 +334,11 @@ impl Router {
             turns: Mutex::new(HashMap::new()),
             owed: Mutex::new(HashMap::new()),
             owed_nudges: Mutex::new(HashMap::new()),
+            timing: Mutex::new(WatchdogTiming::default()),
             loops_done: Mutex::new(HashSet::new()),
             loop_rounds: Mutex::new(HashMap::new()),
             repairs: Mutex::new(HashMap::new()),
+            contracts: Mutex::new(HashMap::new()),
             transition: tokio::sync::Mutex::new(()),
         });
         let _ = router.self_ref.set(Arc::downgrade(&router));
@@ -204,6 +349,12 @@ impl Router {
     /// Wiring break, called once in `Run::start`. Later calls are ignored.
     pub fn set_state_source(&self, source: Arc<dyn StateSource>) {
         let _ = self.state_source.set(source);
+    }
+
+    /// Test knob: shrink the backoff and grace so timing tests run in
+    /// milliseconds. Production keeps the defaults.
+    pub fn set_watchdog_timing(&self, timing: WatchdogTiming) {
+        *lock(&self.timing) = timing;
     }
 
     /// Validates target, assigns `MessageId`, persists (`queued`), emits `message.created`,
@@ -220,6 +371,38 @@ impl Router {
         to: AgentId,
         kind: MessageKind,
         body: String,
+    ) -> Result<MessageRecord, RouterError> {
+        self.create(from, to, kind, body, None).await
+    }
+
+    /// A flow's kickoff message (amendment 31): [`Router::create_message`] with
+    /// the flow name rendered into the injected header, so a target holding more
+    /// than one flow's output contract can tell which schema its reply owes.
+    ///
+    /// The label is a prompt-format detail only — it is not persisted on the
+    /// [`MessageRecord`], whose shape stays as contracts §2.2 fixes it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Router::create_message`].
+    pub async fn create_kickoff(&self, kickoff: FlowKickoff) -> Result<MessageRecord, RouterError> {
+        let FlowKickoff {
+            flow,
+            from,
+            to,
+            kind,
+            body,
+        } = kickoff;
+        self.create(from, to, kind, body, Some(flow)).await
+    }
+
+    async fn create(
+        &self,
+        from: Origin,
+        to: AgentId,
+        kind: MessageKind,
+        body: String,
+        flow: Option<FlowName>,
     ) -> Result<MessageRecord, RouterError> {
         if !self.workflow.agents.contains_key(&to) {
             return Err(RouterError::UnknownAgent(to));
@@ -252,6 +435,8 @@ impl Router {
             created_at: Timestamp::now(),
             injected_at: None,
             completed_at: None,
+            reason: None,
+            reason_code: None,
         };
         self.store.insert_message(&record).await?;
         if kind == MessageKind::Ask {
@@ -265,8 +450,8 @@ impl Router {
             message: record.clone(),
         });
         let text = match kind {
-            MessageKind::Ask => sinks::render_ask(&record.id, &from, &body),
-            MessageKind::Send => sinks::render_send(&record.id, &from, &body),
+            MessageKind::Ask => sinks::render_ask(&record.id, &from, flow.as_ref(), &body),
+            MessageKind::Send => sinks::render_send(&record.id, &from, flow.as_ref(), &body),
         };
         let rx = self.injector.enqueue(to.clone(), text);
         // Owed replies (design 2026-08-06 companion fix): the addressee owes a
@@ -479,21 +664,39 @@ impl Router {
         Ok(updated)
     }
 
-    /// Output-schema gate (design 2026-08-06). A code-0 reply to the kickoff ask
-    /// — the HTTP-origin ask addressed to the contract's target — must match the
-    /// workflow's output schema. Returns the rejection to send back while the
-    /// repair budget lasts; `None` when the contract does not apply, the body
+    /// Registers `contract` for the kickoff about to be created under
+    /// `Origin::Trigger(origin)` (multi-flow spec §5). Call before
+    /// `create_kickoff`: a scripted replier can answer off a bus event, so
+    /// binding afterwards races the reply. If creation fails, call
+    /// [`Router::unbind_kickoff_contract`] — no settle will.
+    pub fn bind_kickoff_contract(
+        &self,
+        origin: &str,
+        contract: Arc<crate::schema::OutputContract>,
+    ) {
+        lock(&self.contracts).insert(origin.to_string(), contract);
+    }
+
+    /// Drops a binding whose kickoff was never created.
+    pub fn unbind_kickoff_contract(&self, origin: &str) {
+        lock(&self.contracts).remove(origin);
+    }
+
+    /// Output-schema gate (design 2026-08-06). A code-0 reply to a kickoff ask
+    /// whose origin bound a contract must match that contract's schema — the
+    /// kickoff's own flow's, never another flow's, so a kickoff that bound none
+    /// (every `on_start` kickoff) is ungated. Returns the rejection to send back
+    /// while the repair budget lasts; `None` when no contract applies, the body
     /// conforms, or the budget is spent (the trigger fails it at the boundary
     /// instead of leaving the caller waiting on an agent that cannot comply).
     ///
     /// Runs under the `transition` guard: synchronous throughout, no `.await`.
     fn reject_off_schema(&self, rec: &MessageRecord, code: u8, body: &str) -> Option<RouterError> {
-        let contract = self.workflow.output.as_ref()?;
-        if code != 0
-            || rec.kind != MessageKind::Ask
-            || !matches!(rec.from, Origin::Http(_))
-            || rec.to != contract.target
-        {
+        let Origin::Trigger(origin) = &rec.from else {
+            return None;
+        };
+        let contract = lock(&self.contracts).get(origin).cloned()?;
+        if code != 0 || rec.kind != MessageKind::Ask {
             return None;
         }
         let Err(errors) = contract.check(body) else {
@@ -513,7 +716,11 @@ impl Router {
             );
             return None;
         }
-        let rendered = crate::schema::render_rejection(&errors, contract.max_repairs - rejections);
+        let rendered = crate::schema::render_rejection(
+            &errors,
+            contract.max_repairs - rejections,
+            &contract.flow,
+        );
         self.bus.publish(EventPayload::ReplyRejected {
             message: rec.id.clone(),
             agent: rec.to.clone(),
@@ -556,7 +763,8 @@ impl Router {
         });
     }
 
-    /// Terminal bookkeeping: drop TTL deadline, repair count and suppression entry, and
+    /// Terminal bookkeeping: drop TTL deadline, repair count, bound output
+    /// contract and suppression entry, and
     /// decrement the asker's pending count for agent-origin asks. A `replied` record keeps
     /// its suppression entry
     /// until [`Router::fire_reply_sink`] consumes it — settling runs first (the auto-clear
@@ -564,6 +772,9 @@ impl Router {
     fn settle(&self, rec: &MessageRecord) {
         lock(&self.deadlines).remove(&rec.id);
         lock(&self.repairs).remove(&rec.id);
+        if let Origin::Trigger(origin) = &rec.from {
+            lock(&self.contracts).remove(origin);
+        }
         if rec.status != MessageStatus::Replied {
             lock(&self.suppressed).remove(&rec.id);
         }
@@ -613,7 +824,8 @@ impl Router {
         match self.store.pending_to_agent(agent).await {
             Ok(records) => {
                 for rec in records {
-                    self.fail_message(&rec.id).await;
+                    self.fail_message(&rec.id, FailReason::restarted(agent))
+                        .await;
                 }
             }
             Err(e) => {
@@ -624,7 +836,7 @@ impl Router {
     }
 
     /// Idempotent: no-op if the message is already terminal (or missing).
-    pub(crate) async fn fail_message(&self, id: &MessageId) {
+    pub(crate) async fn fail_message(&self, id: &MessageId, reason: FailReason) {
         let result = self
             .transition(
                 id,
@@ -636,6 +848,8 @@ impl Router {
                 |rec| {
                     rec.status = MessageStatus::Failed;
                     rec.completed_at = Some(Timestamp::now());
+                    rec.reason = Some(reason.reason.clone());
+                    rec.reason_code = Some(reason.code.to_string());
                 },
             )
             .await;
@@ -731,11 +945,12 @@ impl Router {
         turn.stalled = false;
     }
 
-    /// Owed-reply gate (design 2026-08-06 companion fix). An agent that idles
-    /// without answering an ask addressed to it gets one nudge, then holds
-    /// quiet — `/clear` would destroy the very context the asker is blocked on,
-    /// and after a schema rejection it would destroy the work being repaired.
-    /// `None` means nothing is owed and the caller carries on to turn logic.
+    /// Owed-reply gate (design 2026-08-06 companion fix, spec 2026-08-17 §4).
+    /// An agent that idles without answering an ask addressed to it is nudged,
+    /// then re-nudged on a backoff for as long as the reply is owed — `/clear`
+    /// would destroy the very context the asker is blocked on, and after a
+    /// schema rejection it would destroy the work being repaired. `None` means
+    /// nothing is owed and the caller carries on to turn logic.
     fn owed_reply_decision(&self, agent: &AgentId) -> Option<IdleDecision> {
         let mut owed: Vec<MessageId> = lock(&self.owed)
             .get(agent)
@@ -745,25 +960,195 @@ impl Router {
             return None;
         }
         owed.sort_by(|a, b| a.0.cmp(&b.0)); // the set's order is not stable
-        let mut nudges = lock(&self.owed_nudges);
-        let state = nudges.entry(agent.clone()).or_default();
-        if state.nudged {
-            let publish = !state.stalled;
-            state.stalled = true;
-            drop(nudges);
-            if publish {
-                self.bus.publish(EventPayload::AgentStalled {
-                    agent: agent.clone(),
-                });
-            }
+        if self.blocked_since(agent).is_some() {
+            // Never type into a dialog: a leading digit would answer it. The
+            // sweeper fails the ask once the blocked grace is spent.
             return Some(IdleDecision::HoldQuiet);
         }
-        state.nudged = true;
-        drop(nudges);
-        self.bus.publish(EventPayload::AgentNudged {
-            agent: agent.clone(),
-        });
-        Some(IdleDecision::Nudge(sinks::render_reply_nudge(&owed)))
+        let (round, publish_stalled) = self.advance_nudge_round(agent);
+        match round {
+            None => {
+                if publish_stalled {
+                    self.bus.publish(EventPayload::AgentStalled {
+                        agent: agent.clone(),
+                    });
+                }
+                Some(IdleDecision::HoldQuiet)
+            }
+            Some(round) => {
+                self.bus.publish(EventPayload::AgentNudged {
+                    agent: agent.clone(),
+                });
+                Some(IdleDecision::Nudge(sinks::render_reply_nudge(&owed, round)))
+            }
+        }
+    }
+
+    /// The check-and-bump half of [`Router::owed_reply_decision`], under one
+    /// `owed_nudges` guard so a poke and a state transition cannot both nudge
+    /// the same round. Returns `Some(round)` to nudge or `None` to hold quiet,
+    /// plus whether `agent.stalled` is still owed for the current round.
+    fn advance_nudge_round(&self, agent: &AgentId) -> (Option<u32>, bool) {
+        let now = tokio::time::Instant::now();
+        let timing = *lock(&self.timing);
+        let mut nudges = lock(&self.owed_nudges);
+        match nudges.get_mut(agent) {
+            None => {
+                nudges.insert(
+                    agent.clone(),
+                    ReplyNudgeState {
+                        nudges: 1,
+                        last_nudge_at: now,
+                        stalled: false,
+                    },
+                );
+                (Some(1), false)
+            }
+            Some(state)
+                if now.duration_since(state.last_nudge_at) < timing.backoff_after(state.nudges) =>
+            {
+                let publish = !state.stalled;
+                state.stalled = true;
+                (None, publish)
+            }
+            Some(state) => {
+                state.nudges += 1;
+                state.last_nudge_at = now;
+                state.stalled = false;
+                (Some(state.nudges), false)
+            }
+        }
+    }
+
+    /// The dialog this agent is parked on, if any (spec 2026-08-17 §4.2).
+    fn blocked_since(&self, agent: &AgentId) -> Option<crate::pty::Blocked> {
+        self.state_source
+            .get()
+            .and_then(|source| source.blocked_since(agent))
+    }
+
+    /// One owed-ask watchdog pass (spec 2026-08-17 §4), run by the sweeper
+    /// right after expiry so a dead ask is never poked for. Snapshots under
+    /// the locks and acts after dropping them: fail-fast for agents parked on
+    /// a dialog past the grace, then for agents that have exited, then a poke
+    /// to the queue worker for every agent whose re-nudge is due. The worker,
+    /// not this pass, decides whether anything is typed.
+    pub(crate) async fn sweep_owed(&self) {
+        let now = tokio::time::Instant::now();
+        let timing = *lock(&self.timing);
+        let owed: Vec<(AgentId, Vec<MessageId>)> = lock(&self.owed)
+            .iter()
+            .map(|(agent, ids)| (agent.clone(), ids.iter().cloned().collect()))
+            .collect();
+        for (agent, ids) in owed {
+            if self.fail_owed_if_blocked(&agent, &ids, now, timing).await {
+                continue;
+            }
+            if self.is_exited(&agent) {
+                for id in &ids {
+                    self.fail_message(id, FailReason::exited(&agent)).await;
+                }
+                continue;
+            }
+            if self.poke_is_due(&agent, &ids, now, timing) {
+                self.injector.reconsider(&agent);
+            }
+        }
+    }
+
+    /// Fails every owed ask once `agent` has sat on a permission dialog past
+    /// the grace (spec §4.2), returning true when it did. The agent itself is
+    /// left exactly as it is: the dialog stays up and nothing is typed.
+    async fn fail_owed_if_blocked(
+        &self,
+        agent: &AgentId,
+        ids: &[MessageId],
+        now: tokio::time::Instant,
+        timing: WatchdogTiming,
+    ) -> bool {
+        let Some(blocked) = self.blocked_since(agent) else {
+            return false;
+        };
+        if now.duration_since(blocked.since) < timing.blocked_grace {
+            return false;
+        }
+        tracing::warn!(agent = %agent.0, tool = blocked.tool.as_deref().unwrap_or("?"),
+                       "blocked past the grace; failing its owed asks");
+        for id in ids {
+            let reason = FailReason::blocked(agent, blocked.tool.as_deref(), timing.blocked_grace);
+            self.fail_message(id, reason).await;
+        }
+        true
+    }
+
+    /// The agent's debounced state, `None` when there is no state source (unit
+    /// tests) or the agent is unknown to it.
+    fn debounced_state(&self, agent: &AgentId) -> Option<AgentState> {
+        self.state_source
+            .get()
+            .and_then(|source| source.subscribe_debounced(agent))
+            .map(|rx| *rx.borrow())
+    }
+
+    /// Debounced `Exited`. `drive_message` stops watching an ask once it
+    /// reaches `working`, so an exit after that point is only seen here — the
+    /// ask would otherwise wait out its whole TTL (spec §4.1).
+    fn is_exited(&self, agent: &AgentId) -> bool {
+        self.debounced_state(agent) == Some(AgentState::Exited)
+    }
+
+    /// True when the queue worker should re-run the gate for this owed agent.
+    /// Either it has been nudged and the backoff since has elapsed (spec §4.1),
+    /// or it has never been nudged — the case a `HoldQuiet` leaves behind when
+    /// the idle transition happened while the agent was blocked, so round 1 was
+    /// never performed and no state exists to back off from (spec §4.2
+    /// amendment, live 2026-08-18). Both branches demand a debounced-idle
+    /// agent: a poke sent while it is working is buffered behind the worker's
+    /// in-flight injection and lands the moment that injection is delivered,
+    /// before the agent's `UserPromptSubmit` hook has moved it off idle — a
+    /// nudge for the message it is in the act of answering. The never-nudged
+    /// branch runs the same backoff clock off the ask's own age; with
+    /// `ask_timeout_minutes = 1` (the minimum) that age can never reach
+    /// `backoff_after(0)` before expiry fails the ask, so the branch is dead
+    /// there by design — expiry wins. A blocked agent is never poked, in the
+    /// grace or past it: typing into a dialog is never right, and the fail-fast
+    /// owns that case. Nor is one waiting on its own downstream ask — the gate
+    /// would hold quiet every tick.
+    fn poke_is_due(
+        &self,
+        agent: &AgentId,
+        ids: &[MessageId],
+        now: tokio::time::Instant,
+        timing: WatchdogTiming,
+    ) -> bool {
+        if self.blocked_since(agent).is_some() || self.pending_asks(agent) > 0 {
+            return false;
+        }
+        if self.debounced_state(agent) != Some(AgentState::Idle) {
+            return false;
+        }
+        match lock(&self.owed_nudges).get(agent).copied() {
+            Some(state) => {
+                now.duration_since(state.last_nudge_at) >= timing.backoff_after(state.nudges)
+            }
+            None => self.oldest_owed_age(ids, now) >= timing.backoff_after(0),
+        }
+    }
+
+    /// How long the oldest of `ids` has been owed, read off the TTL deadline
+    /// each ask was given at creation (`created + ask_timeout`). Zero when none
+    /// of them is on the deadline map — an ask already expired is not poked for.
+    fn oldest_owed_age(&self, ids: &[MessageId], now: tokio::time::Instant) -> Duration {
+        let deadlines = lock(&self.deadlines);
+        ids.iter()
+            .filter_map(|id| deadlines.get(id))
+            .map(|deadline| {
+                self.workflow
+                    .ask_timeout
+                    .saturating_sub(deadline.saturating_duration_since(now))
+            })
+            .max()
+            .unwrap_or(Duration::ZERO)
     }
 
     #[must_use]
@@ -771,16 +1156,21 @@ impl Router {
         lock(&self.counts).get(agent).copied().unwrap_or(0)
     }
 
-    /// Count of agents with an open obligation turn (spec triggers §2 quiescence input).
+    /// Sum of pending outgoing asks across `agents` only. A flow's quiescence
+    /// is scoped to its member set (multi-flow spec §4): another flow's
+    /// traffic on the same run must delay nothing here.
     #[must_use]
-    pub fn open_turns(&self) -> u64 {
-        lock(&self.turns).len() as u64
+    pub fn total_pending_asks_among(&self, agents: &[AgentId]) -> u64 {
+        let counts = lock(&self.counts);
+        agents.iter().filter_map(|a| counts.get(a)).sum()
     }
 
-    /// Sum of pending outgoing asks across all agents.
+    /// Count of `agents` with an open obligation turn (member-scoped twin of
+    /// the quiescence input; multi-flow spec §4).
     #[must_use]
-    pub fn total_pending_asks(&self) -> u64 {
-        lock(&self.counts).values().sum()
+    pub fn open_turns_among(&self, agents: &[AgentId]) -> u64 {
+        let turns = lock(&self.turns);
+        agents.iter().filter(|a| turns.contains_key(*a)).count() as u64
     }
 }
 
@@ -795,6 +1185,12 @@ impl ClearGate for Router {
         // agent with no edges at all can still owe somebody a reply.
         if let Some(decision) = self.owed_reply_decision(agent) {
             return decision;
+        }
+        // Parked on a permission dialog (#63): a nudge or `/clear` would be
+        // typed into it. Hold, and leave the turn's nudge unspent — the queue
+        // worker re-runs the gate when the flag clears at idle.
+        if self.blocked_since(agent).is_some() {
+            return IdleDecision::HoldQuiet;
         }
         let Some(edges) = self.workflow.agents.get(agent).map(|c| c.edges.clone()) else {
             return IdleDecision::AllowClear;
@@ -873,12 +1269,14 @@ async fn drive_message(
         Ok(Ok(injected)) => injected,
         Ok(Err(e)) => {
             tracing::info!(message = %id.0, error = %e, "injection failed; failing message");
-            router.fail_message(&id).await;
+            router.fail_message(&id, FailReason::from_inject(&e)).await;
             return;
         }
         Err(_) => {
             tracing::warn!(message = %id.0, "injection receiver dropped; failing message");
-            router.fail_message(&id).await;
+            // The queue worker dropped the ack without answering: it goes with
+            // the agent's PTY, so the target cannot still be running.
+            router.fail_message(&id, FailReason::exited(&to)).await;
             return;
         }
     };
@@ -918,7 +1316,7 @@ async fn drive_message(
             break;
         }
         if state == AgentState::Exited {
-            router.fail_message(&id).await;
+            router.fail_message(&id, FailReason::exited(&to)).await;
             return;
         }
         if states.changed().await.is_err() {
@@ -952,7 +1350,7 @@ async fn drive_message(
                 return;
             }
             if state == AgentState::Exited {
-                router.fail_message(&id).await;
+                router.fail_message(&id, FailReason::exited(&to)).await;
                 return;
             }
         }

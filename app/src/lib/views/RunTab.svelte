@@ -1,6 +1,9 @@
 <script lang="ts">
   import { feedTime } from "../format";
+  import { fireFlow, runFlows, toCmdError } from "../ipc";
+  import { runState } from "../state/run.svelte";
   import { selectTrigger, triggersState } from "../state/triggers.svelte";
+  import type { FlowInfo } from "../types";
   import { classify } from "./triggerHelpers";
   import OutputRenderer from "./OutputRenderer.svelte";
 
@@ -11,12 +14,60 @@
   );
   // oxlint-disable-next-line no-array-reverse -- ES2022 lib; the spread copy is safe to mutate
   const history = $derived([...triggersState.list].reverse());
+
+  let flows = $state<FlowInfo[]>([]);
+  let fireError = $state<string | null>(null);
+
+  // Re-fetched per run: the roster is frozen for the run's lifetime.
+  $effect(() => {
+    if (runState.info === null) {
+      flows = [];
+      fireError = null;
+      return;
+    }
+    void runFlows()
+      .then((list) => {
+        flows = list;
+      })
+      .catch((e: unknown) => {
+        flows = [];
+        fireError = toCmdError(e).message;
+      });
+  });
+
+  async function fire(name: string): Promise<void> {
+    fireError = null;
+    try {
+      await fireFlow(name);
+      // The lifecycle itself arrives via message.created / workflow.completed
+      // bus events — nothing else to do here.
+    } catch (e) {
+      fireError = toCmdError(e).message;
+    }
+  }
 </script>
 
 <div class="run">
+  {#if flows.length > 0}
+    <section class="flows">
+      <div class="label">Flows</div>
+      {#each flows as flow (flow.name)}
+        <div class="mono row">
+          <span class="name">{flow.name}</span>
+          <span class="label">→ {flow.target}</span>
+          {#if flow.type === "on_start"}
+            <button class="mono" onclick={() => void fire(flow.name)}>fire</button>
+          {:else}
+            <span class="label">webhook</span>
+          {/if}
+        </div>
+      {/each}
+    </section>
+  {/if}
+  {#if fireError !== null}<p class="mono err">{fireError}</p>{/if}
   {#if current === null}
     <p class="label empty">
-      No trigger yet. Fire the workflow's webhook (or start an on_start workflow)
+      No trigger yet. Fire an on_start flow above, POST to a webhook flow,
       and its lifecycle appears here.
     </p>
   {:else}
@@ -88,4 +139,8 @@
   .row { display: flex; justify-content: space-between; width: 100%; padding: 3px 4px; }
   .row.active { color: var(--accent); }
   .row .time { color: var(--text-dim); }
+  .flows { border-bottom: 1px solid var(--panel-edge); padding-bottom: 8px; }
+  .flows .row { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
+  .flows .name { color: var(--accent); }
+  .err { color: var(--err); }
 </style>

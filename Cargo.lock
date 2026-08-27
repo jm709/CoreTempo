@@ -634,6 +634,7 @@ dependencies = [
  "anyhow",
  "axum",
  "jsonschema",
+ "libc",
  "portable-pty",
  "rand",
  "rusqlite",

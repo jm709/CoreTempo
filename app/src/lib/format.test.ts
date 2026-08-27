@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { askQueued, askReplied, askWorking, sendFailed, sendQueued } from "./fixtures/recorded";
 import {
-  elapsed, feedTime, isChat, isExternal, lifecycleGlyph, originAgent, originLabel,
+  elapsed, exitLabel, feedTime, isChat, isExternal, lifecycleGlyph, originAgent, originLabel,
   STATE_GLYPHS, stateLabel,
 } from "./format";
 
@@ -33,14 +33,17 @@ describe("origins and times", () => {
     expect(originLabel("agent:planner")).toBe("planner");
     expect(originLabel("user")).toBe("you");
     expect(originLabel("http:1f2e3d4c")).toBe("external");
+    expect(originLabel("trigger:1f2e3d4c")).toBe("trigger");
   });
   it("extracts the agent from an agent origin only", () => {
     expect(originAgent("agent:planner")).toBe("planner");
     expect(originAgent("user")).toBeNull();
     expect(originAgent("http:1f2e3d4c")).toBeNull();
+    expect(originAgent("trigger:1f2e3d4c")).toBeNull();
   });
   it("flags external origins and chat traffic", () => {
     expect(isExternal("http:1f2e3d4c")).toBe(true);
+    expect(isExternal("trigger:1f2e3d4c")).toBe(true);
     expect(isExternal("agent:planner")).toBe(false);
     expect(isChat({ ...askQueued, from: "user" })).toBe(true);
     expect(isChat(askQueued)).toBe(false);
@@ -51,5 +54,17 @@ describe("origins and times", () => {
     expect(elapsed(t0, Date.parse("2026-08-01T17:14:02Z"))).toBe("14m 02s");
     expect(elapsed(t0, Date.parse("2026-08-01T18:04:30Z"))).toBe("1h 04m");
     expect(elapsed(t0, Date.parse("2026-08-01T16:59:00Z"))).toBe("0m 00s");
+  });
+});
+
+describe("exitLabel (pane overlay for a dead agent)", () => {
+  it("shows the exit code", () => {
+    expect(exitLabel({ code: 3 })).toBe("exited 3");
+  });
+  it("names the signal that killed the agent instead of a fake code (#90)", () => {
+    expect(exitLabel({ signal: "Terminated" })).toBe("killed: Terminated");
+  });
+  it("shows ? until the snapshot carries the exit", () => {
+    expect(exitLabel(null)).toBe("exited ?");
   });
 });

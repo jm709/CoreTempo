@@ -15,7 +15,7 @@
 //! the kickoff at `working` (or `done`). Without that guard a swallowed kickoff
 //! reports success.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -31,9 +31,8 @@ use crate::api::PtySource;
 use crate::bus::EventBus;
 use crate::router::Router;
 use crate::types::agent::AgentState;
-use crate::types::config::{TriggerType, WorkflowFile};
 use crate::types::event::{CompletionResult, Event, EventPayload, LifecyclePhase};
-use crate::types::id::{AgentId, MessageId};
+use crate::types::id::{AgentId, FlowName, MessageId};
 use crate::types::message::{MessageKind, MessageRecord, MessageStatus};
 
 /// Queue depth and the router's counters are polled, not watched, so the
@@ -67,7 +66,7 @@ pub fn watcher_deadline(ask_timeout: Duration) -> Duration {
         .max(Duration::from_secs(1))
 }
 
-/// 8 lowercase hex chars, mirroring the `Origin::Http` ids minted elsewhere
+/// 8 lowercase hex chars, mirroring the `Origin::Trigger` ids minted elsewhere
 /// (HTTP request ids, warm-trigger ids). An `on_start` kickoff has no HTTP
 /// request of its own to borrow an id from, so `coretempod run` mints one
 /// here; the desktop app instead registers its kickoff via
@@ -76,27 +75,6 @@ pub fn watcher_deadline(ask_timeout: Duration) -> Duration {
 pub fn startup_id() -> String {
     use rand::RngExt;
     format!("{:08x}", rand::rng().random::<u32>())
-}
-
-/// The kickoff a run should fire at start, for an `on_start` workflow.
-/// `None` for a webhook trigger or no trigger at all, in which case the run
-/// just comes up and waits.
-///
-/// Shared by daemon `run` mode and the desktop app's `run_start`: both build
-/// the kickoff message straight off the frozen [`WorkflowFile`].
-#[must_use]
-pub fn startup_kickoff(file: &WorkflowFile) -> Option<(AgentId, MessageKind, String)> {
-    let trigger = file.trigger.as_ref()?;
-    if trigger.trigger_type != TriggerType::OnStart {
-        return None;
-    }
-    // Validation guarantees an on_start trigger carries a non-empty message.
-    let message = trigger.message.clone().unwrap_or_default();
-    Some((
-        trigger.edge.to.clone(),
-        trigger.edge.kind.message_kind(),
-        message,
-    ))
 }
 
 /// Where one trigger is in its life. The wire form is flat and tagged by
@@ -116,8 +94,9 @@ pub enum TriggerStatus {
         /// `Replied` only.
         #[serde(skip_serializing_if = "Option::is_none")]
         reply: Option<String>,
-        /// The reply parsed against `[trigger.output]`, alongside the raw
-        /// `reply` it came from. Absent when no contract is declared.
+        /// The reply parsed against the webhook flow's `output` contract,
+        /// alongside the raw `reply` it came from. Absent when the flow
+        /// declares no contract.
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<Value>,
     },
@@ -201,8 +180,11 @@ struct HubInner {
     /// Insertion-ordered so the cap evicts the oldest record; a trigger history
     /// is short and read by id, so a scan beats a map plus an eviction queue.
     records: VecDeque<(String, TriggerStatus)>,
-    /// Id of the trigger whose kickoff is running, if any.
-    in_flight: Option<String>,
+    /// Per flow: the id of the trigger whose kickoff is running. Underpins
+    /// serve's `begin` and warm mode's per-flow 409 (multi-flow spec §4–5).
+    /// Serve's all-shared self-overlap records only the latest starter here;
+    /// per-flow running *counts* live in the scheduler's `FlowLoad`.
+    in_flight: BTreeMap<FlowName, String>,
 }
 
 /// Shared trigger bookkeeping: id generation, capped history, the in-flight id
@@ -237,7 +219,7 @@ impl TriggerHub {
         Arc::new(TriggerHub {
             inner: Mutex::new(HubInner {
                 records: VecDeque::new(),
-                in_flight: None,
+                in_flight: BTreeMap::new(),
             }),
             updates: broadcast::channel(UPDATE_BUFFER).0,
         })
@@ -250,39 +232,37 @@ impl TriggerHub {
         id
     }
 
-    /// Registers a trigger and claims the workflow for it in one step, so two
-    /// concurrent callers cannot both find the workflow free. `Err` carries the
-    /// id of the trigger already running.
+    /// Registers a trigger and claims `flow` for it in one step, so two
+    /// concurrent callers cannot both find the flow free.
     ///
     /// # Errors
-    /// The active trigger id when a kickoff is already in flight.
-    pub fn try_begin(&self) -> Result<String, String> {
+    /// The active trigger id when a kickoff is already in flight *in this
+    /// flow* — other flows' kickoffs do not conflict.
+    pub fn try_begin(&self, flow: &FlowName) -> Result<String, String> {
         let mut inner = lock(&self.inner);
-        if let Some(active) = &inner.in_flight {
+        if let Some(active) = inner.in_flight.get(flow) {
             return Err(active.clone());
         }
         let id = trigger_id();
         push_record(&mut inner, id.clone(), TriggerStatus::Running);
-        inner.in_flight = Some(id.clone());
+        inner.in_flight.insert(flow.clone(), id.clone());
         Ok(id)
     }
 
-    /// Moves an already-registered trigger to `running` and claims the workflow
-    /// for it. Serve mode's FIFO worker is the only caller that can do this
-    /// unconditionally: the queue, not the flag, is what serializes it.
-    pub fn begin(&self, id: &str) {
-        lock(&self.inner).in_flight = Some(id.to_string());
+    /// Moves an already-registered trigger to `running` and claims `flow`.
+    /// Serve's flow workers call this unconditionally after locks + permit:
+    /// the queue and locks, not this flag, are what serialize them.
+    pub fn begin(&self, flow: &FlowName, id: &str) {
+        lock(&self.inner)
+            .in_flight
+            .insert(flow.clone(), id.to_string());
         self.set_status(id, TriggerStatus::Running);
     }
 
-    /// Records a trigger's terminal status and releases the workflow.
+    /// Records a trigger's terminal status and releases whichever flow it
+    /// holds.
     pub fn finish(&self, id: &str, status: TriggerStatus) {
-        {
-            let mut inner = lock(&self.inner);
-            if inner.in_flight.as_deref() == Some(id) {
-                inner.in_flight = None;
-            }
-        }
+        lock(&self.inner).in_flight.retain(|_, active| active != id);
         self.set_status(id, status);
     }
 
@@ -310,9 +290,15 @@ impl TriggerHub {
             .map(|(_, status)| status.clone())
     }
 
-    /// Id of the trigger whose kickoff is running, if any.
+    /// The id running in `flow`, if any.
     #[must_use]
-    pub fn in_flight(&self) -> Option<String> {
+    pub fn in_flight(&self, flow: &FlowName) -> Option<String> {
+        lock(&self.inner).in_flight.get(flow).cloned()
+    }
+
+    /// Snapshot of every flow's in-flight id (health, `GET /v1/flows`).
+    #[must_use]
+    pub fn in_flight_by_flow(&self) -> BTreeMap<FlowName, String> {
         lock(&self.inner).in_flight.clone()
     }
 
@@ -333,6 +319,70 @@ impl TriggerHub {
                 status: status.clone(),
             })
             .collect()
+    }
+}
+
+/// Where a [`SettleOnDrop`] guard reports its trigger's terminal status. The
+/// hub is the whole story for a warm run; serve mode wraps its per-flow
+/// counters around the same call, which is why this is a trait rather than an
+/// `Arc<TriggerHub>`.
+pub trait SettleSink: Send + Sync + 'static {
+    /// Records `id`'s terminal status and releases whatever it holds.
+    fn settle(&self, id: &str, status: TriggerStatus);
+}
+
+impl SettleSink for TriggerHub {
+    fn settle(&self, id: &str, status: TriggerStatus) {
+        self.finish(id, status);
+    }
+}
+
+/// Settles its trigger on drop unless the task already did — a panic, a
+/// cancelled task and an early return included (multi-flow spec §4–5: every
+/// exit path settles). A trigger task holds its flow's in-flight slot from the
+/// moment it is accepted, so one that ends without settling wedges that flow:
+/// every later trigger to it 409s until the process restarts.
+///
+/// Build it before `tokio::spawn` and let the task capture it: constructed
+/// inside the future instead, it never exists for a task the runtime drops
+/// before its first poll.
+pub struct SettleOnDrop {
+    sink: Arc<dyn SettleSink>,
+    id: String,
+    settled: bool,
+}
+
+impl SettleOnDrop {
+    #[must_use]
+    pub fn new(sink: Arc<dyn SettleSink>, id: String) -> SettleOnDrop {
+        SettleOnDrop {
+            sink,
+            id,
+            settled: false,
+        }
+    }
+
+    /// Settles with the status the task actually reached; consuming, so the
+    /// drop below cannot also fire.
+    pub fn settle(mut self, status: TriggerStatus) {
+        self.sink.settle(&self.id, status);
+        self.settled = true;
+    }
+}
+
+impl Drop for SettleOnDrop {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.sink.settle(
+                &self.id,
+                TriggerStatus::Failed {
+                    reason: "internal: the trigger task ended without settling this \
+                             trigger; report this"
+                        .to_string(),
+                    reason_code: "internal".to_string(),
+                },
+            );
+        }
     }
 }
 
@@ -371,14 +421,16 @@ pub struct WatchInputs {
     pub bus: EventBus,
     pub router: Arc<Router>,
     pub pty: Arc<dyn PtySource>,
-    /// Every agent in the frozen roster: quiescence is a whole-workflow property.
+    /// The agents whose quiescence settles this kickoff: the kickoff flow's
+    /// member set (`Run::watch_inputs_for_flow`), or the whole frozen roster for a
+    /// flowless run.
     pub roster: Vec<AgentId>,
     /// How long the system must hold still before it counts as quiesced.
     pub idle_debounce: Duration,
     /// Measured from watcher start, never from injection.
     pub deadline: Duration,
-    /// The workflow's `[trigger.output]` contract, when it declares one: the
-    /// final reply is re-validated against it before the caller sees it.
+    /// The webhook flow's `output` contract, when it declares one: the final
+    /// reply is re-validated against it before the caller sees it.
     pub output: Option<Arc<crate::schema::OutputContract>>,
     /// The hub id this watcher settles, when the kickoff is registered.
     pub trigger_id: Option<String>,
@@ -624,15 +676,34 @@ fn terminal_completion(
                 }),
             }
         }
-        MessageStatus::Done | MessageStatus::Failed => Some(Completion::Failed {
-            reason: format!(
+        MessageStatus::Done | MessageStatus::Failed => Some(failed_completion(
+            rec,
+            format!(
                 "kickoff ask '{}' ended at status '{}' without a reply",
                 rec.id.0,
                 rec.status.as_str()
             ),
-            reason_code: "agent_failed",
-        }),
+        )),
         MessageStatus::Queued | MessageStatus::Injected | MessageStatus::Working => None,
+    }
+}
+
+/// The record's own diagnosis, translated into the trigger wire's vocabulary.
+/// A code the wire does not publish (`orphaned`, or anything a later router
+/// adds) degrades to `agent_failed` rather than leaking; a record with no
+/// reason of its own gets `fallback`. Shared by every kickoff shape so an ask
+/// and a send that fail the same way report the same thing.
+fn failed_completion(rec: &MessageRecord, fallback: String) -> Completion {
+    let reason_code = match rec.reason_code.as_deref() {
+        Some("blocked_on_permission") => "blocked_on_permission",
+        Some("timeout") => "timeout",
+        Some("agent_restarted") => "agent_restarted",
+        Some("agent_exited") => "agent_exited",
+        Some(_) | None => "agent_failed",
+    };
+    Completion::Failed {
+        reason: rec.reason.clone().unwrap_or(fallback),
+        reason_code,
     }
 }
 
@@ -708,10 +779,10 @@ fn arming(rec: &MessageRecord) -> Option<Result<(), Completion>> {
         // `replied` cannot happen for a send (the router rejects it), but it is
         // still proof the agent saw the message.
         MessageStatus::Working | MessageStatus::Done | MessageStatus::Replied => Some(Ok(())),
-        MessageStatus::Failed => Some(Err(Completion::Failed {
-            reason: format!("kickoff send '{}' failed before the agent saw it", rec.id.0),
-            reason_code: "agent_failed",
-        })),
+        MessageStatus::Failed => Some(Err(failed_completion(
+            rec,
+            format!("kickoff send '{}' failed before the agent saw it", rec.id.0),
+        ))),
         MessageStatus::Queued | MessageStatus::Injected => None,
     }
 }
@@ -822,11 +893,11 @@ fn check(inputs: &WatchInputs, states: &mut States) -> Verdict {
             }
         }
     }
-    let asks = inputs.router.total_pending_asks();
+    let asks = inputs.router.total_pending_asks_among(&inputs.roster);
     if asks > 0 {
         return Verdict::Blocked(format!("{asks} ask(s) awaiting a reply"));
     }
-    let turns = inputs.router.open_turns();
+    let turns = inputs.router.open_turns_among(&inputs.roster);
     if turns > 0 {
         return Verdict::Blocked(format!("{turns} agent(s) mid-turn"));
     }
@@ -923,52 +994,95 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::time::Timestamp;
     use crate::trigger::{
-        Completion, HISTORY_CAP, PAYLOAD_CAP_BYTES, PayloadError, TriggerHub, TriggerStatus,
-        TriggerView, await_terminal, completion_event, completion_status, normalize_payload,
-        read_payload, startup_id, startup_kickoff, watcher_deadline,
+        Completion, HISTORY_CAP, PAYLOAD_CAP_BYTES, PayloadError, SettleOnDrop, SettleSink,
+        TriggerHub, TriggerStatus, TriggerView, arming, await_terminal, completion_event,
+        completion_status, normalize_payload, read_payload, startup_id, terminal_completion,
+        watcher_deadline,
     };
-    use crate::types::config::{
-        AgentConfig, Edge, EdgeKind, ServerSection, TriggerConfig, TriggerType,
-    };
-    use crate::types::config::{WorkflowFile, WorkflowSection};
     use crate::types::event::{CompletionResult, EventPayload};
-    use crate::types::id::{AgentId, MessageId};
-    use crate::types::message::MessageKind;
-
-    fn workflow_file(trigger: Option<TriggerConfig>) -> WorkflowFile {
-        WorkflowFile {
-            workflow: WorkflowSection {
-                name: "test".to_string(),
-                db: "./tempo.db".into(),
-                port: 4820,
-                ask_timeout_minutes: 30,
-                idle_debounce_seconds: 2.0,
-                scrollback: 5_000,
-            },
-            server: ServerSection::default(),
-            agents: [(
-                AgentId("worker".to_string()),
-                AgentConfig {
-                    dir: "/tmp".into(),
-                    prompt: "You reply.".to_string(),
-                    model: None,
-                    permission_mode: None,
-                    auto_clear: true,
-                    edges: Vec::new(),
-                    tools: Vec::new(),
-                },
-            )]
-            .into_iter()
-            .collect(),
-            trigger,
-        }
-    }
+    use crate::types::id::{AgentId, FlowName, MessageId};
+    use crate::types::message::{MessageKind, MessageRecord, MessageStatus, Origin};
 
     #[test]
     fn normalize_leaves_plain_newlines_alone() {
         assert_eq!(normalize_payload("a\nb"), "a\nb");
         assert_eq!(normalize_payload(""), "");
+    }
+
+    fn failed_ask() -> MessageRecord {
+        MessageRecord {
+            id: MessageId("m-0000000000000001".into()),
+            kind: MessageKind::Ask,
+            from: Origin::Http("1f2e3d4c".into()),
+            to: AgentId("r".into()),
+            body: "go".into(),
+            status: MessageStatus::Failed,
+            code: None,
+            reply: None,
+            created_at: Timestamp("2026-08-18T00:00:00Z".into()),
+            injected_at: None,
+            completed_at: Some(Timestamp("2026-08-18T00:01:30Z".into())),
+            reason: None,
+            reason_code: None,
+        }
+    }
+
+    #[test]
+    fn failed_record_reason_wins_over_the_generic_agent_failed() {
+        let mut rec = failed_ask();
+        rec.reason = Some("agent 'r' has been waiting on … Bash(python3 …)".into());
+        rec.reason_code = Some("blocked_on_permission".into());
+        match terminal_completion(&rec, None) {
+            Some(Completion::Failed {
+                reason,
+                reason_code,
+            }) => {
+                assert_eq!(reason_code, "blocked_on_permission");
+                assert!(reason.contains("Bash(python3"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        rec.reason_code = Some("orphaned".into());
+        match terminal_completion(&rec, None) {
+            Some(Completion::Failed { reason_code, .. }) => assert_eq!(reason_code, "agent_failed"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A send kickoff that fails before arming reports the record's own code,
+    /// exactly as the identical ask kickoff does through `terminal_completion`.
+    #[test]
+    fn failed_send_kickoff_arming_reports_the_records_code() {
+        let mut rec = failed_ask();
+        rec.kind = MessageKind::Send;
+        rec.reason = Some("agent 'r' restarted before it saw the message".into());
+        rec.reason_code = Some("agent_restarted".into());
+        match arming(&rec) {
+            Some(Err(Completion::Failed {
+                reason,
+                reason_code,
+            })) => {
+                assert_eq!(reason_code, "agent_restarted");
+                assert!(reason.contains("restarted"), "got {reason}");
+            }
+            other => panic!("expected Err(Failed), got {other:?}"),
+        }
+        // An unmapped code still degrades to agent_failed, with generic prose
+        // when the record carries no reason of its own.
+        rec.reason = None;
+        rec.reason_code = Some("orphaned".into());
+        match arming(&rec) {
+            Some(Err(Completion::Failed {
+                reason,
+                reason_code,
+            })) => {
+                assert_eq!(reason_code, "agent_failed");
+                assert!(reason.contains("before the agent saw it"), "got {reason}");
+            }
+            other => panic!("expected Err(Failed), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1084,16 +1198,21 @@ mod tests {
         );
     }
 
+    fn flow_name(name: &str) -> FlowName {
+        FlowName(name.to_string())
+    }
+
     #[test]
-    fn try_begin_claims_the_workflow_until_the_trigger_finishes() {
+    fn try_begin_claims_one_flow_until_the_trigger_finishes() {
         let hub = TriggerHub::new();
-        assert_eq!(hub.in_flight(), None);
-        let first = hub.try_begin().expect("the workflow starts free");
+        let post = flow_name("post");
+        assert_eq!(hub.in_flight(&post), None);
+        let first = hub.try_begin(&post).expect("the flow starts free");
         assert_eq!(hub.get(&first), Some(TriggerStatus::Running));
-        assert_eq!(hub.in_flight(), Some(first.clone()));
-        // The second caller is told which trigger holds the workflow, and no
-        // record is minted for it.
-        assert_eq!(hub.try_begin(), Err(first.clone()));
+        assert_eq!(hub.in_flight(&post), Some(first.clone()));
+        // The second caller is told which trigger holds the flow, and no record
+        // is minted for it.
+        assert_eq!(hub.try_begin(&post), Err(first.clone()), "same flow: 409");
         hub.finish(
             &first,
             TriggerStatus::Completed {
@@ -1103,9 +1222,82 @@ mod tests {
                 output: None,
             },
         );
-        assert_eq!(hub.in_flight(), None);
-        let second = hub.try_begin().expect("finishing releases the workflow");
-        assert_ne!(second, first);
+        assert_eq!(hub.in_flight(&post), None);
+        hub.try_begin(&post).expect("finishing releases the flow");
+    }
+
+    #[test]
+    fn a_dropped_settle_guard_releases_the_flow_as_an_internal_failure() {
+        // The whole point of the guard: a task that never reaches its own
+        // `settle` call still gives the flow back, labelled so the failure
+        // reads as a bug rather than a workflow outcome.
+        let hub = TriggerHub::new();
+        let hook = flow_name("hook");
+        let id = hub.try_begin(&hook).expect("free");
+        drop(SettleOnDrop::new(
+            Arc::clone(&hub) as Arc<dyn SettleSink>,
+            id.clone(),
+        ));
+        assert_eq!(hub.in_flight(&hook), None);
+        let TriggerStatus::Failed {
+            reason,
+            reason_code,
+        } = hub.get(&id).expect("the record survives")
+        else {
+            panic!("a dropped guard must settle the trigger as failed");
+        };
+        assert_eq!(reason_code, "internal");
+        assert!(reason.contains("without settling"), "reason: {reason}");
+    }
+
+    #[test]
+    fn an_explicitly_settled_guard_does_not_overwrite_on_drop() {
+        let hub = TriggerHub::new();
+        let hook = flow_name("hook");
+        let id = hub.try_begin(&hook).expect("free");
+        let guard = SettleOnDrop::new(Arc::clone(&hub) as Arc<dyn SettleSink>, id.clone());
+        guard.settle(TriggerStatus::Completed {
+            result: CompletionResult::Quiesced,
+            code: None,
+            reply: None,
+            output: None,
+        });
+        assert_eq!(
+            hub.get(&id),
+            Some(TriggerStatus::Completed {
+                result: CompletionResult::Quiesced,
+                code: None,
+                reply: None,
+                output: None,
+            }),
+            "the task's own outcome must survive the guard's drop"
+        );
+        assert_eq!(hub.in_flight(&hook), None);
+    }
+
+    #[test]
+    fn flows_claim_independently_and_finish_releases_only_its_own() {
+        let hub = TriggerHub::new();
+        let a = hub.try_begin(&flow_name("a")).expect("free");
+        let b = hub
+            .try_begin(&flow_name("b"))
+            .expect("a busy flow must not block a different one");
+        assert_eq!(
+            hub.in_flight_by_flow(),
+            std::collections::BTreeMap::from([
+                (flow_name("a"), a.clone()),
+                (flow_name("b"), b.clone()),
+            ])
+        );
+        hub.finish(
+            &a,
+            TriggerStatus::Failed {
+                reason: "x".to_string(),
+                reason_code: "internal".to_string(),
+            },
+        );
+        assert_eq!(hub.in_flight(&flow_name("a")), None);
+        assert_eq!(hub.in_flight(&flow_name("b")), Some(b));
     }
 
     #[test]
@@ -1113,8 +1305,9 @@ mod tests {
         // Serve mode's worker and a late warm watcher can both call finish; only
         // the trigger that holds the claim may release it.
         let hub = TriggerHub::new();
+        let hook = flow_name("hook");
         let stale = hub.register(TriggerStatus::Running);
-        let active = hub.try_begin().expect("free");
+        let active = hub.try_begin(&hook).expect("free");
         hub.finish(
             &stale,
             TriggerStatus::Failed {
@@ -1122,16 +1315,17 @@ mod tests {
                 reason_code: "internal".to_string(),
             },
         );
-        assert_eq!(hub.in_flight(), Some(active));
+        assert_eq!(hub.in_flight(&hook), Some(active));
     }
 
     #[test]
     fn begin_marks_a_queued_trigger_running() {
         let hub = TriggerHub::new();
+        let hook = flow_name("hook");
         let id = hub.register(TriggerStatus::Queued { position: 1 });
-        hub.begin(&id);
+        hub.begin(&hook, &id);
         assert_eq!(hub.get(&id), Some(TriggerStatus::Running));
-        assert_eq!(hub.in_flight(), Some(id));
+        assert_eq!(hub.in_flight(&hook), Some(id));
     }
 
     #[test]
@@ -1215,7 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn await_terminal_returns_a_result_that_lands_while_waiting() {
         let hub = TriggerHub::new();
-        let id = hub.try_begin().expect("free");
+        let id = hub.try_begin(&flow_name("hook")).expect("free");
         let waiter = {
             let hub = Arc::clone(&hub);
             let id = id.clone();
@@ -1241,7 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn await_terminal_gives_up_on_a_running_trigger() {
         let hub = TriggerHub::new();
-        let id = hub.try_begin().expect("free");
+        let id = hub.try_begin(&flow_name("hook")).expect("free");
         assert_eq!(
             await_terminal(&hub, &id, Duration::from_millis(50)).await,
             None
@@ -1389,41 +1583,5 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 16, "startup_id minted a duplicate id");
-    }
-
-    #[test]
-    fn startup_kickoff_fires_for_on_start_only() {
-        let on_start = workflow_file(Some(TriggerConfig {
-            trigger_type: TriggerType::OnStart,
-            edge: Edge {
-                to: AgentId("worker".to_string()),
-                kind: EdgeKind::Ask,
-                max_rounds: None,
-            },
-            message: Some("begin".to_string()),
-            output: None,
-        }));
-        assert_eq!(
-            startup_kickoff(&on_start),
-            Some((
-                AgentId("worker".to_string()),
-                MessageKind::Ask,
-                "begin".to_string()
-            ))
-        );
-
-        let webhook = workflow_file(Some(TriggerConfig {
-            trigger_type: TriggerType::Webhook,
-            edge: Edge {
-                to: AgentId("worker".to_string()),
-                kind: EdgeKind::Ask,
-                max_rounds: None,
-            },
-            message: None,
-            output: None,
-        }));
-        assert_eq!(startup_kickoff(&webhook), None);
-
-        assert_eq!(startup_kickoff(&workflow_file(None)), None);
     }
 }

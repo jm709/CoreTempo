@@ -1,5 +1,7 @@
 import { onCoreEvent } from "./ipc";
-import { applyAgentState, applyLifecycle, setAgents, setStalled } from "./state/agents.svelte";
+import {
+  applyAgentState, applyLifecycle, clearBlocked, setAgents, setBlocked, setRefused, setStalled,
+} from "./state/agents.svelte";
 import { setMessages, upsertMessage } from "./state/messages.svelte";
 import { runState } from "./state/run.svelte";
 import {
@@ -43,7 +45,7 @@ export function applyEvent(ev: Event, onReset: () => void = noop): boolean {
       applyAgentState(ev.agent, ev.state);
       break;
     case "agent.lifecycle":
-      applyLifecycle(ev.agent, ev.phase, ev.exit_code);
+      applyLifecycle(ev.agent, ev.phase, ev.exit);
       break;
     case "message.created":
       upsertMessage(ev.message);
@@ -56,6 +58,13 @@ export function applyEvent(ev: Event, onReset: () => void = noop): boolean {
       break; // logged server-side; the stall badge is the durable signal
     case "agent.stalled":
       setStalled(ev.agent, true);
+      break;
+    case "agent.blocked":
+      if (ev.blocked) setBlocked(ev.agent, ev.tool);
+      else clearBlocked(ev.agent);
+      break;
+    case "agent.permission_refused":
+      setRefused(ev.agent, { tool: ev.tool, input: ev.input, ts: ev.ts });
       break;
     case "reply.rejected":
       addRejection(ev.message, ev.errors, ev.ts);

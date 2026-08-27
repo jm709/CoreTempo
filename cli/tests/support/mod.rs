@@ -7,7 +7,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -121,17 +121,46 @@ fn handle_conn(
     Ok(())
 }
 
-/// Runs the real `tempo` binary against the stub with token env set.
+/// Runs the real `tempo` binary against the stub with token env set. Stdin is
+/// closed (not inherited), so a `state` command's stdin drain sees EOF immediately
+/// instead of blocking on the test harness's own stdin.
 pub fn tempo(args: &[&str], port: u16, agent_id: Option<&str>) -> anyhow::Result<Output> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tempo"));
     cmd.args(args)
         .env("CORETEMPO_PORT", port.to_string())
         .env("CORETEMPO_TOKEN", "t".repeat(64))
-        .env_remove("CORETEMPO_AGENT_ID");
+        .env_remove("CORETEMPO_AGENT_ID")
+        .stdin(Stdio::null());
     if let Some(id) = agent_id {
         cmd.env("CORETEMPO_AGENT_ID", id);
     }
     Ok(cmd.output()?)
+}
+
+/// Like `tempo`, but pipes `stdin` to the process — mirrors how Claude Code feeds a
+/// hook its JSON payload on stdin.
+pub fn tempo_with_stdin(
+    args: &[&str],
+    port: u16,
+    agent_id: Option<&str>,
+    stdin: &str,
+) -> anyhow::Result<Output> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tempo"));
+    cmd.args(args)
+        .env("CORETEMPO_PORT", port.to_string())
+        .env("CORETEMPO_TOKEN", "t".repeat(64))
+        .env_remove("CORETEMPO_AGENT_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(id) = agent_id {
+        cmd.env("CORETEMPO_AGENT_ID", id);
+    }
+    let mut child = cmd.spawn()?;
+    if let Some(mut child_stdin) = child.stdin.take() {
+        child_stdin.write_all(stdin.as_bytes())?;
+    }
+    Ok(child.wait_with_output()?)
 }
 
 pub fn stdout(out: &Output) -> String {

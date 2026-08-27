@@ -10,6 +10,7 @@ fn coretempod() -> Command {
         "CORETEMPO_TOKEN",
         "CORETEMPO_TOKEN_FILE",
         "CORETEMPO_LOG",
+        "CORETEMPO_CONFIG",
     ] {
         cmd.env_remove(var);
     }

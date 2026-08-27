@@ -6,8 +6,10 @@ by typing into their prompts, and shows the traffic in a terminal-centric UI.
 
 Design spec: `docs/superpowers/specs/2026-08-01-coretempo-design.md`.
 Frozen type/API contracts: `docs/superpowers/plans/2026-08-01-contracts.md` —
-**read its "Reconciliation amendments" section; those 24 amendments are the
+**read its "Reconciliation amendments" section; those amendments are the
 authoritative type/API shapes wherever another doc disagrees.**
+Later specs in `docs/superpowers/specs/` amend both — multi-flow (2026-08-12)
+and agent-dialogs (2026-08-17) are the ones the gotchas below cite.
 
 ## Running it
 
@@ -15,6 +17,7 @@ authoritative type/API shapes wherever another doc disagrees.**
 ./dev              # desktop app (vite :1420 + Rust core in one process)
 ./dev headless     # coretempod against ./tempo.toml
 ./dev check        # every gate: cargo test/clippy/fmt, svelte-check, oxlint, vitest, client tsc/oxlint/vitest
+./dev live         # the real-claude round trip (#3): needs a logged-in claude, spends tokens
 ```
 
 Copy `tempo.example.toml` to `tempo.toml` to get a workflow to run. The desktop
@@ -36,7 +39,8 @@ headless daemon possible, and it is load-bearing — keep it.
 
 Key modules: `core/src/run.rs` (the orchestrator that wires everything),
 `core/src/pty/queue.rs` (the only writer of text into a PTY),
-`core/src/router/` (message lifecycle + reply sinks), `core/src/api/`.
+`core/src/router/` (message lifecycle + reply sinks), `core/src/api/`,
+`core/src/claude_config.rs` (the managed `CLAUDE_CONFIG_DIR` for isolated agents).
 
 ## How messaging works
 
@@ -50,28 +54,75 @@ Key modules: `core/src/run.rs` (the orchestrator that wires everything),
 - `send` completion is inferred from the target's observed state transition, not
   from any acknowledgement.
 - Status lifecycle: `queued → injected → working → replied | done | failed`.
+  `failed` carries `reason_code` (`timeout | blocked_on_permission |
+  agent_exited | agent_restarted | orphaned`) and a `reason`.
 - Edges (`[agents.<id>] edges = [{ to, kind }]`, kind `ask|send|loop`) are
   deterministic delegation steps: composed into the frozen prompt as numbered
   `tempo` commands and enforced by per-turn obligation tracking. An agent that
-  idles with unmet steps gets one nudge instead of `/clear`; idle again →
-  `agent.stalled` and it is left un-cleared. Messages from an agent the
+  idles with unmet steps gets a nudge instead of `/clear`; an owed *reply* is
+  re-nudged on a 60/120/240 s backoff (`Router::sweep_owed` pokes the queue
+  worker, which re-runs the gate — still the only decision point) and
+  `agent.stalled` marks each idle-after-nudge. Messages from an agent the
   receiver has an edge to never arm its turn (downstream feedback is exempt),
   and replies never open a turn — except a loop target's reply, which re-arms
   the owner until `tempo done <target>` or the edge's `max_rounds` soft cap
   (default 10). Restart disarms and zeroes round counters. The decision point
   is `ClearGate::on_stable_idle`, evaluated inside the queue worker after the
   drain.
-- A `[trigger]` section makes the workflow self-starting: `on_start` injects a
-  configured message at launch (`coretempod run` exits 0/1 on completion);
-  `webhook` makes `coretempod serve` cold-start a run per API call. Completion
-  is inferred: ask kickoff → its reply; send kickoff → global quiescence
-  (armed only after the kickoff reaches `working` — never weaken that guard).
-- `[trigger.output]` declares a JSON Schema (inline `schema` or `schema_file`,
-  exactly one) for the webhook reply. `tempo reply` rejects non-conforming
-  bodies with the validation errors (422) so the agent repairs in-turn, up to
-  `max_repairs`; the watcher re-validates what it returns, so callers get a
-  parsed `output` object or a `reason_code`d failure. `--code 1` always
-  bypasses validation. The schema file's bytes join the freeze hash.
+- `[flows.<name>]` sections make the workflow self-starting: each declares
+  an agent subset (`agents = [...]`, non-empty and edge-closed), a
+  `trigger = { type = "on_start" | "webhook", edge = { to, kind } }`
+  (on_start also carries `message`), and optionally
+  `[flows.<name>.output]`. An `on_start` flow injects its configured message
+  when fired (`coretempod run --flow <name>` or the desktop Run tab's
+  per-flow fire control — see the run modes below); a `webhook` flow takes
+  its kickoff over HTTP, and `coretempod serve` cold-starts a run per API
+  call. Completion is inferred: ask kickoff → its reply; send kickoff → the
+  member subset's quiescence (armed only after the kickoff reaches
+  `working` — never weaken that guard). Per-agent
+  `concurrency = "exclusive" | "shared"` (default exclusive) and
+  `[server] max_concurrent_runs` (default 2, 1..=16, file-only) govern
+  scheduling: `coretempod serve` schedules flows concurrently: one FIFO
+  queue per webhook flow, one `RwLock` per pool agent (read for `shared`,
+  write for `exclusive`) acquired in sorted agent-id order, then a
+  `max_concurrent_runs` permit — locks before permit, and never the
+  reverse. Each triggered run spawns only the flow's member subset and
+  completes on that subset's reply/quiescence. `webhook` flows are each
+  their own endpoint — `POST /v1/flows/{name}/trigger` on both the serve
+  listener and a warm run's own API (`?wait=<secs>` long-polls; 202 +
+  trigger id otherwise). `GET /v1/flows` lists every flow with queue depth
+  and running count; `/v1/health` carries per-flow depths. Bare
+  `POST /v1/trigger` is gone — its 404 names the flows and the new route.
+  An on_start flow 400s over HTTP, pointing at `run --flow`. Warm runs
+  serialize flows sharing an exclusive agent through the same lock table
+  (one live session per agent) and take one in-flight trigger per flow (409
+  otherwise). `on_start` flows fire via `coretempod run --flow <name>`
+  (spawns only the flow's members, injects its message at launch holding
+  the flow's locks, exits 0/1 on completion) or the desktop Run tab's
+  per-flow fire control; bare `coretempod run` / desktop ▶ Run is a warm
+  whole-pool run — every pool agent spawns and nothing auto-fires.
+  `run --flow <webhook-flow>` is warm with that flow armed; a `run --flow`
+  subset excludes every other flow's contract. The reply-schema gate binds
+  a contract per kickoff, so only a webhook kickoff fired against a flow
+  that declares `[flows.<name>.output]` is validated; on_start kickoffs
+  never are. `tempo export` emits a serve unit when any webhook flow
+  exists; `tempo export --flow <on_start-flow>` emits a batch unit running
+  `coretempod run --flow`; an on_start-only file without `--flow` fails
+  naming the flows.
+- `[flows.<name>.output]` declares a JSON Schema (inline `schema` or
+  `schema_file`, exactly one) for that flow's webhook reply. `tempo reply`
+  rejects non-conforming bodies with the validation errors (422) so the
+  agent repairs in-turn, up to `max_repairs`; the watcher re-validates what
+  it returns, so callers get a parsed `output` object or a `reason_code`d
+  failure. `--code 1` always bypasses validation. Every flow's schema-file
+  bytes join the freeze hash in flow-name order.
+- Every flow kickoff names its flow in the header it is injected with —
+  `[CoreTempo <id> from http, flow <name> — reply expected] <body>` — so an
+  agent holding two flows' contracts knows which schema applies before it
+  replies. Agent-to-agent asks, sends and replies are unlabelled; the label
+  means "flow kickoff". `Router::create_kickoff` renders it,
+  `Router::create_message` does not, and it is not persisted on the
+  `MessageRecord`.
 
 ## Agent state comes from hooks, not the screen
 
@@ -84,6 +135,8 @@ CoreTempo writes one `agent-settings-<agent_id>.json` per agent and passes
 | `SessionStart` | idle |
 | `UserPromptSubmit` | working |
 | `Stop`, `StopFailure` | idle |
+| `PermissionRequest` | blocked (side flag; permission dialog is up) |
+| `PostToolBatch` | unblocked |
 
 This replaced screen-scraping the TUI, which broke: Claude Code 2.1.220 emits
 neither `esc to interrupt` nor `? for shortcuts`, and its spinner verbs are
@@ -100,7 +153,14 @@ strict drain-then-clear.
 - **Enter must be a separate write.** Injecting `text + "\r"` in one write leaves
   the prompt typed but unsubmitted whenever Claude Code is rebuilding its input
   box — right after spawn, and after the session restart `/clear` triggers. The
-  queue sends the text, waits `SUBMIT_DELAY`, then sends `\r`.
+  queue sends the text, waits `SUBMIT_DELAY`, then sends `\r`. Even a separate
+  Enter is dropped on a cold spawn still drawing its welcome box (#54: 3 of 13
+  spawns on 2.1.233, every cold spawn on 2.1.234), and no hook says "prompt
+  ready" — so the queue verifies
+  the submit instead: if the debounced state has not left idle
+  (`UserPromptSubmit`) within `SUBMIT_VERIFY` it resends `\r`, at most
+  `MAX_ENTER_RESENDS` times, then warns. Any state change, restart, or a
+  permission dialog (#63) ends the wait — Enter into a dialog answers it.
 - **The state detector's stripper passes printable ASCII only.** Any marker or
   parsing you add against PTY output cannot rely on `❯`, box drawing, or emoji.
 - **Spawned agents must not inherit `CLAUDE_CODE_*`.** A daemon launched from
@@ -108,16 +168,92 @@ strict drain-then-clear.
   silently changes their behaviour. `spawn.rs` strips them.
 - **A late hook must not revive an exited agent**, or the queue injects into a
   dead PTY and the write vanishes. `report_state` guards this.
-- **Claude Code blocks on a trust dialog** in any directory it has not seen, and
-  `--dangerously-skip-permissions` does not skip it. See the open issues.
+- **Claude Code startup dialogs fire no hook**, so an agent parked on one sits
+  in `starting` forever with no `SessionStart`. Four exist; CoreTempo
+  prevents three of them and *reports* the fourth — the in-turn permission
+  dialog — rather than preventing it (spec 2026-08-17 §3):
+  - **Trust dialog** — any git repo (or bare dir) Claude Code has not seen;
+    `--dangerously-skip-permissions` does not skip it. Preflighted before
+    spawning against `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when
+    the operator sets that variable; the same rule applies to MCP resolution)
+    `projects[trust_root(dir)].hasTrustDialogAccepted` (`trust_root` = git
+    toplevel, physical path): `Run::start_with` over its roster,
+    `coretempod serve` over the whole frozen pool at boot, including agents only
+    an `on_start` flow would spawn. With `trust_agent_dirs = true` — in
+    `~/.coretempo/config.toml` (`CORETEMPO_CONFIG` overrides the path) or under
+    `[server]` in `tempo.toml` — it writes the key (0600, atomic rename,
+    other content kept); otherwise the run refuses to start naming every root
+    and both fixes, and the desktop shows a confirm dialog first (the answer
+    becomes that run's policy). A live Claude session can revert the key, so
+    `PtyManager` re-checks through a `SpawnGate` (`TrustGate`) before every
+    spawn and restart; a refused restart leaves the agent `Exited` with the
+    reason in the log and nothing auto-recovers it. Trust is never granted
+    silently.
+  - **"New MCP server found"** — every agent spawns with `--strict-mcp-config`,
+    so it sees only the servers its `mcp = [...]` names. Names resolve at load
+    against `~/.claude.json` `mcpServers`, then its `projects["<dir>"]`, then
+    `~/.mcp.json`, then `<dir>/.mcp.json` (first match wins — CoreTempo's
+    precedence, not Claude Code's), are written to `agent-mcp-<agent_id>.json`
+    and passed as `--mcp-config`; an unknown name fails the load naming every
+    declared server, so `load_workflow` (and every serve trigger) can now fail
+    on machine-local MCP state. **`mcp` is not permission to call the tools**:
+    pair it with `allow = ["mcp__<server>__<tool>"]` per tool the agent calls
+    (listing needs no rule; calling does — verified live on 2.1.233). The
+    canonical JSON of each selection joins the freeze hash (`hash mismatch`
+    after an MCP edit is expected). Plugin-provided servers are dropped unless
+    redeclared in one of those four sources; workflows that silently inherited
+    ambient servers lose them until they declare `mcp`.
+  - **Onboarding / theme picker** — an empty `CLAUDE_CONFIG_DIR` opens on
+    "Let's get started" before trust. Only `isolated_config = true` agents
+    run against a fresh dir, and `core/src/claude_config.rs` seeds it
+    (`hasCompletedOnboarding`, `autoMemoryEnabled: false`, `skills/` links).
+    Login is **not** seeded: the spawn exports
+    `CLAUDE_SECURESTORAGE_CONFIG_DIR` at the operator's config dir so the
+    agent shares the operator's `.credentials.json` and refresh lock. Never
+    copy or symlink that file into the managed dir — Claude Code writes it
+    by temp+rename, which replaces a symlink and strands every other holder
+    (rotated refresh token → they log out); verified live on 2.1.241.
+    `skipDangerousModePermissionPrompt: true` in that managed `settings.json`
+    also suppresses the **Bypass Permissions acknowledgment** a fresh dir
+    raises for `permission_mode = "bypassPermissions"` agents — the
+    `.claude.json` key `bypassPermissionsModeAccepted` does not (verified
+    live on 2.1.241). Trust for that dir is a **mirror**: the gate
+    re-checks the operator's `~/.claude.json` and then writes the key into the
+    managed `.claude.json` before every spawn — never a second consent.
+  - **In-turn permission dialog** — a tool call with no matching allow rule.
+    By default (`on_permission_prompt = "deny"`) the agent's `PermissionRequest`
+    hook runs `tempo state refused`, which answers the dialog itself with a deny
+    decision and a message naming the fix (verified live on 2.1.246: the call
+    fails inside the turn, the agent carries on, no dialog is ever shown);
+    CoreTempo logs the refused tool and a ≤200-byte summary of its input (the
+    Bash command / file path) at warn, publishes `agent.permission_refused`,
+    and the desktop shows ⛔ on the agent with both in the tooltip — that is
+    the allow rule you are missing.
+    Read-only commands (`ls | wc -l`) raise no dialog at all on 2.1.246. With
+    `on_permission_prompt = "wait"` the dialog stays up for a human, and the
+    rest of this bullet applies:
+    no turn hook fires, so the agent reads **`working` forever** and is never
+    nudged or stalled. Its `PermissionRequest` hook reports `tempo state
+    blocked`; CoreTempo publishes `agent.blocked` with the tool name and the UI
+    shows ⏸; `PostToolBatch`, turn end and restart clear it. Owed asks on it
+    fail after 90 s with `blocked_on_permission: <tool>`; the agent itself is
+    never touched — a new ask/send aimed at it parks in the queue (nothing is
+    typed at a dialog: a digit picks an option, Enter takes the default) and
+    fails on the same 90 s clock whatever state it reads, and nudges/`/clear`
+    hold until the flag clears. A subagent's dialog fires the parent's hook too and is
+    accepted while the parent is idle; an `unblocked` report clears the flag
+    only when its `agent_id` matches the dialog's — Claude Code helper agents
+    fire `PostToolBatch` for tools they did not run. Do not add a PTY-silence
+    heuristic for this: Claude Code
+    2.1.233 keeps blinking a glyph while the dialog waits, so silence never
+    comes.
 - **Generated per-agent settings always allow `Bash(tempo:*)`.** Each agent's
-  `agent-settings-<agent_id>.json` (written by `write_agent_settings_files`)
-  allows it unconditionally, plus `Bash(<bin>:*)` for every entry in that
-  agent's `tools = [...]` in `tempo.toml`. Manually editing the agent dir's
-  `.claude` settings is only needed for tools not declared this way. Without
-  an allowlist entry for a tool an agent actually calls, that call parks on
-  Claude Code's approval dialog: the agent reads idle with unmet steps, gets
-  nudged, and stalls.
+  `agent-settings-<agent_id>.json` (`write_agent_settings_files`) allows it
+  unconditionally, plus `Bash(<bin>:*)` for every entry in that agent's
+  `tools = [...]`, plus every `allow = [...]` rule verbatim (Claude Code
+  permission syntax: `"WebSearch"`, `"Read(//data/**)"`, `"mcp__…"`). Editing
+  the agent dir's `.claude` settings by hand is only needed for tools not
+  declared this way.
 - **WSL:** the webkitgtk window never maps under Wayland, and MESA has no device
   without `/dev/dri`. `./dev` sets `GDK_BACKEND=x11` and `LIBGL_ALWAYS_SOFTWARE=1`
   for you. Without a GPU, expect xterm's DOM renderer rather than WebGL.
@@ -125,7 +261,15 @@ strict drain-then-clear.
   `0.0.0.0` bind 403s any caller whose `Host` header isn't `localhost`,
   loopback, or the bind IP literal — the same rule the run API enforces. Put a
   public deployment behind a reverse proxy that rewrites `Host`, or bind
-  loopback and tunnel in.
+  loopback and tunnel in. Serve also refuses to start without a provisioned
+  token (`CORETEMPO_TOKEN`, `--token-file`/`CORETEMPO_TOKEN_FILE`, or
+  `[server] token_file`): it writes no `api.json`, so a generated one would
+  reach no caller — `coretempod run` and the desktop still generate theirs.
+- **Concurrent runs share one SQLite file.** `Store::open` runs under
+  `spawn_blocking`; the shutdown WAL checkpoint is skipped (debug log) when a
+  peer holds the file; and every open sweeps orphaned non-terminal rows of
+  NULL-`run_id` or cleanly-stopped runs (crashed runs' rows are deliberately
+  left — see #30).
 
 ## Conventions
 
@@ -143,11 +287,24 @@ strict drain-then-clear.
 - Frontend: exact pinned versions, no `^`. TypeScript stays on 5.9.x — TS 7
   breaks `svelte-check`.
 - Errors are read by LLMs. Include the roster, the valid values, the fix.
+- Every type/API change appends a numbered entry to the contracts doc's
+  "Reconciliation amendments". Numbers are taken in merge order: when several
+  PRs are in flight, assign each its number up front, and the ones that merge
+  later renumber on rebase (the doc's tail is a guaranteed conflict).
+- Parallel worktrees must not share one `CARGO_TARGET_DIR`: the crates have the
+  same names, so a sibling worktree's build makes cargo serve a stale test
+  binary for yours — false greens *and* false reds. Give each worktree its own
+  target dir (and build one at a time on WSL, where concurrent cold builds have
+  crashed the session), or gate on PR CI, which builds each branch alone.
 
 ## Testing against real agents
 
 Unit and integration tests use a scripted fake agent, which cannot catch PTY
-timing or TUI behaviour — the four bugs above all escaped it. When touching the
-spawn recipe, injection, or state reporting, drive a real `claude`: write a
-workflow, `coretempod run` it, and check a round trip with
+timing or TUI behaviour — the gotchas above all escaped it. When touching the
+spawn recipe, injection, or state reporting, run `./dev live`: it builds the
+workspace and runs `daemon/tests/live_claude.rs` (`#[ignore]`d in CI) against
+the real `claude` on PATH — hooks report idle, an ask round-trips, auto-`/clear`
+is typed, a second ask survives it. Two Haiku turns; it trusts
+`~/.coretempo/live-test/agent` once and reuses it. For anything it does not
+cover, write a workflow, `coretempod run` it, and check a round trip with
 `tempo ask <agent> "..."`. Real agents cost tokens; keep prompts trivial.

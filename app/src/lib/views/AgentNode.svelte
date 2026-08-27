@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Handle, Position, type NodeProps } from "@xyflow/svelte";
   import { stateLabel } from "../format";
-  import { agentsState } from "../state/agents.svelte";
+  import { agentsState, blockedTitle, refusedTitle } from "../state/agents.svelte";
   import { jumpToAgentTerminal } from "../term/jump";
   import type { AgentModel } from "../types";
   import { nodeTint } from "./nodeState";
@@ -39,7 +39,13 @@
         <StatusGlyph state={live.state} />
         {stateLabel(live.state)}
         {#if agentsState.stalled[id]}
-          <span class="stalled" title="idled with unmet workflow steps after a nudge">⚠</span>
+          <span class="stalled" title="idled again after a nudge; an owed reply keeps being re-nudged on a backoff">⚠</span>
+        {/if}
+        {#if id in agentsState.blocked}
+          <span class="blocked" title={blockedTitle(agentsState.blocked[id] ?? null)}>⏸</span>
+        {/if}
+        {#if agentsState.refused[id] !== undefined}
+          <span class="refused" title={refusedTitle(agentsState.refused[id])}>⛔</span>
         {/if}
       </span>
     {/if}
@@ -62,6 +68,8 @@
   .title { display: flex; justify-content: space-between; gap: 12px; color: var(--accent); }
   .state { color: var(--text-dim); font-size: var(--fs-label); }
   .stalled { color: var(--warn); }
+  .blocked { color: var(--err); }
+  .refused { color: var(--warn); }
   .sub { color: var(--text-dim); font-size: var(--fs-label); }
   .dir { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
 </style>

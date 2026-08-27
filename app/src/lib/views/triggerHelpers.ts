@@ -1,4 +1,4 @@
-/// Value-driven classification of a validated [trigger.output] object into
+/// Value-driven classification of a validated [flows.<name>.output] object into
 /// renderable nodes. Value-driven, not schema-driven: serde_json alphabetizes
 /// object keys core-side, so a schema could not restore author order anyway
 /// (design 2026-08-07). Layout is stable because the key order is deterministic.

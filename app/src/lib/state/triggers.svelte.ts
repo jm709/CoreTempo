@@ -16,7 +16,7 @@ export interface TriggerLifecycle {
   result: CompletionResult | null;
   code: number | null;
   reply: string | null;
-  output: unknown;            // non-null only when a [trigger.output] schema validated
+  output: unknown;            // non-null only when a [flows.<name>.output] schema validated
   reason: string | null;
   reasonCode: string | null;
   completedAt: string | null;
@@ -35,11 +35,12 @@ function blank(id: string): TriggerLifecycle {
   };
 }
 
-/// Opens a lifecycle for an HTTP-origin kickoff. `from` is "http:<hex>" where the
-/// trigger id is "t-<hex>" (contracts amendment 24); everything else is ignored.
+/// Opens a lifecycle for a flow kickoff. `from` is "trigger:<hex>" where the
+/// trigger id is "t-<hex>" (contracts amendment 38); everything else — including
+/// a plain "http:<hex>" message such as a manual `tempo ask` — is ignored.
 export function beginTrigger(m: MessageRecord): void {
-  if (!m.from.startsWith("http:")) return;
-  const id = `t-${m.from.slice("http:".length)}`;
+  if (!m.from.startsWith("trigger:")) return;
+  const id = `t-${m.from.slice("trigger:".length)}`;
   if (triggersState.list.some((t) => t.id === id)) return;
   triggersState.list.push({
     ...blank(id), messageId: m.id, agent: m.to, body: m.body, startedAt: m.created_at,
@@ -82,7 +83,7 @@ export function completeTrigger(ev: CompletionEvent): void {
 export function seedTriggers(views: TriggerView[], messages: MessageRecord[]): void {
   triggersState.list = views.map((v) => {
     const hex = v.trigger_id.slice("t-".length);
-    const m = messages.find((x) => x.from === `http:${hex}`);
+    const m = messages.find((x) => x.from === `trigger:${hex}`);
     const t = blank(v.trigger_id);
     if (m !== undefined) {
       t.messageId = m.id;

@@ -14,8 +14,8 @@
     connectAgents, duplicateEdgeError, freeSlot, isProjectedEdge, nextEdgeKind,
   } from "./graphEditing";
   import {
-    addAgent, addOutput, addTrigger, setEdgeKind, toFlow, OUTPUT_NODE_ID, TRIGGER_NODE_ID,
-    type FlowEdge, type FlowNode,
+    addAgent, addFlow, addOutput, outputNodeId, setEdgeKind, toFlow, triggerNodeFlow,
+    triggerNodeId, type FlowEdge, type FlowNode,
   } from "./graphModel";
 
   let {
@@ -63,12 +63,12 @@
 
   /** Edge click cycles ask -> send -> loop; the inspector owns reorder and delete. The
    * trigger edge takes the same path but skips loop (validation rejects loop triggers),
-   * and `duplicateEdgeError` finds no agent under `§trigger`, so it reports no clash. */
+   * and `duplicateEdgeError` finds no agent under a trigger node id, so it reports no clash. */
   function cycleKind(edge: FlowEdge): void {
     // Nothing to cycle on a projected edge. isProjectedEdge also narrows the type for
     // nextEdgeKind below.
     if (isProjectedEdge(edge.label)) return;
-    const kind = nextEdgeKind(edge.label, edge.source !== TRIGGER_NODE_ID);
+    const kind = nextEdgeKind(edge.label, triggerNodeFlow(edge.source) === null);
     const clash = duplicateEdgeError(model, edge.source, edge.target, kind);
     if (clash !== null) {
       graphError = clash;
@@ -79,17 +79,39 @@
     onchanged();
   }
 
-  function addTriggerNode(type: TriggerType): void {
-    graphError = addTrigger(model, type);
-    if (graphError !== null) return;
-    selected = TRIGGER_NODE_ID;
+  const selectedTriggerFlow = $derived(selected === null ? null : triggerNodeFlow(selected));
+  /** The selected trigger's flow when "+ output" applies to it: a webhook flow
+   * with an ask kickoff and no output yet. */
+  const outputTarget = $derived.by(() => {
+    if (selectedTriggerFlow === null) return null;
+    const flow = model.flows[selectedTriggerFlow];
+    if (
+      flow === undefined ||
+      flow.trigger.type !== "webhook" ||
+      flow.trigger.edge.kind !== "ask" ||
+      flow.output !== undefined
+    ) {
+      return null;
+    }
+    return selectedTriggerFlow;
+  });
+
+  function addFlowNode(type: TriggerType): void {
+    const result = addFlow(model, type);
+    if ("error" in result) {
+      graphError = result.error;
+      return;
+    }
+    graphError = null;
+    selected = triggerNodeId(result.name);
     onchanged();
   }
 
   function addOutputNode(): void {
-    graphError = addOutput(model);
+    if (outputTarget === null) return;
+    graphError = addOutput(model, outputTarget);
     if (graphError !== null) return;
-    selected = OUTPUT_NODE_ID;
+    selected = outputNodeId(outputTarget);
     onchanged();
   }
 </script>
@@ -104,25 +126,20 @@
       }}>+ agent</button
     >
     <button
-      disabled={model.trigger !== null}
-      title="start the workflow when the run begins"
+      title="add an on_start flow (fires from the Run tab or run --flow)"
       onclick={() => {
-        addTriggerNode("on_start");
+        addFlowNode("on_start");
       }}>+ on-start</button
     >
     <button
-      disabled={model.trigger !== null}
-      title="start the workflow from POST /v1/trigger"
+      title="add a webhook flow (fires over HTTP)"
       onclick={() => {
-        addTriggerNode("webhook");
+        addFlowNode("webhook");
       }}>+ webhook</button
     >
     <button
-      disabled={model.trigger === null ||
-        model.trigger.type !== "webhook" ||
-        model.trigger.edge.kind !== "ask" ||
-        model.trigger.output !== undefined}
-      title="declare the [trigger.output] reply contract (webhook trigger with an ask kickoff)"
+      disabled={outputTarget === null}
+      title="declare [flows.<name>.output] for the selected webhook trigger"
       onclick={addOutputNode}>+ output</button
     >
     {#if graphError !== null}<span class="err">{graphError}</span>{/if}

@@ -13,6 +13,7 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
     tauri::generate_handler![
         commands::snapshot,
         commands::run_start,
+        commands::run_untrusted_dirs,
         commands::run_stop,
         commands::restart_agent,
         commands::subscribe_pty,
@@ -24,6 +25,8 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::workflow_parse,
         commands::workflow_merge,
         commands::send_chat,
+        commands::run_flows,
+        commands::fire_flow,
     ]
 }
 
@@ -38,8 +41,18 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // The desktop must still show its window when ~/.coretempo/config.toml is
+    // broken: an invisible failure from a launcher icon is worse than falling
+    // back to asking. (`coretempod` hard-fails instead.)
+    let trust_grant = match coretempo_core::user_config::UserConfig::load_default() {
+        Ok(user) => user.trust_agent_dirs,
+        Err(err) => {
+            tracing::error!(%err, "ignoring ~/.coretempo/config.toml; trust will be asked for");
+            false
+        }
+    };
     tauri::Builder::default()
-        .manage(state::AppState::default())
+        .manage(state::AppState::with_trust(trust_grant))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(invoke_handler())
         .build(tauri::generate_context!())

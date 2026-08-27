@@ -3,14 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use coretempo_core::pty::{Cursor, PtyChunk};
-use coretempo_core::router::{MessageFilter, RouterError};
-use coretempo_core::run::Run;
-use coretempo_core::trigger::{
-    TriggerStatus, completion_status, startup_kickoff, watch_completion, watcher_deadline,
-};
+use coretempo_core::router::{FlowKickoff, MessageFilter, RouterError};
+use coretempo_core::run::{Run, RunOptions};
+use coretempo_core::trigger::{Completion, completion_status, watch_completion, watcher_deadline};
+use coretempo_core::trust::{TrustPolicy, TrustStore};
 use coretempo_core::types::{
-    AgentDetail, AgentInfo, MessageKind, MessageRecord, Origin, RunInfo, ServerOverrides, Snapshot,
-    ValidationIssue,
+    AgentDetail, AgentInfo, FlowName, MessageKind, MessageRecord, Origin, RunInfo, ServerOverrides,
+    Snapshot, ValidationIssue,
 };
 use coretempo_core::workflow::{load_workflow, resolve_server, validate_workflow};
 use serde::Serialize;
@@ -237,6 +236,128 @@ pub async fn pause_pty(
     Ok(())
 }
 
+/// Fires an `on_start` flow's kickoff and returns the hub trigger id plus the
+/// handle of the task watching it.
+///
+/// The trigger is registered in the hub so the snapshot's trigger history
+/// includes the `on_start` kickoff; the `Origin::Trigger` hex is the hub id
+/// minus "t-" so the UI correlates the kickoff message to the trigger
+/// (contracts amendments 24 and 38). `create_kickoff` names the flow in the
+/// injected header, as the daemon and serve paths do.
+///
+/// The task mirrors the warm webhook path (`api::trigger::fire_flow`): member
+/// locks first (multi-flow spec §5 — a webhook trigger sharing an `exclusive`
+/// agent serializes with this batch instead of interleaving prompts in that
+/// agent's one live session), then the kickoff, then the watcher. Locking off
+/// the command path keeps the caller from blocking on a contending flow while
+/// it holds the active-run mutex; the cost is that a kickoff the router rejects
+/// settles as a failed trigger rather than failing the command.
+fn spawn_kickoff(
+    run: &Arc<Run>,
+    flow_name: &FlowName,
+    plan: (coretempo_core::types::AgentId, MessageKind, String),
+) -> Result<(String, tauri::async_runtime::JoinHandle<Completion>), CmdError> {
+    let (to, kind, message) = plan;
+    let trigger_id = run.triggers().try_begin(flow_name).map_err(|active| {
+        CmdError::new(
+            "trigger_in_flight",
+            format!(
+                "trigger '{active}' is still running on flow '{flow}'; wait for it to \
+                 settle, then fire again",
+                flow = flow_name.0,
+            ),
+        )
+    })?;
+    let origin_hex = trigger_id
+        .strip_prefix("t-")
+        .unwrap_or(&trigger_id)
+        .to_string();
+    let run = Arc::clone(run);
+    let flow_name = flow_name.clone();
+    let fired = trigger_id.clone();
+    // No exit here (this is the desktop app, not batch mode): the result reaches
+    // the UI as the `workflow.completed` bus event via the bridge. The handle is
+    // kept so `run_stop` can abort it — see `ActiveRun::kickoffs`.
+    let handle = tauri::async_runtime::spawn(async move {
+        let _guards = run.lock_flow(&flow_name).await;
+        let kickoff = match run
+            .router()
+            .create_kickoff(FlowKickoff {
+                flow: flow_name.clone(),
+                from: Origin::Trigger(origin_hex),
+                to,
+                kind,
+                body: message,
+            })
+            .await
+        {
+            Ok(kickoff) => kickoff,
+            Err(error) => {
+                tracing::error!(
+                    flow = %flow_name.0,
+                    error = %error,
+                    "the on_start kickoff was rejected"
+                );
+                let completion = Completion::Failed {
+                    reason: error.to_string(),
+                    reason_code: "kickoff_rejected",
+                };
+                run.triggers()
+                    .finish(&trigger_id, completion_status(completion.clone()));
+                return completion;
+            }
+        };
+        // Built immediately after creation: the watcher's deadline runs from
+        // here, scoped to the on_start flow's members and contract.
+        let inputs = run
+            .watch_inputs_for_flow(
+                &flow_name,
+                watcher_deadline(run.workflow().ask_timeout),
+                Some(trigger_id.clone()),
+            )
+            .unwrap_or_else(|| {
+                run.watch_inputs(
+                    watcher_deadline(run.workflow().ask_timeout),
+                    Some(trigger_id.clone()),
+                )
+            });
+        let completion = watch_completion(inputs, kickoff).await;
+        run.triggers()
+            .finish(&trigger_id, completion_status(completion.clone()));
+        completion
+    });
+    Ok((fired, handle))
+}
+
+/// Trust roots the desktop must ask about before `run_start` (spec 2026-08-17
+/// §1): empty when every root is trusted or when policy lets the run grant.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_untrusted_dirs(
+    state: tauri::State<'_, AppState>,
+    config_path: String,
+) -> Result<Vec<String>, CmdError> {
+    let path = resolve_workflow_path(&config_path)?;
+    let (file, frozen) = load_workflow(&path).map_err(|err| {
+        CmdError::new(
+            "config",
+            format!("failed to load workflow '{config_path}': {err}"),
+        )
+    })?;
+    if TrustPolicy::resolve(state.trust_grant, file.server.trust_agent_dirs).grant {
+        return Ok(Vec::new());
+    }
+    let store = TrustStore::from_env().ok_or_else(|| {
+        CmdError::new(
+            "io",
+            "cannot determine HOME or CLAUDE_CONFIG_DIR for .claude.json",
+        )
+    })?;
+    let roots = store
+        .untrusted_roots(frozen.agents.values().map(|cfg| cfg.dir.as_path()))
+        .map_err(|err| CmdError::new("trust", err.to_string()))?;
+    Ok(roots.into_iter().map(|r| r.display().to_string()).collect())
+}
+
 /// Load + freeze the workflow, resolve server settings (env layer only — the app passes no
 /// flag layer), start the core run, spawn the event bridge. Generic over `Runtime` so tests
 /// can drive it with `MockRuntime`. Startup stays fast: this runs strictly on user action,
@@ -246,6 +367,7 @@ pub async fn run_start<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
     config_path: String,
+    trust_confirmed: bool,
 ) -> Result<RunInfo, CmdError> {
     let mut guard = state.active.lock().await;
     if guard.is_some() {
@@ -274,60 +396,24 @@ pub async fn run_start<R: tauri::Runtime>(
         )
     })?;
     let port = server.port;
-    let run = Run::start(frozen, server)
-        .await
-        .map_err(|err| CmdError::new("run", format!("failed to start run: {err}")))?;
+    // The user's dialog answer travels with the run: its TrustGate may re-grant
+    // after a live Claude session reverts the key, for the run's whole life.
+    let policy = TrustPolicy::resolve(state.trust_grant, file.server.trust_agent_dirs);
+    let trust = TrustPolicy {
+        grant: policy.grant || trust_confirmed,
+    };
+    let run = Run::start_with(
+        frozen,
+        server,
+        RunOptions {
+            trust,
+            ..RunOptions::default()
+        },
+    )
+    .await
+    .map_err(|err| CmdError::new("run", format!("failed to start run: {err}")))?;
 
     let bridge = spawn_event_bridge(app, run.bus().clone());
-
-    let kickoff = if let Some((to, kind, message)) = startup_kickoff(&file) {
-        // Register in the hub so the snapshot's trigger history includes the
-        // on_start kickoff; the Origin hex is the hub id minus "t-" so the UI
-        // correlates the kickoff message to the trigger (contracts amendment 24).
-        let trigger_id = run.triggers().try_begin().map_err(|active| {
-            CmdError::new(
-                "trigger_in_flight",
-                format!("trigger '{active}' is already running on a freshly started run"),
-            )
-        })?;
-        let origin_hex = trigger_id
-            .strip_prefix("t-")
-            .unwrap_or(&trigger_id)
-            .to_string();
-        let kickoff = match run
-            .router()
-            .create_message(Origin::Http(origin_hex), to, kind, message)
-            .await
-        {
-            Ok(kickoff) => kickoff,
-            Err(error) => {
-                run.triggers().finish(
-                    &trigger_id,
-                    TriggerStatus::Failed {
-                        reason: error.to_string(),
-                        reason_code: "kickoff_rejected".to_string(),
-                    },
-                );
-                return Err(error.into());
-            }
-        };
-        // Built immediately after creation: the watcher's deadline runs from here.
-        let inputs = run.watch_inputs(
-            watcher_deadline(run.workflow().ask_timeout),
-            Some(trigger_id.clone()),
-        );
-        let hub = Arc::clone(run.triggers());
-        // No exit here (this is the desktop app, not batch mode): the result reaches
-        // the UI as the `workflow.completed` bus event via the bridge. The handle is
-        // kept so `run_stop` can abort it — see `ActiveRun::kickoff`.
-        Some(tauri::async_runtime::spawn(async move {
-            let completion = watch_completion(inputs, kickoff).await;
-            hub.finish(&trigger_id, completion_status(completion.clone()));
-            completion
-        }))
-    } else {
-        None
-    };
 
     let info = RunInfo {
         run_id: run.run_id().clone(),
@@ -342,15 +428,108 @@ pub async fn run_start<R: tauri::Runtime>(
         port,
         workflow_path: info.workflow_path.clone(),
         bridge,
-        kickoff,
+        kickoffs: BTreeMap::new(),
     });
     Ok(info)
 }
 
+/// One flow as the Run tab needs it: its name, how it fires, and its target.
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub trigger_type: String,
+    pub target: String,
+}
+
+/// The active run's flows, for the Run tab's fire controls (multi-flow spec §6).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_flows(state: tauri::State<'_, AppState>) -> Result<Vec<FlowInfo>, CmdError> {
+    use coretempo_core::types::config::TriggerType;
+
+    let run = active_run(&state).await?;
+    Ok(run
+        .workflow()
+        .flows
+        .iter()
+        .map(|(name, flow)| FlowInfo {
+            name: name.0.clone(),
+            trigger_type: match flow.trigger_type {
+                TriggerType::OnStart => "on_start".to_string(),
+                TriggerType::Webhook => "webhook".to_string(),
+            },
+            target: flow.edge.to.0.clone(),
+        })
+        .collect())
+}
+
+/// Fires an `on_start` flow's configured kickoff into the warm pool — the
+/// desktop's per-flow fire control (multi-flow spec §6). Webhook flows fire
+/// over HTTP instead. Returns the hub trigger id; the kickoff itself is
+/// created off the command path (after `spawn_kickoff`'s lock acquisition),
+/// and the watcher handle lands in `ActiveRun.kickoffs` (keyed by flow) so
+/// `run_stop` aborts it. `try_begin` already 409s a second fire of the same
+/// flow, so this insert never clobbers a live handle.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn fire_flow(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<String, CmdError> {
+    use coretempo_core::types::config::TriggerType;
+
+    let mut guard = state.active.lock().await;
+    let Some(active) = guard.as_mut() else {
+        return Err(CmdError::new(
+            "no_run",
+            "no run is active; call run_start first",
+        ));
+    };
+    let run = Arc::clone(&active.run);
+    let flow_name = FlowName(name.clone());
+    let Some(flow) = run.workflow().flows.get(&flow_name) else {
+        let declared = run
+            .workflow()
+            .flows
+            .keys()
+            .map(|f| f.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CmdError::new(
+            "unknown_flow",
+            format!("no flow named '{name}'; declared flows: {declared}"),
+        ));
+    };
+    // Explicit match, no wildcard (repo style): a third trigger kind must be
+    // decided here, not silently fired.
+    match flow.trigger_type {
+        TriggerType::OnStart => {}
+        TriggerType::Webhook => {
+            return Err(CmdError::new(
+                "invalid_request",
+                format!(
+                    "flow '{name}' is a webhook flow; it fires over the run's HTTP \
+                     trigger endpoint, not from the Run tab — the fire control is \
+                     for on_start flows"
+                ),
+            ));
+        }
+    }
+    let plan = (
+        flow.edge.to.clone(),
+        flow.edge.kind.message_kind(),
+        // Validation guarantees an on_start trigger carries a message.
+        flow.message.clone().unwrap_or_default(),
+    );
+    let (trigger_id, handle) = spawn_kickoff(&run, &flow_name, plan)?;
+    active.kickoffs.insert(flow_name, handle);
+    Ok(trigger_id)
+}
+
 /// Idempotent: stopping with no active run is Ok. The bridge task ends on its own when the
-/// bus closes; `abort()` is cleanup insurance. The kickoff watcher (if any) has no such
-/// self-ending path — it awaits a reply or quiescence against wiring `stop()` just tore
-/// down — so it is always aborted explicitly.
+/// bus closes; `abort()` is cleanup insurance. A fired flow's kickoff watcher ends on its own
+/// too, but only at its deadline or on a member's exit — its `Arc<Run>` keeps the bus open
+/// past `stop()` — so it can await a reply against torn-down wiring for as long as
+/// `ask_timeout`. Each one is therefore aborted explicitly.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn run_stop(state: tauri::State<'_, AppState>) -> Result<(), CmdError> {
     let mut guard = state.active.lock().await;
@@ -360,7 +539,7 @@ pub async fn run_stop(state: tauri::State<'_, AppState>) -> Result<(), CmdError>
     drop(guard);
     let result = active.run.stop().await;
     active.bridge.abort();
-    if let Some(kickoff) = active.kickoff {
+    for kickoff in active.kickoffs.into_values() {
         kickoff.abort();
     }
     result.map_err(|err| CmdError::new("run", format!("failed to stop run: {err}")))
@@ -423,20 +602,23 @@ pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Snapshot, Cmd
     let mut agents = Vec::new();
     let mut pty_cursors = BTreeMap::new();
     for (id, cfg) in &run.workflow().agents {
-        // Contracts amendment 10: `PtyManager` is the single source of truth for exit codes;
-        // it reports `Some` only while the agent is `exited`.
+        // Contracts amendment 10: `PtyManager` is the single source of truth for how an
+        // agent exited; it reports `Some` only while the agent is `exited`.
         let (cursor, _tail) = run.pty().read_ring(id, None)?;
         agents.push(AgentDetail {
             info: AgentInfo {
                 id: id.clone(),
                 state: run.pty().state(id)?,
                 pending_asks: run.router().pending_asks(id),
-                exit_code: run.pty().exit_code(id)?,
+                exit: run.pty().exit(id)?,
+                blocked: run.pty().blocked(id)?,
             },
             dir: cfg.dir.display().to_string(),
             model: cfg.model.clone(),
             permission_mode: cfg.permission_mode.clone(),
             auto_clear: cfg.auto_clear,
+            isolated_config: cfg.isolated_config,
+            skills: cfg.skills.iter().map(|p| p.display().to_string()).collect(),
             pty_cursor: cursor.0,
         });
         pty_cursors.insert(id.clone(), cursor.0);
@@ -609,6 +791,16 @@ prompt = "You implement tasks sent to you."
             .build(tauri::test::mock_context(tauri::test::noop_assets()))?)
     }
 
+    /// Same mock app with an explicit `~/.coretempo/config.toml` trust grant, so
+    /// the policy branches of `run_untrusted_dirs` are reachable in tests.
+    fn test_app_with_trust(
+        trust_grant: bool,
+    ) -> anyhow::Result<tauri::App<tauri::test::MockRuntime>> {
+        Ok(tauri::test::mock_builder()
+            .manage(AppState::with_trust(trust_grant))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))?)
+    }
+
     #[tokio::test]
     async fn pty_commands_without_run_return_no_run() -> anyhow::Result<()> {
         use tauri::Manager;
@@ -700,11 +892,136 @@ prompt = "You implement tasks sent to you."
         let app = test_app()?;
         let handle = app.handle().clone();
         let missing = "/nonexistent/coretempo/tempo.toml".to_string();
-        match run_start(handle, app.state::<AppState>(), missing).await {
+        match run_start(handle, app.state::<AppState>(), missing, false).await {
             Ok(info) => anyhow::bail!("expected config error, got run {}", info.run_id.0),
             Err(err) => {
                 assert_eq!(err.code, "config");
                 assert!(err.message.contains("/nonexistent/coretempo/tempo.toml"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A workflow whose single agent lives in `dir`, plus whatever extra
+    /// `[server]` keys a trust test needs.
+    fn trust_workflow(dir: &std::path::Path, server: &str) -> String {
+        format!(
+            "[workflow]\nname = \"trust-flow\"\n{server}\n\
+             [agents.builder]\ndir = \"{}\"\nprompt = \"You implement tasks.\"\n",
+            dir.display()
+        )
+    }
+
+    /// Writes `tempo.toml` and an agent dir with no `.git`, both under a unique
+    /// name so the HOME-serialized trust tests never read each other's files.
+    fn trust_fixture(tag: &str, server: &str) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+        let home = temp_file(&format!("{tag}-home"))?;
+        let agent_dir = temp_file(&format!("{tag}-agent"))?;
+        std::fs::create_dir_all(&home)?;
+        std::fs::create_dir_all(&agent_dir)?;
+        let config = temp_file(&format!("{tag}-tempo.toml"))?;
+        std::fs::write(&config, trust_workflow(&agent_dir, server))?;
+        Ok((home, agent_dir, config))
+    }
+
+    /// Runs `run_untrusted_dirs` with `HOME` pointed at an empty temp home, so
+    /// `~/.claude.json` is absent and every root reads as untrusted.
+    async fn untrusted_dirs_under_home(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        home: &std::path::Path,
+        config: &std::path::Path,
+    ) -> Result<Vec<String>, CmdError> {
+        use tauri::Manager;
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let result =
+            run_untrusted_dirs(app.state::<AppState>(), config.display().to_string()).await;
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn run_untrusted_dirs_lists_the_root_when_policy_does_not_grant() -> anyhow::Result<()> {
+        let (home, agent_dir, config) = trust_fixture("untrusted-ask", "")?;
+        let app = test_app_with_trust(false)?;
+        let _guard = HOME_LOCK.lock().await;
+        let roots = untrusted_dirs_under_home(&app, &home, &config).await?;
+        assert_eq!(
+            roots,
+            vec![
+                coretempo_core::trust::trust_root(&agent_dir)
+                    .display()
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_untrusted_dirs_is_empty_when_the_user_config_grants() -> anyhow::Result<()> {
+        let (home, _agent_dir, config) = trust_fixture("untrusted-user-grant", "")?;
+        let app = test_app_with_trust(true)?;
+        let _guard = HOME_LOCK.lock().await;
+        let roots = untrusted_dirs_under_home(&app, &home, &config).await?;
+        assert!(
+            roots.is_empty(),
+            "the run may grant, so the desktop must not ask: {roots:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_untrusted_dirs_is_empty_when_the_workflow_grants() -> anyhow::Result<()> {
+        let (home, _agent_dir, config) = trust_fixture(
+            "untrusted-workflow-grant",
+            "\n[server]\ntrust_agent_dirs = true\n",
+        )?;
+        let app = test_app_with_trust(false)?;
+        let _guard = HOME_LOCK.lock().await;
+        let roots = untrusted_dirs_under_home(&app, &home, &config).await?;
+        assert!(
+            roots.is_empty(),
+            "[server] trust_agent_dirs grants too: {roots:?}"
+        );
+        Ok(())
+    }
+
+    /// The dialog answer must reach `Run::start_with`'s policy. Without it the
+    /// preflight refuses the untrusted root instead of parking an agent on the
+    /// trust dialog — and it refuses before any store, port, or PTY exists.
+    #[tokio::test]
+    async fn run_start_without_confirmation_fails_the_trust_preflight() -> anyhow::Result<()> {
+        use tauri::Manager;
+        let (home, agent_dir, config) = trust_fixture("start-unconfirmed", "")?;
+        let app = test_app_with_trust(false)?;
+        let handle = app.handle().clone();
+        let _guard = HOME_LOCK.lock().await;
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+        let result = run_start(
+            handle,
+            app.state::<AppState>(),
+            config.display().to_string(),
+            false,
+        )
+        .await;
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match result {
+            Ok(info) => anyhow::bail!("expected a trust failure, got run {}", info.run_id.0),
+            Err(err) => {
+                assert_eq!(err.code, "run");
+                let root = coretempo_core::trust::trust_root(&agent_dir);
+                assert!(
+                    err.message.contains(&root.display().to_string()),
+                    "the error must name the untrusted root: {}",
+                    err.message
+                );
             }
         }
         Ok(())
@@ -737,6 +1054,35 @@ prompt = "You implement tasks sent to you."
             Ok(record) => anyhow::bail!("send_chat: expected no_run, got {}", record.id.0),
             Err(err) => assert_eq!(err.code, "no_run"),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flow_commands_without_run_return_no_run() -> anyhow::Result<()> {
+        use tauri::Manager;
+        let app = test_app()?;
+        match run_flows(app.state::<AppState>()).await {
+            Ok(flows) => anyhow::bail!("run_flows: expected no_run, got {} flows", flows.len()),
+            Err(err) => assert_eq!(err.code, "no_run"),
+        }
+        match fire_flow(app.state::<AppState>(), "main".to_string()).await {
+            Ok(id) => anyhow::bail!("fire_flow: expected no_run, got trigger {id}"),
+            Err(err) => assert_eq!(err.code, "no_run"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flow_info_serializes_with_a_type_key() -> anyhow::Result<()> {
+        let info = FlowInfo {
+            name: "main".to_string(),
+            trigger_type: "on_start".to_string(),
+            target: "worker".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&info)?,
+            serde_json::json!({"name": "main", "type": "on_start", "target": "worker"})
+        );
         Ok(())
     }
 

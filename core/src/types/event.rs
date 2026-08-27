@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::time::Timestamp;
-use crate::types::agent::AgentState;
+use crate::types::agent::{AgentExit, AgentState};
 use crate::types::id::{AgentId, MessageId, RunId};
 use crate::types::message::MessageRecord;
 
@@ -35,16 +35,47 @@ pub enum EventPayload {
     AgentLifecycle {
         agent: AgentId,
         phase: LifecyclePhase,
-        exit_code: Option<i32>,
+        exit: Option<AgentExit>,
     },
 
-    /// Obligation nudge injected (spec §2): the agent idled with unmet steps.
+    /// Owed-reply or obligation nudge injected (spec §2, 2026-08-17 §4.1). For
+    /// an owed reply this repeats on a 60/120/240 s backoff until the reply
+    /// lands or the ask fails.
     #[serde(rename = "agent.nudged")]
     AgentNudged { agent: AgentId },
 
-    /// Idle again after its one nudge — un-cleared and waiting for a human.
+    /// Idle again after a nudge — un-cleared and waiting; fires once per nudge
+    /// round while the reply is owed (2026-08-17 §4.1).
     #[serde(rename = "agent.stalled")]
     AgentStalled { agent: AgentId },
+
+    /// The agent is parked on a Claude Code permission dialog (spec 2026-08-17
+    /// §3): its `PermissionRequest` hook fired mid-turn. `blocked: true` once
+    /// when the dialog goes up, `blocked: false` once when `PostToolBatch`, a
+    /// turn boundary, a restart or an exit clears it.
+    #[serde(rename = "agent.blocked")]
+    AgentBlocked {
+        agent: AgentId,
+        blocked: bool,
+        /// The tool the dialog is for, from the `PermissionRequest` hook;
+        /// `None` on clears and when the hook gave none.
+        #[serde(default)]
+        tool: Option<String>,
+    },
+
+    /// The agent's `PermissionRequest` hook refused a tool call itself
+    /// (`on_permission_prompt = "deny"`, amendment 44): no dialog, the turn goes
+    /// on. `tool` names what was refused and `input` summarises its input (the
+    /// Bash command, a file path, else compact JSON; ≤ 200 bytes) — together,
+    /// the allow rule that is missing.
+    #[serde(rename = "agent.permission_refused")]
+    AgentPermissionRefused {
+        agent: AgentId,
+        #[serde(default)]
+        tool: Option<String>,
+        #[serde(default)]
+        input: Option<String>,
+    },
 
     /// Fat event: full record snapshot.
     #[serde(rename = "message.created")]
@@ -103,7 +134,7 @@ pub enum CompletionResult {
 #[cfg(test)]
 mod tests {
     use crate::time::Timestamp;
-    use crate::types::agent::AgentState;
+    use crate::types::agent::{AgentExit, AgentState};
     use crate::types::event::{CompletionResult, Event, EventPayload, LifecyclePhase};
     use crate::types::id::{AgentId, MessageId, RunId};
 
@@ -153,12 +184,12 @@ mod tests {
             payload: EventPayload::AgentLifecycle {
                 agent: AgentId("docs".into()),
                 phase: LifecyclePhase::Exited,
-                exit_code: Some(1),
+                exit: Some(AgentExit::Code(1)),
             },
         };
         let expected = serde_json::json!({
             "seq": 7, "ts": "2026-08-01T17:00:06Z", "type": "agent.lifecycle",
-            "agent": "docs", "phase": "exited", "exit_code": 1
+            "agent": "docs", "phase": "exited", "exit": {"code": 1}
         });
         assert_eq!(serde_json::to_value(&ev).unwrap(), expected);
 
@@ -200,6 +231,91 @@ mod tests {
         assert_eq!(json["type"], "agent.stalled");
         let back: Event = serde_json::from_value(json).unwrap();
         assert_eq!(back, stalled);
+    }
+
+    #[test]
+    fn blocked_wire_form_carries_the_flag_and_tool() {
+        let ev = Event {
+            seq: 11,
+            ts: Timestamp("2026-08-17T10:00:00Z".into()),
+            payload: EventPayload::AgentBlocked {
+                agent: AgentId("resolver".into()),
+                blocked: true,
+                tool: Some("Read".into()),
+            },
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "seq": 11, "ts": "2026-08-17T10:00:00Z",
+                "type": "agent.blocked", "agent": "resolver", "blocked": true,
+                "tool": "Read"
+            })
+        );
+        assert_eq!(json["tool"], "Read");
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn permission_refused_wire_form_carries_the_tool() {
+        let ev = Event {
+            seq: 13,
+            ts: Timestamp("2026-08-26T10:00:00Z".into()),
+            payload: EventPayload::AgentPermissionRefused {
+                agent: AgentId("resolver".into()),
+                tool: Some("Bash".into()),
+                input: Some("python3 -c 'print(1)'".into()),
+            },
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "seq": 13, "ts": "2026-08-26T10:00:00Z",
+                "type": "agent.permission_refused", "agent": "resolver", "tool": "Bash",
+                "input": "python3 -c 'print(1)'"
+            })
+        );
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn blocked_clear_wire_form_nulls_the_tool() {
+        let ev = Event {
+            seq: 12,
+            ts: Timestamp("2026-08-17T10:00:01Z".into()),
+            payload: EventPayload::AgentBlocked {
+                agent: AgentId("resolver".into()),
+                blocked: false,
+                tool: None,
+            },
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["blocked"], false);
+        assert!(json["tool"].is_null(), "json: {json}");
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    /// A payload stored or sent before `tool` existed still parses.
+    #[test]
+    fn blocked_without_a_tool_key_deserialises() {
+        let json = serde_json::json!({
+            "seq": 13, "ts": "2026-08-17T10:00:02Z",
+            "type": "agent.blocked", "agent": "resolver", "blocked": true
+        });
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.payload,
+            EventPayload::AgentBlocked {
+                agent: AgentId("resolver".into()),
+                blocked: true,
+                tool: None,
+            }
+        );
     }
 
     #[test]

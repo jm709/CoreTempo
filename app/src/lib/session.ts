@@ -1,8 +1,9 @@
-import { runStart, runStop, snapshot, toCmdError } from "./ipc";
+import { runStart, runStop, runUntrustedDirs, snapshot, toCmdError } from "./ipc";
 import { resetAgents } from "./state/agents.svelte";
 import { runState } from "./state/run.svelte";
 import { releaseCapture, uiState } from "./state/ui.svelte";
 import { disposeAllTerminals, ensureTerminal } from "./term/manager";
+import { confirmTrust } from "./trustDialog";
 import { applySnapshot, wireEvents } from "./wireEvents";
 import type { Snapshot } from "./types";
 
@@ -41,7 +42,16 @@ export async function startRun(configPath: string): Promise<void> {
   runState.phase = "starting";
   uiState.runCenter = "graph";
   try {
-    runState.info = await runStart(configPath);
+    const roots = await runUntrustedDirs(configPath);
+    let trustConfirmed = false;
+    if (roots.length > 0) {
+      trustConfirmed = await confirmTrust(roots);
+      if (!trustConfirmed) {
+        runState.phase = "stopped";
+        return;
+      }
+    }
+    runState.info = await runStart(configPath, trustConfirmed);
     const snap = await snapshot(); // events before this are deduped by last_seq
     applySnapshot(snap);
     await openTerminals(snap);

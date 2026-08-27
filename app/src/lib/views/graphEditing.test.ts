@@ -1,9 +1,9 @@
-import { describe, expect, test } from "vitest";
-import type { WorkflowModel } from "../types";
+import { describe, expect, it, test } from "vitest";
+import type { FlowModel, WorkflowModel } from "../types";
 import {
   coerceNumber, connectAgents, duplicateEdgeError, freeSlot, isProjectedEdge, nextEdgeKind,
 } from "./graphEditing";
-import { OUTPUT_NODE_ID, TRIGGER_NODE_ID, WORKFLOW_NODE_ID } from "./graphModel";
+import { outputNodeId, triggerNodeId, WORKFLOW_NODE_ID } from "./graphModel";
 
 function model(): WorkflowModel {
   return {
@@ -14,7 +14,9 @@ function model(): WorkflowModel {
       ask_timeout_minutes: 30,
       idle_debounce_seconds: 2,
     },
-    server: { bind: null, token_file: null, allowed_origins: [], log: null },
+    server: {
+      bind: null, token_file: null, log: null, max_concurrent_runs: 2, trust_agent_dirs: false,
+    },
     agents: {
       planner: {
         dir: "/p",
@@ -27,6 +29,11 @@ function model(): WorkflowModel {
           { to: "builder", kind: "send" },
         ],
         tools: [],
+        allow: [],
+        mcp: [],
+        concurrency: "exclusive",
+        isolated_config: false,
+        skills: [],
       },
       builder: {
         dir: "/b",
@@ -36,10 +43,41 @@ function model(): WorkflowModel {
         auto_clear: true,
         edges: [],
         tools: [],
+        allow: [],
+        mcp: [],
+        concurrency: "exclusive",
+        isolated_config: false,
+        skills: [],
       },
     },
-    trigger: null,
+    flows: {},
   };
+}
+
+function agent(): WorkflowModel["agents"][string] {
+  return {
+    dir: "/tmp", prompt: "p", model: null, permission_mode: null,
+    auto_clear: true, edges: [], tools: [], allow: [], mcp: [], concurrency: "exclusive",
+    isolated_config: false, skills: [],
+  };
+}
+
+function twoAgentModel(flows: Record<string, FlowModel>): WorkflowModel {
+  return {
+    workflow: {
+      name: "x", db: "./tempo.db", port: 4820,
+      ask_timeout_minutes: 30, idle_debounce_seconds: 2,
+    },
+    server: {
+      bind: null, token_file: null, log: null, max_concurrent_runs: 2, trust_agent_dirs: false,
+    },
+    agents: { a: agent(), b: agent() },
+    flows,
+  };
+}
+
+function webhookFlow(agents: string[], to: string): FlowModel {
+  return { agents, trigger: { type: "webhook", edge: { to, kind: "ask" }, message: null } };
 }
 
 describe("coerceNumber", () => {
@@ -97,29 +135,49 @@ describe("connectAgents", () => {
 
   test("a drag from the trigger node rewires the trigger instead of adding an agent edge", () => {
     const m = model();
-    m.trigger = { type: "webhook", edge: { to: "planner", kind: "send" }, message: null };
-    expect(connectAgents(m, TRIGGER_NODE_ID, "builder")).toBeNull();
-    expect(m.trigger.edge).toEqual({ to: "builder", kind: "send" });
+    m.flows = {
+      main: {
+        agents: ["planner", "builder"],
+        trigger: { type: "webhook", edge: { to: "planner", kind: "send" }, message: null },
+      },
+    };
+    expect(connectAgents(m, triggerNodeId("main"), "builder")).toBeNull();
+    expect(m.flows["main"]!.trigger.edge).toEqual({ to: "builder", kind: "send" });
     expect(m.agents["planner"]!.edges).toHaveLength(2); // agent edges untouched
   });
 
   test("refuses a connection touching the trigger node from the wrong side", () => {
     const m = model();
-    m.trigger = { type: "webhook", edge: { to: "planner", kind: "ask" }, message: null };
-    expect(connectAgents(m, TRIGGER_NODE_ID, WORKFLOW_NODE_ID)).toContain("is not an agent");
-    expect(connectAgents(m, "planner", TRIGGER_NODE_ID)).toContain("has no inbound edges");
-    expect(m.trigger.edge.to).toBe("planner");
+    m.flows = {
+      main: {
+        agents: ["planner", "builder"],
+        trigger: { type: "webhook", edge: { to: "planner", kind: "ask" }, message: null },
+      },
+    };
+    expect(connectAgents(m, triggerNodeId("main"), WORKFLOW_NODE_ID)).toContain("is not an agent");
+    expect(connectAgents(m, "planner", triggerNodeId("main"))).toContain("has no inbound edges");
+    expect(m.flows["main"]!.trigger.edge.to).toBe("planner");
   });
 
   test("connections touching the output node are refused without mutating", () => {
     const m = model();
-    m.trigger = {
-      type: "webhook", edge: { to: "planner", kind: "ask" }, message: null,
-      output: { schema_file: "s.json", max_repairs: 2 },
+    m.flows = {
+      main: {
+        agents: ["planner", "builder"],
+        trigger: { type: "webhook", edge: { to: "planner", kind: "ask" }, message: null },
+        output: { schema_file: "s.json", max_repairs: 2 },
+      },
     };
-    expect(connectAgents(m, "planner", OUTPUT_NODE_ID)).toContain("[trigger.output]");
-    expect(connectAgents(m, OUTPUT_NODE_ID, "planner")).toContain("[trigger.output]");
+    expect(connectAgents(m, "planner", outputNodeId("main"))).toContain("[flows.<name>.output]");
+    expect(connectAgents(m, outputNodeId("main"), "planner")).toContain("[flows.<name>.output]");
     expect(m.agents["planner"]!.edges).toHaveLength(2);
+  });
+
+  it("a drag from a trigger node re-aims exactly that flow", () => {
+    const m = twoAgentModel({ one: webhookFlow(["a"], "a"), two: webhookFlow(["a"], "a") });
+    expect(connectAgents(m, triggerNodeId("one"), "b")).toBeNull();
+    expect(m.flows["one"]!.trigger.edge.to).toBe("b");
+    expect(m.flows["two"]!.trigger.edge.to).toBe("a");
   });
 });
 

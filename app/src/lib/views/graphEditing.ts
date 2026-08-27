@@ -4,9 +4,9 @@
 import type { EdgeKind, WorkflowModel } from "../types";
 import {
   addEdge,
-  OUTPUT_NODE_ID,
+  outputNodeFlow,
   setTriggerTarget,
-  TRIGGER_NODE_ID,
+  triggerNodeFlow,
   WORKFLOW_NODE_ID,
 } from "./graphModel";
 
@@ -28,23 +28,24 @@ export function freeSlot(position: Point, taken: Point[]): Point {
 
 /** Applies a canvas connection to the model, returning an error message or null on success.
  * New edges are `ask` (spec §3.1). The workflow node is decoration — it has no handles and
- * no edges in the model — so a connection touching it is refused rather than added. The
- * output node is a read-only projection of [trigger.output] for the same reason. A drag
- * from the trigger node re-aims the trigger's single edge instead of appending one: the
+ * no edges in the model — so a connection touching it is refused rather than added. An
+ * output node is a read-only projection of [flows.<name>.output] for the same reason. A
+ * drag from a trigger node re-aims that flow's single edge instead of appending one: the
  * trigger has exactly one target, so the new drag replaces the old target. */
 export function connectAgents(model: WorkflowModel, source: string, target: string): string | null {
   if (source === WORKFLOW_NODE_ID || target === WORKFLOW_NODE_ID) {
     return `'${WORKFLOW_NODE_ID}' is not an agent; drag between two agent nodes`;
   }
-  if (source === OUTPUT_NODE_ID || target === OUTPUT_NODE_ID) {
+  if (outputNodeFlow(source) !== null || outputNodeFlow(target) !== null) {
     return (
-      `'${OUTPUT_NODE_ID}' is a projection of [trigger.output]; it takes no drawn ` +
-      "edges — its edge follows the trigger's kickoff target"
+      "an output node is a projection of [flows.<name>.output]; it takes no drawn " +
+      "edges — its edge follows its flow's kickoff target"
     );
   }
-  if (source === TRIGGER_NODE_ID) return setTriggerTarget(model, target);
-  if (target === TRIGGER_NODE_ID) {
-    return `'${TRIGGER_NODE_ID}' has no inbound edges; it starts the workflow, so drag from it, not into it`;
+  const sourceFlow = triggerNodeFlow(source);
+  if (sourceFlow !== null) return setTriggerTarget(model, sourceFlow, target);
+  if (triggerNodeFlow(target) !== null) {
+    return "a trigger node has no inbound edges; it starts its flow, so drag from it, not into it";
   }
   return addEdge(model, source, target, "ask");
 }
@@ -82,7 +83,7 @@ export function nextEdgeKind(kind: EdgeKind, allowLoop: boolean): EdgeKind {
   return "ask";
 }
 
-/** The output edge is a projection of [trigger.output], not an EdgeModel. */
+/** The output edge is a projection of [flows.<name>.output], not an EdgeModel. */
 export function isProjectedEdge(label: EdgeKind | "output"): label is "output" {
   return label === "output";
 }

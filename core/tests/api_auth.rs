@@ -33,12 +33,11 @@ fn missing_or_wrong_token_is_401() -> anyhow::Result<()> {
         .call()?;
     assert_eq!(res.status().as_u16(), 401);
     let body: serde_json::Value = res.body_mut().read_json()?;
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Bearer")
-    );
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("Bearer"), "{message}");
+    // A run publishes its token, so the 401 keeps pointing at the file that
+    // carries it — only serve mode, which publishes none, says something else.
+    assert!(message.contains("api.json"), "{message}");
     Ok(())
 }
 
@@ -105,6 +104,68 @@ fn non_json_content_type_is_415() -> anyhow::Result<()> {
     assert_eq!(res.status().as_u16(), 415);
     let body: serde_json::Value = res.body_mut().read_json()?;
     assert_eq!(body["error"]["code"], "unsupported_media_type");
+    Ok(())
+}
+
+/// One raw POST with exact headers: `headers` is spliced in as written, so a
+/// test can send a request with no `Content-Type` at all — which no HTTP client
+/// will do for you.
+fn raw_post(
+    srv: &support::TestServer,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> anyhow::Result<String> {
+    raw_request(
+        srv.addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n\
+             {headers}Connection: close\r\n\r\n{body}",
+            srv.token
+        ),
+    )
+}
+
+#[test]
+fn a_body_less_post_needs_no_content_type() -> anyhow::Result<()> {
+    // #57: `curl -X POST .../restart` sends no body and no Content-Type, and
+    // the body-less endpoints have nothing to parse — a 415 there is a retry
+    // that teaches the operator nothing.
+    let srv = support::start_default()?;
+    let with_length = raw_post(
+        &srv,
+        "/v1/agents/planner/restart",
+        "Content-Length: 0\r\n",
+        "",
+    )?;
+    assert!(
+        with_length.starts_with("HTTP/1.1 202"),
+        "empty POST refused: {with_length}"
+    );
+    // No Content-Length either: HTTP/1.1 reads that as no body at all.
+    let bare = raw_post(&srv, "/v1/agents/planner/restart", "", "")?;
+    assert!(
+        bare.starts_with("HTTP/1.1 202"),
+        "bare POST refused: {bare}"
+    );
+
+    // A declared content type still has to be JSON, body or no body.
+    let typed = raw_post(
+        &srv,
+        "/v1/agents/planner/restart",
+        "Content-Type: text/plain\r\nContent-Length: 0\r\n",
+        "",
+    )?;
+    assert!(
+        typed.starts_with("HTTP/1.1 415"),
+        "text/plain accepted: {typed}"
+    );
+    // And a body without a JSON content type is still refused.
+    let untyped_body = raw_post(&srv, "/v1/messages", "Content-Length: 10\r\n", "plain text")?;
+    assert!(
+        untyped_body.starts_with("HTTP/1.1 415"),
+        "an untyped body was accepted: {untyped_body}"
+    );
     Ok(())
 }
 

@@ -3,7 +3,8 @@
 //! byte-identical; only genuinely changed values alter the text.
 
 use coretempo_core::types::config::{
-    AgentConfig, Edge, OutputConfig, TriggerConfig, TriggerType, WorkflowFile,
+    AgentConcurrency, AgentConfig, Edge, FlowConfig, OutputConfig, TriggerConfig, TriggerType,
+    WorkflowFile,
 };
 use coretempo_core::workflow::validate_workflow;
 use toml_edit::{DocumentMut, Item, Table, Value};
@@ -29,7 +30,7 @@ pub fn merge_workflow(text: &str, model: &WorkflowFile) -> Result<String, String
     merge_workflow_section(&mut doc, &old, model)?;
     merge_server_section(&mut doc, &old, model)?;
     merge_agents(&mut doc, &old, model)?;
-    merge_trigger_section(&mut doc, &old, model)?;
+    merge_flows_section(&mut doc, &old, model)?;
     Ok(doc.to_string())
 }
 
@@ -142,13 +143,20 @@ fn merge_server_section(
     set_option(table, "log", old_s.log.as_ref(), new_s.log.as_ref(), |s| {
         Value::from(s.as_str())
     });
-    if old_s.allowed_origins != new_s.allowed_origins {
-        if new_s.allowed_origins.is_empty() {
-            table.remove("allowed_origins");
-        } else {
-            table["allowed_origins"] = Item::Value(Value::from_iter(new_s.allowed_origins.clone()));
-        }
-    }
+    set_scalar(
+        table,
+        "max_concurrent_runs",
+        &old_s.max_concurrent_runs,
+        &new_s.max_concurrent_runs,
+        |v| Value::from(i64::try_from(*v).unwrap_or(i64::MAX)),
+    );
+    set_scalar(
+        table,
+        "trust_agent_dirs",
+        &old_s.trust_agent_dirs,
+        &new_s.trust_agent_dirs,
+        |b| Value::from(*b),
+    );
     if table.is_empty() {
         doc.remove("server");
     }
@@ -208,6 +216,20 @@ fn merge_agent_fields(
     set_scalar(table, "auto_clear", &old.auto_clear, &new.auto_clear, |b| {
         Value::from(*b)
     });
+    set_scalar(
+        table,
+        "concurrency",
+        &old.concurrency,
+        &new.concurrency,
+        |c| Value::from(c.as_str()),
+    );
+    set_scalar(
+        table,
+        "isolated_config",
+        &old.isolated_config,
+        &new.isolated_config,
+        |b| Value::from(*b),
+    );
     if old.edges != new.edges {
         if new.edges.is_empty() {
             table.remove("edges");
@@ -220,6 +242,27 @@ fn merge_agent_fields(
             table.remove("tools");
         } else {
             table["tools"] = Item::Value(Value::from_iter(new.tools.clone()));
+        }
+    }
+    if old.allow != new.allow {
+        if new.allow.is_empty() {
+            table.remove("allow");
+        } else {
+            table["allow"] = Item::Value(Value::from_iter(new.allow.clone()));
+        }
+    }
+    if old.mcp != new.mcp {
+        if new.mcp.is_empty() {
+            table.remove("mcp");
+        } else {
+            table["mcp"] = Item::Value(Value::from_iter(new.mcp.clone()));
+        }
+    }
+    if old.skills != new.skills {
+        if new.skills.is_empty() {
+            table.remove("skills");
+        } else {
+            table["skills"] = Item::Value(skills_value(&new.skills));
         }
     }
     Ok(())
@@ -240,13 +283,37 @@ fn new_agent_table(agent: &AgentConfig) -> Result<Table, String> {
     if !agent.auto_clear {
         table["auto_clear"] = Item::Value(Value::from(false));
     }
+    if agent.concurrency != AgentConcurrency::Exclusive {
+        table["concurrency"] = Item::Value(Value::from(agent.concurrency.as_str()));
+    }
+    if agent.isolated_config {
+        table["isolated_config"] = Item::Value(Value::from(true));
+    }
     if !agent.edges.is_empty() {
         table["edges"] = Item::Value(edges_value(&agent.edges)?);
     }
     if !agent.tools.is_empty() {
         table["tools"] = Item::Value(Value::from_iter(agent.tools.clone()));
     }
+    if !agent.allow.is_empty() {
+        table["allow"] = Item::Value(Value::from_iter(agent.allow.clone()));
+    }
+    if !agent.mcp.is_empty() {
+        table["mcp"] = Item::Value(Value::from_iter(agent.mcp.clone()));
+    }
+    if !agent.skills.is_empty() {
+        table["skills"] = Item::Value(skills_value(&agent.skills));
+    }
     Ok(table)
+}
+
+/// Skill paths as the array of strings the file declared (relative paths stay
+/// relative; the freeze resolves them, the file never does).
+fn skills_value(skills: &[std::path::PathBuf]) -> Value {
+    skills
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Value>()
 }
 
 /// Multiline prompts render as `"""` blocks when that round-trips exactly;
@@ -303,44 +370,41 @@ fn trigger_type_str(trigger_type: TriggerType) -> &'static str {
     }
 }
 
-/// `[trigger]` is add/update/remove as a whole: absent in the model means the section
-/// goes, since the trigger *is* its one edge and a half-written one will not validate.
-fn merge_trigger_section(
-    doc: &mut DocumentMut,
-    old: &WorkflowFile,
-    model: &WorkflowFile,
-) -> Result<(), String> {
-    if old.trigger == model.trigger {
-        return Ok(());
+/// The flow's inline trigger table. Built programmatically, not string-parsed:
+/// an `on_start` message is arbitrary text and must be escaped, which
+/// `Value::from(&str)` handles (a `"""` block is illegal inside an inline
+/// table, so multiline messages become escaped `\n` strings here).
+fn trigger_value(trigger: &TriggerConfig) -> Result<Value, String> {
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("type", Value::from(trigger_type_str(trigger.trigger_type)));
+    table.insert("edge", trigger_edge_value(&trigger.edge)?);
+    if let Some(message) = &trigger.message {
+        table.insert("message", Value::from(message.as_str()));
     }
-    let Some(new_trigger) = &model.trigger else {
-        doc.remove("trigger");
-        return Ok(());
-    };
-    let Some(old_trigger) = &old.trigger else {
-        doc["trigger"] = Item::Table(new_trigger_table(new_trigger)?);
-        return Ok(());
-    };
-    let table = as_table(&mut doc["trigger"], "trigger")?;
-    set_scalar(
-        table,
-        "type",
-        &old_trigger.trigger_type,
-        &new_trigger.trigger_type,
-        |t| Value::from(trigger_type_str(*t)),
-    );
-    if old_trigger.edge != new_trigger.edge {
-        table["edge"] = Item::Value(trigger_edge_value(&new_trigger.edge)?);
+    Ok(Value::InlineTable(table))
+}
+
+/// Template field order for a brand-new `[flows.<name>]` table: `agents`,
+/// `trigger`, then the output contract when there is one.
+fn new_flow_table(flow: &FlowConfig) -> Result<Table, String> {
+    let mut table = Table::new();
+    table["agents"] = Item::Value(flow.agents.iter().map(|a| a.0.clone()).collect::<Value>());
+    table["trigger"] = Item::Value(trigger_value(&flow.trigger)?);
+    if let Some(output) = &flow.output {
+        table["output"] = Item::Table(output_table(output)?);
     }
-    set_option(
-        table,
-        "message",
-        old_trigger.message.as_ref(),
-        new_trigger.message.as_ref(),
-        |s| prompt_value(s),
-    );
-    if old_trigger.output != new_trigger.output {
-        match &new_trigger.output {
+    Ok(table)
+}
+
+fn merge_flow_fields(table: &mut Table, old: &FlowConfig, new: &FlowConfig) -> Result<(), String> {
+    if old.agents != new.agents {
+        table["agents"] = Item::Value(new.agents.iter().map(|a| a.0.clone()).collect::<Value>());
+    }
+    if old.trigger != new.trigger {
+        table["trigger"] = Item::Value(trigger_value(&new.trigger)?);
+    }
+    if old.output != new.output {
+        match &new.output {
             None => {
                 table.remove("output");
             }
@@ -350,22 +414,46 @@ fn merge_trigger_section(
     Ok(())
 }
 
-/// Template field order for a brand-new `[trigger]` table: `type`, `edge`, then the
-/// `on_start` message and output contract when there are any.
-fn new_trigger_table(trigger: &TriggerConfig) -> Result<Table, String> {
-    let mut table = Table::new();
-    table["type"] = Item::Value(Value::from(trigger_type_str(trigger.trigger_type)));
-    table["edge"] = Item::Value(trigger_edge_value(&trigger.edge)?);
-    if let Some(message) = &trigger.message {
-        table["message"] = Item::Value(prompt_value(message));
+/// Flows are add/update/remove per `[flows.<name>]` table. A `[flows]` parent
+/// the merge creates is implicit so no bare header appears; one the file
+/// already has keeps whatever the author wrote, explicit header included.
+fn merge_flows_section(
+    doc: &mut DocumentMut,
+    old: &WorkflowFile,
+    model: &WorkflowFile,
+) -> Result<(), String> {
+    if old.flows == model.flows {
+        return Ok(());
     }
-    if let Some(output) = &trigger.output {
-        table["output"] = Item::Table(output_table(output)?);
+    let had_flows = doc.contains_key("flows");
+    let flows_table = as_table(doc["flows"].or_insert(Item::Table(Table::new())), "flows")?;
+    if !had_flows {
+        flows_table.set_implicit(true);
     }
-    Ok(table)
+    for name in old.flows.keys() {
+        if !model.flows.contains_key(name) {
+            flows_table.remove(&name.0);
+        }
+    }
+    for (name, new_flow) in &model.flows {
+        match old.flows.get(name) {
+            Some(old_flow) if old_flow == new_flow => {}
+            Some(old_flow) => {
+                let table = as_table(&mut flows_table[name.0.as_str()], &name.0)?;
+                merge_flow_fields(table, old_flow, new_flow)?;
+            }
+            None => {
+                flows_table[name.0.as_str()] = Item::Table(new_flow_table(new_flow)?);
+            }
+        }
+    }
+    if flows_table.is_empty() {
+        doc.remove("flows");
+    }
+    Ok(())
 }
 
-/// `[trigger.output]` table in template order: schema source, then the budget.
+/// `[flows.<name>.output]` table in template order: schema source, then the budget.
 fn output_table(output: &OutputConfig) -> Result<Table, String> {
     let mut table = Table::new();
     if let Some(path) = &output.schema_file {
@@ -412,8 +500,11 @@ fn json_to_toml(value: &serde_json::Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coretempo_core::types::AgentId;
-    use coretempo_core::types::config::{EdgeKind, TriggerConfig, TriggerType};
+    use coretempo_core::types::config::{
+        AgentConcurrency, EdgeKind, PermissionPrompt, TriggerConfig, TriggerType,
+    };
+    use coretempo_core::types::{AgentId, FlowName};
+    use std::path::PathBuf;
 
     // `planner` exists so edges-to-planner round-trip through validate_workflow's
     // roster check (edge-target existence is validated on reparse, not by merge).
@@ -445,20 +536,24 @@ prompt = "You build things."
 tools = ["pat"]
 "#;
 
-    // A trigger the merge must leave alone unless the model changed it. The interior comment
-    // and the hand-spaced inline edge are what a wholesale rebuild of the table would lose.
+    // A flow the merge must leave alone unless the model changed it. The
+    // interior comment is what a wholesale rebuild of the table would lose.
     const TRIGGERED: &str = r#"[workflow]
 name = "example"
 
-[trigger]
+[flows.main]
 # Why this workflow starts on a webhook.
-type = "webhook"
-edge = {to = "builder",   kind = "ask"}
+agents = ["builder"]
+trigger = { type = "webhook", edge = { to = "builder", kind = "ask" } }
 
 [agents.builder]
 dir = "/tmp/b"
 prompt = "You build things."
 "#;
+
+    /// The `trigger` line both flow fixtures carry, verbatim.
+    const WEBHOOK_TRIGGER_LINE: &str =
+        r#"trigger = { type = "webhook", edge = { to = "builder", kind = "ask" } }"#;
 
     fn parsed(text: &str) -> WorkflowFile {
         coretempo_core::workflow::validate_workflow(text).expect("fixture is valid")
@@ -542,13 +637,8 @@ prompt = "You build things."
         model.agents.insert(
             AgentId("reviewer".into()),
             AgentConfig {
-                dir: "/tmp/review".into(),
-                prompt: "Line one.\nLine two.".into(),
                 model: Some("opus".into()),
-                permission_mode: None,
-                auto_clear: true,
-                edges: Vec::new(),
-                tools: Vec::new(),
+                ..AgentConfig::new("/tmp/review".into(), "Line one.\nLine two.")
             },
         );
         let merged = merge_workflow(COMMENTED, &model).expect("merges");
@@ -631,6 +721,168 @@ prompt = "You build things."
     }
 
     #[test]
+    fn editing_allow_in_place_persists() {
+        let mut model = parsed(COMMENTED);
+        let builder = model
+            .agents
+            .get_mut(&AgentId("builder".into()))
+            .expect("builder");
+        builder.allow = vec!["WebSearch".to_string()];
+        let merged = merge_workflow(COMMENTED, &model).expect("merges");
+        assert!(
+            merged.contains(r#"allow = ["WebSearch"]"#),
+            "allow written: {merged}"
+        );
+        let reparsed = toml_str(&merged);
+        assert_eq!(
+            reparsed.agents[&AgentId("builder".into())].allow,
+            vec!["WebSearch".to_string()]
+        );
+    }
+
+    #[test]
+    fn emptying_allow_removes_the_key() {
+        // `COMMENTED`'s builder table carries no `tools` key (unlike `WITH_TOOLS`),
+        // so the literal the brief replaces against lives in `WITH_TOOLS` instead.
+        let with_allow = WITH_TOOLS.replace(
+            "tools = [\"pat\"]",
+            "tools = [\"pat\"]\nallow = [\"WebSearch\"]",
+        );
+        let mut model = parsed(&with_allow);
+        model
+            .agents
+            .get_mut(&AgentId("builder".into()))
+            .expect("builder")
+            .allow = Vec::new();
+        let merged = merge_workflow(&with_allow, &model).expect("merges");
+        assert!(!merged.contains("allow ="), "allow key gone: {merged}");
+        assert_eq!(
+            toml_str(&merged).agents[&AgentId("builder".into())].allow,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn editing_mcp_in_place_persists() {
+        let mut model = parsed(COMMENTED);
+        let builder = model
+            .agents
+            .get_mut(&AgentId("builder".into()))
+            .expect("builder");
+        builder.mcp = vec!["context7".to_string()];
+        let merged = merge_workflow(COMMENTED, &model).expect("merges");
+        assert!(
+            merged.contains(r#"mcp = ["context7"]"#),
+            "mcp written: {merged}"
+        );
+        let reparsed = toml_str(&merged);
+        assert_eq!(
+            reparsed.agents[&AgentId("builder".into())].mcp,
+            vec!["context7".to_string()]
+        );
+    }
+
+    #[test]
+    fn isolated_config_and_skills_round_trip() {
+        let mut model = parsed(COMMENTED);
+        let builder = model
+            .agents
+            .get_mut(&AgentId("builder".into()))
+            .expect("builder");
+        builder.isolated_config = true;
+        builder.skills = vec![PathBuf::from("./skills/handoff")];
+        let merged = merge_workflow(COMMENTED, &model).expect("merges");
+        assert!(merged.contains("isolated_config = true"), "{merged}");
+        assert!(
+            merged.contains(r#"skills = ["./skills/handoff"]"#),
+            "{merged}"
+        );
+        let reparsed = toml_str(&merged);
+        let b = &reparsed.agents[&AgentId("builder".into())];
+        assert!(b.isolated_config);
+        assert_eq!(b.skills, vec![PathBuf::from("./skills/handoff")]);
+
+        let mut back = reparsed.clone();
+        let b = back
+            .agents
+            .get_mut(&AgentId("builder".into()))
+            .expect("builder");
+        b.isolated_config = false;
+        b.skills = Vec::new();
+        let cleared = merge_workflow(&merged, &back).expect("merges");
+        assert!(
+            cleared.contains("isolated_config = false"),
+            "scalar flips: {cleared}"
+        );
+        assert!(
+            !cleared.contains("skills ="),
+            "empty list removes the key: {cleared}"
+        );
+    }
+
+    #[test]
+    fn emptying_mcp_removes_the_key() {
+        let with_mcp = WITH_TOOLS.replace(
+            "tools = [\"pat\"]",
+            "tools = [\"pat\"]\nmcp = [\"context7\"]",
+        );
+        let mut model = parsed(&with_mcp);
+        model
+            .agents
+            .get_mut(&AgentId("builder".into()))
+            .expect("builder")
+            .mcp = Vec::new();
+        let merged = merge_workflow(&with_mcp, &model).expect("merges");
+        assert!(!merged.contains("mcp ="), "mcp key gone: {merged}");
+        assert_eq!(
+            toml_str(&merged).agents[&AgentId("builder".into())].mcp,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn new_agent_with_mcp_writes_the_key() {
+        let mut model = parsed(COMMENTED);
+        model.agents.insert(
+            AgentId("resolver".into()),
+            AgentConfig {
+                mcp: vec!["context7".to_string()],
+                ..AgentConfig::new(PathBuf::from("/tmp/r"), "resolve")
+            },
+        );
+        let merged = merge_workflow(COMMENTED, &model).expect("merges");
+        assert!(
+            merged.contains(r#"mcp = ["context7"]"#),
+            "mcp written: {merged}"
+        );
+    }
+
+    #[test]
+    fn new_agent_with_isolated_config_and_skills_writes_both_keys() {
+        let mut model = parsed(COMMENTED);
+        model.agents.insert(
+            AgentId("iso".into()),
+            AgentConfig {
+                isolated_config: true,
+                skills: vec![PathBuf::from("./skills/handoff")],
+                on_permission_prompt: PermissionPrompt::Deny,
+                ..AgentConfig::new(PathBuf::from("/tmp/i"), "isolated")
+            },
+        );
+        let merged = merge_workflow(COMMENTED, &model).expect("merges");
+        let table = merged.split("[agents.iso]").nth(1).expect("iso table");
+        assert!(table.contains("isolated_config = true"), "{table}");
+        assert!(
+            table.contains(r#"skills = ["./skills/handoff"]"#),
+            "{table}"
+        );
+        let reparsed = toml_str(&merged);
+        let iso = &reparsed.agents[&AgentId("iso".into())];
+        assert!(iso.isolated_config);
+        assert_eq!(iso.skills, vec![PathBuf::from("./skills/handoff")]);
+    }
+
+    #[test]
     fn removed_agent_table_is_deleted() {
         let two = format!("{COMMENTED}\n[agents.extra]\ndir = \"/tmp\"\nprompt = \"x\"\n");
         let mut model = parsed(&two);
@@ -640,112 +892,216 @@ prompt = "You build things."
         assert!(merged.contains("[agents.builder]"));
     }
 
+    fn main_flow(model: &mut WorkflowFile) -> &mut FlowConfig {
+        model
+            .flows
+            .get_mut(&FlowName("main".into()))
+            .expect("fixture has a flow")
+    }
+
     #[test]
-    fn adding_a_trigger_appends_the_section() {
+    fn adding_a_flow_appends_the_section() {
         let mut model = parsed(COMMENTED);
-        model.trigger = Some(TriggerConfig {
-            trigger_type: TriggerType::OnStart,
-            edge: Edge {
-                to: AgentId("builder".into()),
-                kind: EdgeKind::Ask,
-                max_rounds: None,
+        model.flows.insert(
+            FlowName("main".into()),
+            FlowConfig {
+                agents: vec![AgentId("builder".into())],
+                trigger: TriggerConfig {
+                    trigger_type: TriggerType::OnStart,
+                    edge: Edge {
+                        to: AgentId("builder".into()),
+                        kind: EdgeKind::Ask,
+                        max_rounds: None,
+                    },
+                    message: Some("Go.".into()),
+                },
+                output: None,
             },
-            message: Some("Go.".into()),
-            output: None,
-        });
+        );
         let merged = merge_workflow(COMMENTED, &model).expect("merges");
-        assert!(merged.contains("[trigger]"));
-        assert!(merged.contains(r#"type = "on_start""#));
-        assert!(merged.contains(r#"edge = { to = "builder", kind = "ask" }"#));
         let reparsed = toml_str(&merged);
-        assert_eq!(reparsed.trigger, model.trigger);
+        assert_eq!(reparsed.flows, model.flows);
         // What `git diff` shows after saving from the canvas: an appended section, nothing else.
         let appended = concat!(
-            "\n[trigger]\n",
-            "type = \"on_start\"\n",
-            "edge = { to = \"builder\", kind = \"ask\" }\n",
-            "message = \"Go.\"\n",
+            "\n[flows.main]\n",
+            "agents = [\"builder\"]\n",
+            "trigger = { type = \"on_start\", edge = { to = \"builder\", kind = \"ask\" }, ",
+            "message = \"Go.\" }\n",
         );
         assert_eq!(merged, format!("{COMMENTED}{appended}"));
     }
 
     #[test]
+    fn an_explicit_flows_header_survives_a_flow_edit() {
+        let doc = concat!(
+            "[workflow]\nname = \"example\"\n\n",
+            "[flows]\n\n",
+            "[flows.main]\nagents = [\"builder\"]\n",
+            "trigger = { type = \"webhook\", edge = { to = \"builder\", kind = \"ask\" } }\n\n",
+            "[agents.builder]\ndir = \"/tmp/b\"\nprompt = \"You build things.\"\n",
+        );
+        let mut model = parsed(doc);
+        main_flow(&mut model).trigger.edge.kind = EdgeKind::Send;
+        let merged = merge_workflow(doc, &model).expect("merges");
+        assert!(
+            merged.contains("[flows]\n"),
+            "explicit header preserved:\n{merged}"
+        );
+        assert_eq!(toml_str(&merged).flows, model.flows);
+    }
+
+    #[test]
     fn a_multiline_on_start_message_round_trips() {
         let mut model = parsed(COMMENTED);
-        model.trigger = Some(TriggerConfig {
-            trigger_type: TriggerType::OnStart,
-            edge: Edge {
-                to: AgentId("builder".into()),
-                kind: EdgeKind::Send,
-                max_rounds: None,
+        model.flows.insert(
+            FlowName("main".into()),
+            FlowConfig {
+                agents: vec![AgentId("builder".into())],
+                trigger: TriggerConfig {
+                    trigger_type: TriggerType::OnStart,
+                    edge: Edge {
+                        to: AgentId("builder".into()),
+                        kind: EdgeKind::Send,
+                        max_rounds: None,
+                    },
+                    message: Some("Line one.\nLine two.\n".into()),
+                },
+                output: None,
             },
-            message: Some("Line one.\nLine two.\n".into()),
-            output: None,
-        });
+        );
         let merged = merge_workflow(COMMENTED, &model).expect("merges");
         let reparsed = toml_str(&merged);
-        assert_eq!(reparsed.trigger, model.trigger);
+        assert_eq!(reparsed.flows, model.flows, "escaped inline form: {merged}");
     }
 
     #[test]
-    fn removing_the_trigger_deletes_the_section() {
+    fn removing_the_flow_deletes_the_section() {
         let mut model = parsed(TRIGGERED);
-        model.trigger = None;
+        model.flows.remove(&FlowName("main".into()));
         let merged = merge_workflow(TRIGGERED, &model).expect("merges");
-        assert!(!merged.contains("[trigger]"), "section gone: {merged}");
+        assert!(!merged.contains("[flows"), "no bare header left: {merged}");
         assert!(merged.contains("[agents.builder]"), "agents untouched");
-        assert_eq!(toml_str(&merged).trigger, None);
+        assert!(toml_str(&merged).flows.is_empty());
     }
 
     #[test]
-    fn unchanged_trigger_is_byte_identical() {
+    fn unchanged_flow_is_byte_identical() {
         let model = parsed(TRIGGERED);
         let merged = merge_workflow(TRIGGERED, &model).expect("merges");
         assert_eq!(merged, TRIGGERED);
     }
 
     #[test]
-    fn retargeting_a_trigger_rewrites_only_the_edge() {
+    fn retargeting_a_flow_rewrites_only_the_trigger() {
         let two = format!("{TRIGGERED}\n[agents.planner]\ndir = \"/tmp/p\"\nprompt = \"plan\"\n");
         let mut model = parsed(&two);
-        let trigger = model.trigger.as_mut().expect("fixture has a trigger");
-        trigger.edge = Edge {
+        let flow = main_flow(&mut model);
+        flow.agents = vec![AgentId("planner".into())];
+        flow.trigger.edge = Edge {
             to: AgentId("planner".into()),
             kind: EdgeKind::Send,
             max_rounds: None,
         };
         let merged = merge_workflow(&two, &model).expect("merges");
-        assert!(merged.contains(r#"edge = { to = "planner", kind = "send" }"#));
-        assert!(merged.contains(r#"type = "webhook""#), "type left alone");
+        assert!(
+            merged.contains(
+                r#"trigger = { type = "webhook", edge = { to = "planner", kind = "send" } }"#
+            ),
+            "trigger rewritten: {merged}"
+        );
+        assert!(merged.contains(r#"agents = ["planner"]"#), "{merged}");
         assert!(merged.contains("# Why this workflow starts on a webhook."));
-        assert_eq!(toml_str(&merged).trigger, model.trigger);
+        assert_eq!(toml_str(&merged).flows, model.flows);
     }
 
     #[test]
     fn switching_a_webhook_to_on_start_writes_the_message() {
         let mut model = parsed(TRIGGERED);
-        let trigger = model.trigger.as_mut().expect("fixture has a trigger");
-        trigger.trigger_type = TriggerType::OnStart;
-        trigger.message = Some("Kick off.".into());
+        let flow = main_flow(&mut model);
+        flow.trigger.trigger_type = TriggerType::OnStart;
+        flow.trigger.message = Some("Kick off.".into());
         let merged = merge_workflow(TRIGGERED, &model).expect("merges");
         assert!(merged.contains(r#"type = "on_start""#));
         assert!(merged.contains(r#"message = "Kick off.""#));
-        assert_eq!(toml_str(&merged).trigger, model.trigger);
+        assert_eq!(toml_str(&merged).flows, model.flows);
     }
 
     #[test]
     fn switching_on_start_to_a_webhook_removes_the_message() {
         let on_start = TRIGGERED.replace(
-            r#"type = "webhook""#,
-            "type = \"on_start\"\nmessage = \"Go.\"",
+            r#"trigger = { type = "webhook", edge = { to = "builder", kind = "ask" } }"#,
+            "trigger = { type = \"on_start\", edge = { to = \"builder\", kind = \"ask\" }, \
+             message = \"Go.\" }",
         );
         let mut model = parsed(&on_start);
-        let trigger = model.trigger.as_mut().expect("fixture has a trigger");
-        trigger.trigger_type = TriggerType::Webhook;
-        trigger.message = None;
+        let flow = main_flow(&mut model);
+        flow.trigger.trigger_type = TriggerType::Webhook;
+        flow.trigger.message = None;
         let merged = merge_workflow(&on_start, &model).expect("merges");
         assert!(!merged.contains("message ="), "message key gone: {merged}");
-        assert_eq!(toml_str(&merged).trigger, model.trigger);
+        assert_eq!(toml_str(&merged).flows, model.flows);
+    }
+
+    #[test]
+    fn concurrency_round_trips_and_survives_rename() {
+        let shared = "[workflow]\nname = \"example\"\n\n[agents.builder]\n\
+                      dir = \"/tmp/b\"\nprompt = \"You build things.\"\n\
+                      concurrency = \"shared\"\n";
+        // Rename: remove + re-insert under the new id must keep the field.
+        let mut model = parsed(shared);
+        let old_agent = model
+            .agents
+            .remove(&AgentId("builder".into()))
+            .expect("builder");
+        model.agents.insert(AgentId("builder2".into()), old_agent);
+        let merged = merge_workflow(shared, &model).expect("merges");
+        assert_eq!(
+            toml_str(&merged).agents[&AgentId("builder2".into())].concurrency,
+            AgentConcurrency::Shared,
+            "concurrency survives the rename: {merged}"
+        );
+        // In-place flip writes the key.
+        let mut model = parsed(shared);
+        model
+            .agents
+            .get_mut(&AgentId("builder".into()))
+            .expect("builder")
+            .concurrency = AgentConcurrency::Exclusive;
+        let merged = merge_workflow(shared, &model).expect("merges");
+        assert_eq!(
+            toml_str(&merged).agents[&AgentId("builder".into())].concurrency,
+            AgentConcurrency::Exclusive
+        );
+    }
+
+    #[test]
+    fn max_concurrent_runs_round_trips() {
+        let base = "[workflow]\nname = \"example\"\n\n[agents.builder]\n\
+                    dir = \"/tmp/b\"\nprompt = \"You build things.\"\n";
+        let mut model = parsed(base);
+        model.server.max_concurrent_runs = 5;
+        let merged = merge_workflow(base, &model).expect("merges");
+        assert_eq!(
+            toml_str(&merged).server.max_concurrent_runs,
+            5,
+            "written into [server]: {merged}"
+        );
+    }
+
+    #[test]
+    fn trust_agent_dirs_round_trips() {
+        let mut model = parsed(COMMENTED);
+        model.server.trust_agent_dirs = true;
+        let merged = merge_workflow(COMMENTED, &model).expect("merges");
+        assert!(
+            merged.contains("trust_agent_dirs = true"),
+            "written: {merged}"
+        );
+        assert!(toml_str(&merged).server.trust_agent_dirs);
+        let mut back = toml_str(&merged);
+        back.server.trust_agent_dirs = false;
+        let merged = merge_workflow(&merged, &back).expect("merges");
+        assert!(!toml_str(&merged).server.trust_agent_dirs);
     }
 
     #[test]
@@ -755,16 +1111,16 @@ prompt = "You build things."
         assert!(err.contains("parse"), "says why: {err}");
     }
 
-    // A webhook trigger with an inline output schema, for the `[trigger.output]`
-    // round-trip tests below.
+    // A webhook flow with an inline output schema, for the
+    // `[flows.main.output]` round-trip tests below.
     const WITH_OUTPUT: &str = r#"[workflow]
 name = "example"
 
-[trigger]
-type = "webhook"
-edge = { to = "builder", kind = "ask" }
+[flows.main]
+agents = ["builder"]
+trigger = { type = "webhook", edge = { to = "builder", kind = "ask" } }
 
-[trigger.output]
+[flows.main.output]
 schema = { type = "object", properties = { name = { type = "string" } }, required = ["name"] }
 max_repairs = 1
 
@@ -796,8 +1152,7 @@ prompt = "You build things."
     #[test]
     fn adding_output_via_model_writes_the_section() {
         let mut model = parsed(TRIGGERED);
-        let trigger = model.trigger.as_mut().expect("fixture has a trigger");
-        trigger.output = Some(OutputConfig {
+        main_flow(&mut model).output = Some(OutputConfig {
             schema: None,
             schema_file: Some("schemas/x.json".into()),
             max_repairs: 2,
@@ -807,20 +1162,19 @@ prompt = "You build things."
             merged.contains(r#"schema_file = "schemas/x.json""#),
             "schema_file written: {merged}"
         );
-        assert_eq!(toml_str(&merged).trigger, model.trigger);
+        assert_eq!(toml_str(&merged).flows, model.flows);
     }
 
     #[test]
     fn removing_output_via_model_deletes_the_section() {
         let mut model = parsed(WITH_OUTPUT);
-        let trigger = model.trigger.as_mut().expect("fixture has a trigger");
-        trigger.output = None;
+        main_flow(&mut model).output = None;
         let merged = merge_workflow(WITH_OUTPUT, &model).expect("merges");
         assert!(!merged.contains("output"), "output section gone: {merged}");
         assert!(
-            merged.contains(r#"edge = { to = "builder", kind = "ask" }"#),
-            "rest of [trigger] intact: {merged}"
+            merged.contains(WEBHOOK_TRIGGER_LINE),
+            "rest of [flows.main] intact: {merged}"
         );
-        assert_eq!(toml_str(&merged).trigger, model.trigger);
+        assert_eq!(toml_str(&merged).flows, model.flows);
     }
 }

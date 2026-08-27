@@ -6,10 +6,14 @@
 use serde_json::Value;
 
 use crate::types::AgentId;
+use crate::types::id::FlowName;
 
 pub struct OutputContract {
     /// Raw schema, pretty-printed into the target agent's system prompt.
     pub schema: Value,
+    /// The flow that declared it. Named in the prompt block, in the kickoff's
+    /// injected header, and in the rejection — one label the agent can match.
+    pub flow: FlowName,
     pub target: AgentId,
     /// Rejections allowed before the router accepts and the trigger fails.
     pub max_repairs: u32,
@@ -19,6 +23,7 @@ pub struct OutputContract {
 impl std::fmt::Debug for OutputContract {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutputContract")
+            .field("flow", &self.flow)
             .field("target", &self.target)
             .field("max_repairs", &self.max_repairs)
             .finish_non_exhaustive()
@@ -34,6 +39,7 @@ impl OutputContract {
     /// A human-readable compile diagnostic, for `ValidationIssue.message`.
     pub fn compile(
         schema: Value,
+        flow: FlowName,
         target: AgentId,
         max_repairs: u32,
     ) -> Result<OutputContract, String> {
@@ -48,6 +54,7 @@ impl OutputContract {
             .map_err(|e| format!("schema does not compile under draft 2020-12: {e}"))?;
         Ok(OutputContract {
             schema,
+            flow,
             target,
             max_repairs,
             validator,
@@ -184,22 +191,27 @@ fn balanced_span(text: &str) -> Option<&str> {
 }
 
 /// The 422 body for a rejected `tempo reply` (read by the agent as CLI stderr).
+/// Names the flow whose schema rejected it: with two contracts in one prompt,
+/// "the workflow's output schema" left the agent to work out which block to
+/// repair against (amendment 31).
 #[must_use]
-pub fn render_rejection(errors: &[String], attempts_left: u32) -> String {
+pub fn render_rejection(errors: &[String], attempts_left: u32, flow: &FlowName) -> String {
     let plural = if attempts_left == 1 {
         "attempt"
     } else {
         "attempts"
     };
     format!(
-        "tempo reply rejected: the reply body does not match the workflow's \
-         output schema.\n- {}\nReply with ONLY the JSON object — no prose, no \
+        "tempo reply rejected: the reply body does not match the output schema \
+         of flow '{flow}' (the flow named in that ask's [CoreTempo …] line).\n\
+         - {}\nReply with ONLY the JSON object — no prose, no \
          markdown fences. Consider writing it to a file and using \
          `tempo reply <id> --code 0 --json-file <path>`.\n{attempts_left} \
          {plural} remain; after that the trigger fails and the caller gets \
          these errors.\nIf you cannot produce this shape, reply with --code 1 \
          and a plain-text explanation instead.",
-        errors.join("\n- ")
+        errors.join("\n- "),
+        flow = flow.0,
     )
 }
 
@@ -218,7 +230,7 @@ mod tests {
     use super::*;
 
     fn contract(schema: serde_json::Value) -> OutputContract {
-        OutputContract::compile(schema, AgentId("t".into()), 2)
+        OutputContract::compile(schema, FlowName("hook".into()), AgentId("t".into()), 2)
             .unwrap_or_else(|e| panic!("schema must compile: {e}"))
     }
 
@@ -270,16 +282,32 @@ mod tests {
     #[test]
     fn compile_rejects_external_ref() {
         let schema = serde_json::json!({"$ref": "https://example.com/x.json"});
-        let err = OutputContract::compile(schema, AgentId("t".into()), 2)
+        let err = OutputContract::compile(schema, FlowName("hook".into()), AgentId("t".into()), 2)
             .expect_err("external ref must fail");
         assert!(err.contains("$ref"), "{err}");
     }
 
     #[test]
     fn rejection_text_names_the_escape_hatch() {
-        let text = render_rejection(&["at /x: bad".to_string()], 1);
+        let text = render_rejection(&["at /x: bad".to_string()], 1, &FlowName("hook".into()));
         assert!(text.contains("tempo reply rejected"));
         assert!(text.contains("1 attempt"));
         assert!(text.contains("--code 1"));
+    }
+
+    /// Amendment 31: with two contracts in one prompt, the rejection has to say
+    /// which flow's schema it came from — the same name the kickoff's header
+    /// carries, so the agent can match them.
+    #[test]
+    fn rejection_text_names_the_rejecting_flow() {
+        let text = render_rejection(&["at /x: bad".to_string()], 2, &FlowName("nightly".into()));
+        assert!(
+            text.contains("output schema of flow 'nightly'"),
+            "the rejection names its flow: {text}"
+        );
+        assert!(
+            text.contains("[CoreTempo"),
+            "and points back at the ask that carries the same name: {text}"
+        );
     }
 }

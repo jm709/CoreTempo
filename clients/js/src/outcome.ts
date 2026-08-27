@@ -85,7 +85,7 @@ export async function toOutcome<T = unknown>(
         {
           message:
             "a schema was supplied but the server reply carried no parsed output — " +
-            "declare [trigger.output] in tempo.toml so the server validates and emits it",
+            "declare [flows.<name>.output] in tempo.toml so the server validates and emits it",
         },
       ],
     };

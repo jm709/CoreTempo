@@ -11,3 +11,7 @@
 
 clients/js/node_modules
 clients/js/dist
+
+# local agent scratch: superpowers drafts and Claude Code agent worktrees
+/.superpowers/
+/.claude/worktrees/

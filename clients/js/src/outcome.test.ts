@@ -90,7 +90,7 @@ describe("toOutcome", () => {
     const outcome = await toOutcome(view, translationsSchema);
     expect(outcome.status).toBe("output_mismatch");
     if (outcome.status !== "output_mismatch") return;
-    expect(outcome.issues[0]?.message).toContain("[trigger.output]");
+    expect(outcome.issues[0]?.message).toContain("[flows.<name>.output]");
   });
 
   it("passes output through untyped when no schema is supplied", async () => {

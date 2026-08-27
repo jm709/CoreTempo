@@ -8,18 +8,20 @@ pub mod event;
 pub mod id;
 pub mod message;
 
-pub use crate::types::agent::{AgentDetail, AgentInfo, AgentState};
+pub use crate::types::agent::{AgentDetail, AgentExit, AgentInfo, AgentState};
 pub use crate::types::api::{
     AgentListResponse, AgentStateResponse, ApiErrorBody, ApiErrorDetail, ApiFile,
-    CreateMessageRequest, Health, MessageListResponse, ReplyRequest, ReportStateRequest,
+    CreateMessageRequest, FlowView, Health, MessageListResponse, ReplyRequest, ReportStateRequest,
     ReportedState, RestartResponse, RunInfo, Snapshot, WorkflowResponse,
 };
+#[cfg(feature = "server")]
+pub use crate::types::config::FrozenFlow;
 pub use crate::types::config::{
-    AgentConfig, FrozenWorkflow, ResolvedServer, ServerOverrides, ServerSection, ValidationIssue,
-    WorkflowFile, WorkflowSection,
+    AgentConcurrency, AgentConfig, FlowConfig, FrozenWorkflow, ResolvedServer, ServerOverrides,
+    ServerSection, ValidationIssue, WorkflowFile, WorkflowSection,
 };
 pub use crate::types::event::{Event, EventPayload, LifecyclePhase};
-pub use crate::types::id::{AgentId, MessageId, RunId, Token};
+pub use crate::types::id::{AgentId, FlowName, MessageId, RunId, Token};
 pub use crate::types::message::{
     MessageKind, MessageRecord, MessageStatus, Origin, OriginParseError,
 };

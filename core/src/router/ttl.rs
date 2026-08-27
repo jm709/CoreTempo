@@ -2,11 +2,15 @@
 //! and decrements the asker's pending count. Guarantees no permanently-stuck pending state
 //! (spec §12). Deadlines are in-memory: a run owns its messages, and a process restart is a
 //! new run.
+//!
+//! Also the owed-ask watchdog (spec 2026-08-17 §4): fails owed asks on blocked
+//! (past grace) or exited agents and pokes the queue worker when a re-nudge is
+//! due. Expiry runs first in every tick, so a dead ask is never poked for.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::router::{Router, lock};
+use crate::router::{FailReason, Router, lock};
 use crate::types::id::MessageId;
 
 pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -23,6 +27,7 @@ pub(crate) fn spawn_sweeper(router: &Arc<Router>) {
                 return;
             };
             router.sweep_expired().await;
+            router.sweep_owed().await;
         }
     });
 }
@@ -40,7 +45,8 @@ impl Router {
         };
         for id in expired {
             tracing::info!(message = %id.0, "ask TTL expired; failing message");
-            self.fail_message(&id).await;
+            let reason = FailReason::timeout(&id, self.workflow.ask_timeout);
+            self.fail_message(&id, reason).await;
         }
     }
 }

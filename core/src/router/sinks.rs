@@ -3,31 +3,57 @@
 //! injected messages stay short.
 
 use crate::types::config::{Edge, EdgeKind};
-use crate::types::id::{AgentId, MessageId};
+use crate::types::id::{AgentId, FlowName, MessageId};
 use crate::types::message::Origin;
 
 /// `{sender}` rendering (contracts §3.2): `Agent(id)` → bare id, `User` → `user`,
-/// `Http(_)` → `http`.
+/// `Http(_)` and `Trigger(_)` → `http` — a kickoff is external traffic to the
+/// agent, and the `flow` clause below is what tells it a kickoff apart.
 pub(crate) fn origin_label(origin: &Origin) -> String {
     match origin {
         Origin::Agent(id) => id.0.clone(),
         Origin::User => "user".to_string(),
-        Origin::Http(_) => "http".to_string(),
+        Origin::Http(_) | Origin::Trigger(_) => "http".to_string(),
+    }
+}
+
+/// `{sender}`, plus the flow a kickoff belongs to (amendment 31): `http` becomes
+/// `http, flow nightly`. Only flow kickoffs carry a flow — an agent-to-agent
+/// message belongs to no flow, so its header is unchanged.
+fn sender_clause(origin: &Origin, flow: Option<&FlowName>) -> String {
+    match flow {
+        Some(flow) => format!("{}, flow {}", origin_label(origin), flow.0),
+        None => origin_label(origin),
     }
 }
 
 /// One injection: two lines joined by `\n`.
-pub(crate) fn render_ask(id: &MessageId, from: &Origin, body: &str) -> String {
+pub(crate) fn render_ask(
+    id: &MessageId,
+    from: &Origin,
+    flow: Option<&FlowName>,
+    body: &str,
+) -> String {
     format!(
         "[CoreTempo {id} from {sender} — reply expected] {body}\nReply first with: tempo \
          reply {id} --code 0 '<answer>' (--code 1 on failure), then continue.",
         id = id.0,
-        sender = origin_label(from),
+        sender = sender_clause(from, flow),
     )
 }
 
-pub(crate) fn render_send(id: &MessageId, from: &Origin, body: &str) -> String {
-    format!("[CoreTempo {} from {}] {}", id.0, origin_label(from), body)
+pub(crate) fn render_send(
+    id: &MessageId,
+    from: &Origin,
+    flow: Option<&FlowName>,
+    body: &str,
+) -> String {
+    format!(
+        "[CoreTempo {} from {}] {}",
+        id.0,
+        sender_clause(from, flow),
+        body
+    )
 }
 
 pub(crate) fn render_reply(id: &MessageId, replier: &AgentId, code: u8, body: &str) -> String {
@@ -60,7 +86,9 @@ pub(crate) fn render_nudge(unmet: &[Edge]) -> String {
 
 /// Owed-reply nudge: the agent went idle without answering an ask it received.
 /// Takes precedence over [`render_nudge`] — someone is blocked on this agent.
-pub(crate) fn render_reply_nudge(owed: &[MessageId]) -> String {
+/// From round 2 on it also names the commonest cause: the agent ended its turn
+/// while background subagents were still running (spec 2026-08-17 §4.1).
+pub(crate) fn render_reply_nudge(owed: &[MessageId], round: u32) -> String {
     let ids = owed
         .iter()
         .map(|id| id.0.as_str())
@@ -69,11 +97,19 @@ pub(crate) fn render_reply_nudge(owed: &[MessageId]) -> String {
     // Runnable as typed, for the first one owed: a placeholder id is one more
     // thing to get wrong when the agent is already off the rails.
     let first = owed.first().map_or("<id>", |id| id.0.as_str());
-    format!(
+    let mut text = format!(
         "[CoreTempo] You still owe a reply to: {ids}. Run \
          `tempo reply {first} --code 0 '<answer>'` (or --code 1 with why you \
          could not) before anything else. The asker is blocked on you."
-    )
+    );
+    if round >= 2 {
+        text.push_str(
+            " If you are waiting on background subagents, poll for their result \
+             inside this turn (`/tasks`, or check their output files) rather than \
+             ending it — CoreTempo cannot see them.",
+        );
+    }
+    text
 }
 
 /// One-shot nudge when a loop's round cap is reached (edge-semantics spec):
@@ -97,7 +133,7 @@ pub(crate) fn render_cap_nudge(capped: &[(AgentId, u32)]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::router::sinks::{origin_label, render_ask, render_reply, render_send};
-    use crate::types::id::{AgentId, MessageId};
+    use crate::types::id::{AgentId, FlowName, MessageId};
     use crate::types::message::Origin;
 
     #[test]
@@ -108,6 +144,11 @@ mod tests {
         );
         assert_eq!(origin_label(&Origin::User), "user");
         assert_eq!(origin_label(&Origin::Http("1f2e3d4c".to_string())), "http");
+        assert_eq!(
+            origin_label(&Origin::Trigger("1f2e3d4c".to_string())),
+            "http",
+            "the wire discriminator is for observers; the agent-facing header is unchanged"
+        );
     }
 
     #[test]
@@ -115,6 +156,7 @@ mod tests {
         let text = render_ask(
             &MessageId("m-a3f91c2e".to_string()),
             &Origin::Agent(AgentId("planner".to_string())),
+            None,
             "Is the schema migration done?",
         );
         assert_eq!(
@@ -125,25 +167,59 @@ mod tests {
         );
     }
 
+    /// Amendment 31: a flow kickoff names its flow in the header line, so a
+    /// target holding two flows' output contracts knows which one applies
+    /// before it replies — not after a 422.
+    #[test]
+    fn ask_template_names_the_kickoff_flow() {
+        let text = render_ask(
+            &MessageId("m-a3f91c2e".to_string()),
+            &Origin::Http("t-1f2e3d4c".to_string()),
+            Some(&FlowName("nightly".to_string())),
+            "Is the schema migration done?",
+        );
+        assert_eq!(
+            text,
+            "[CoreTempo m-a3f91c2e from http, flow nightly — reply expected] Is the schema \
+             migration done?\nReply first with: tempo reply m-a3f91c2e --code 0 '<answer>' \
+             (--code 1 on failure), then continue."
+        );
+    }
+
     #[test]
     fn send_template() {
         let text = render_send(
             &MessageId("m-b7c2d1e0".to_string()),
             &Origin::Agent(AgentId("planner".to_string())),
+            None,
             "Deploy is green.",
         );
         assert_eq!(text, "[CoreTempo m-b7c2d1e0 from planner] Deploy is green.");
     }
 
     #[test]
+    fn send_template_names_the_kickoff_flow() {
+        let text = render_send(
+            &MessageId("m-b7c2d1e0".to_string()),
+            &Origin::Http("t-1f2e3d4c".to_string()),
+            Some(&FlowName("nightly".to_string())),
+            "Deploy is green.",
+        );
+        assert_eq!(
+            text,
+            "[CoreTempo m-b7c2d1e0 from http, flow nightly] Deploy is green."
+        );
+    }
+
+    #[test]
     fn send_template_from_user_and_http() {
         let id = MessageId("m-b7c2d1e0".to_string());
         assert_eq!(
-            render_send(&id, &Origin::User, "hi"),
+            render_send(&id, &Origin::User, None, "hi"),
             "[CoreTempo m-b7c2d1e0 from user] hi"
         );
         assert_eq!(
-            render_send(&id, &Origin::Http("1f2e3d4c".to_string()), "hi"),
+            render_send(&id, &Origin::Http("1f2e3d4c".to_string()), None, "hi"),
             "[CoreTempo m-b7c2d1e0 from http] hi"
         );
     }

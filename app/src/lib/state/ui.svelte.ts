@@ -1,3 +1,5 @@
+import type { RunPhase } from "./run.svelte";
+
 export type RunCenter = "graph" | "terminals";
 
 export type DockTab = "feed" | "chat" | "run";
@@ -11,6 +13,7 @@ export const uiState = $state({
   hoverFrom: null as string | null,      // roster highlight while hovering a feed item
   hoverTo: null as string | null,
   editorPath: null as string | null,     // workflow file open in the stopped-mode editor
+  editorDirty: false,                    // the editor holds edits not yet saved to editorPath
   runCenter: "graph" as RunCenter,       // center view while a run is active
 });
 
@@ -57,5 +60,26 @@ export function resetUi(): void {
   uiState.hoverFrom = null;
   uiState.hoverTo = null;
   uiState.editorPath = null;
+  uiState.editorDirty = false;
   uiState.runCenter = "graph";
+}
+
+export interface RunGate {
+  disabled: boolean;
+  hint: string | null;
+}
+
+/// Whether the header's ▶ Run / ■ Stop button is usable, and why not when it
+/// is not. A run always starts from the file on disk, so unsaved editor
+/// edits block Run (never Stop) until the operator saves them (#89).
+export function runGate(
+  phase: RunPhase,
+  editorPath: string | null,
+  editorDirty: boolean,
+): RunGate {
+  if (phase === "starting" || phase === "stopping") return { disabled: true, hint: null };
+  if (phase === "running") return { disabled: false, hint: null };
+  if (editorPath === null) return { disabled: true, hint: null };
+  if (editorDirty) return { disabled: true, hint: "save the workflow to run it" };
+  return { disabled: false, hint: null };
 }

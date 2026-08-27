@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, TRANSFER_ENCODING};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -30,13 +30,19 @@ fn check(ctx: &ApiContext, req: &Request) -> Result<(), ApiError> {
         return Ok(());
     }
     check_bearer(ctx, req)?;
-    // A webhook caller posts whatever its sender emits, and the trigger body is
-    // the kickoff message verbatim rather than a JSON document. The exemption is
-    // the content type only: auth above still applies.
-    if req.uri().path() != "/v1/trigger" {
+    if !is_trigger_post(req.uri().path()) {
         check_content_type(req)?;
     }
     Ok(())
+}
+
+/// The trigger routes. A webhook caller posts whatever its sender emits, and the
+/// body is the kickoff message verbatim rather than a JSON document, so they are
+/// exempt from the JSON content-type guard — the exemption is the content type
+/// only: auth above still applies. The removed bare `/v1/trigger` keeps it so an
+/// old caller reaches its 404 tombstone naming the new route, not a 415.
+fn is_trigger_post(path: &str) -> bool {
+    path == "/v1/trigger" || (path.starts_with("/v1/flows/") && path.ends_with("/trigger"))
 }
 
 fn check_host(ctx: &ApiContext, req: &Request) -> Result<(), ApiError> {
@@ -102,24 +108,55 @@ pub(crate) fn bearer_ok(token: &Token, headers: &HeaderMap) -> bool {
     provided.as_bytes().ct_eq(token.0.as_bytes()).into()
 }
 
-fn check_bearer(ctx: &ApiContext, req: &Request) -> Result<(), ApiError> {
-    require_bearer(&ctx.token, req.headers())
+/// Where a 401'd caller can find the token this server wants (#57).
+///
+/// A run publishes its own in `~/.coretempo/runs/<run_id>/api.json`; a
+/// `coretempod serve` daemon writes none and never repoints `current`, so the
+/// only token it will ever accept is the one its environment gave it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenHint {
+    /// A workflow run, whose `api.json` carries the token.
+    Run,
+    /// A headless `coretempod serve` daemon.
+    Serve,
 }
 
-/// The bearer guard as a check, for servers with no [`ApiContext`].
+impl TokenHint {
+    fn advice(self) -> &'static str {
+        match self {
+            TokenHint::Run => {
+                "using the token from CORETEMPO_TOKEN or ~/.coretempo/runs/current/api.json"
+            }
+            TokenHint::Serve => {
+                "using the token this daemon was started with — `coretempod serve` is \
+                 headless and writes no api.json, so its token is whatever \
+                 CORETEMPO_TOKEN, --token-file/CORETEMPO_TOKEN_FILE, or [server] \
+                 token_file provisioned"
+            }
+        }
+    }
+}
+
+fn check_bearer(ctx: &ApiContext, req: &Request) -> Result<(), ApiError> {
+    require_bearer(&ctx.token, req.headers(), TokenHint::Run)
+}
+
+/// The bearer guard as a check, for servers with no [`ApiContext`]. `hint`
+/// picks which token the refusal points the caller at.
 ///
 /// # Errors
 /// 401 `unauthorized` when the `Authorization` header does not carry `token`.
-pub fn require_bearer(token: &Token, headers: &HeaderMap) -> Result<(), ApiError> {
+pub fn require_bearer(token: &Token, headers: &HeaderMap, hint: TokenHint) -> Result<(), ApiError> {
     if bearer_ok(token, headers) {
         return Ok(());
     }
     Err(ApiError::new(
         StatusCode::UNAUTHORIZED,
         "unauthorized",
-        "missing or invalid bearer token; send 'Authorization: Bearer <token>' using the \
-         token from CORETEMPO_TOKEN or ~/.coretempo/runs/current/api.json"
-            .to_string(),
+        format!(
+            "missing or invalid bearer token; send 'Authorization: Bearer <token>' {}",
+            hint.advice()
+        ),
     ))
 }
 
@@ -139,6 +176,13 @@ fn check_content_type(req: &Request) -> Result<(), ApiError> {
     {
         return Ok(());
     }
+    // A POST that carries nothing has nothing to misinterpret: `curl -X POST
+    // .../restart` declares neither a body nor a type, and the body-less
+    // endpoints (restart, loop-done) parse nothing anyway (#57). A declared
+    // type still has to be JSON, and a body still has to declare one.
+    if ct.is_empty() && no_body_declared(req.headers()) {
+        return Ok(());
+    }
     Err(ApiError::new(
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
         "unsupported_media_type",
@@ -147,6 +191,25 @@ fn check_content_type(req: &Request) -> Result<(), ApiError> {
              'Content-Type: application/json'"
         ),
     ))
+}
+
+/// Whether the request says it carries no body: no `Transfer-Encoding`, and a
+/// `Content-Length` that is absent or zero. Read off the headers rather than the
+/// body, because the guard runs before any handler has consumed it — and an
+/// unparseable `Content-Length` counts as a body, so a malformed request is
+/// still refused rather than waved through.
+fn no_body_declared(headers: &HeaderMap) -> bool {
+    if headers.contains_key(TRANSFER_ENCODING) {
+        return false;
+    }
+    match headers.get(CONTENT_LENGTH) {
+        None => true,
+        Some(len) => len
+            .to_str()
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .is_some_and(|len| len == 0),
+    }
 }
 
 fn valid_agent_id(s: &str) -> bool {
@@ -199,9 +262,12 @@ pub fn default_runs_dir() -> Option<PathBuf> {
 
 /// Writes `contents` to `path`, truncating, with mode 0600 both on creation and on
 /// an existing file (run-scoped files carry the API token or agent-controlling hooks).
+/// The contents are fsync'd before this returns, so a crash cannot leave a
+/// zero-length file behind — callers that rename the result into place
+/// (`trust::TrustStore::grant`) depend on that.
 ///
 /// # Errors
-/// Propagates filesystem errors from opening, writing, or chmod'ing the file.
+/// Propagates filesystem errors from opening, writing, syncing, or chmod'ing the file.
 pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -211,6 +277,7 @@ pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result
         .mode(0o600)
         .open(path)?;
     f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
     std::fs::set_permissions(path, PermissionsExt::from_mode(0o600))
 }
 
@@ -298,6 +365,25 @@ mod tests {
         assert_eq!(strip_port("[::1]:4820"), "::1");
         assert_eq!(strip_port("127.0.0.1:4820"), "127.0.0.1");
         assert_eq!(strip_port("localhost"), "localhost");
+    }
+
+    #[test]
+    fn body_declaration_rules() {
+        use crate::api::auth::no_body_declared;
+        use axum::http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+
+        let with = |name: axum::http::HeaderName, value: &str| {
+            let mut map = HeaderMap::new();
+            map.insert(name, value.parse().expect("header value"));
+            map
+        };
+        assert!(no_body_declared(&HeaderMap::new()));
+        assert!(no_body_declared(&with(CONTENT_LENGTH, "0")));
+        assert!(!no_body_declared(&with(CONTENT_LENGTH, "12")));
+        // Chunked bodies declare no length; they are still bodies.
+        assert!(!no_body_declared(&with(TRANSFER_ENCODING, "chunked")));
+        // A length nobody can parse is not a promise of an empty body.
+        assert!(!no_body_declared(&with(CONTENT_LENGTH, "nonsense")));
     }
 
     #[test]

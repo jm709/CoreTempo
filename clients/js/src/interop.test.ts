@@ -26,7 +26,7 @@ describe("zod interop", () => {
         },
       },
     ]);
-    const client = new CoreTempoClient({ baseUrl: server.url, token: "t" });
+    const client = new CoreTempoClient({ baseUrl: server.url, token: "t", flow: "post" });
     const outcome = await client.trigger("hello", { schema: Output });
     expect(outcome.status).toBe("completed");
     if (outcome.status !== "completed") return;
@@ -48,7 +48,7 @@ describe("zod interop", () => {
         },
       },
     ]);
-    const client = new CoreTempoClient({ baseUrl: server.url, token: "t" });
+    const client = new CoreTempoClient({ baseUrl: server.url, token: "t", flow: "post" });
     const outcome = await client.trigger("hello", { schema: Output });
     expect(outcome.status).toBe("output_mismatch");
     if (outcome.status !== "output_mismatch") return;

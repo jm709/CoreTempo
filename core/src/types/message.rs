@@ -97,7 +97,14 @@ impl std::str::FromStr for MessageStatus {
 pub enum Origin {
     Agent(AgentId),
     User,
+    /// A plain authenticated API call without `X-CoreTempo-Agent` (a script,
+    /// a human's `tempo ask` from a shell); the id is the request id.
     Http(String),
+    /// A flow kickoff: the webhook, `run --flow` and desktop fire paths. The
+    /// id is the trigger hub id minus `t-`, so observers correlate the
+    /// kickoff to its trigger without mistaking any other HTTP message for
+    /// one (#24). Agents see it as `http` in the injected header.
+    Trigger(String),
 }
 
 impl std::fmt::Display for Origin {
@@ -106,12 +113,13 @@ impl std::fmt::Display for Origin {
             Origin::Agent(id) => write!(f, "agent:{id}"),
             Origin::User => f.write_str("user"),
             Origin::Http(req) => write!(f, "http:{req}"),
+            Origin::Trigger(hex) => write!(f, "trigger:{hex}"),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid origin '{0}': expected 'agent:<id>', 'user', or 'http:<req-id>'")]
+#[error("invalid origin '{0}': expected 'agent:<id>', 'user', 'http:<req-id>', or 'trigger:<hex>'")]
 pub struct OriginParseError(pub String);
 
 impl std::str::FromStr for Origin {
@@ -130,6 +138,11 @@ impl std::str::FromStr for Origin {
             && !req.is_empty()
         {
             return Ok(Origin::Http(req.to_string()));
+        }
+        if let Some(hex) = s.strip_prefix("trigger:")
+            && !hex.is_empty()
+        {
+            return Ok(Origin::Trigger(hex.to_string()));
         }
         Err(OriginParseError(s.to_string()))
     }
@@ -162,6 +175,14 @@ pub struct MessageRecord {
     pub created_at: Timestamp,
     pub injected_at: Option<Timestamp>,
     pub completed_at: Option<Timestamp>,
+    /// Why the message failed (human text naming the fix); `None` unless
+    /// `status == Failed` (spec 2026-08-17 §4.3).
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Machine-readable failure kind: `timeout`, `blocked_on_permission`,
+    /// `agent_exited`, `agent_restarted`, `orphaned`.
+    #[serde(default)]
+    pub reason_code: Option<String>,
 }
 
 #[cfg(test)]
@@ -186,13 +207,15 @@ mod tests {
             created_at: Timestamp("2026-08-01T17:03:11Z".into()),
             injected_at: Some(Timestamp("2026-08-01T17:03:12Z".into())),
             completed_at: Some(Timestamp("2026-08-01T17:04:40Z".into())),
+            reason: None,
+            reason_code: None,
         };
         let expected = serde_json::json!({
             "id": "m-a3f91c2e", "kind": "ask", "from": "agent:planner", "to": "builder",
             "body": "Is the schema migration done?", "status": "replied", "code": 0,
             "reply": "Yes, migration 004 applied and tested.",
             "created_at": "2026-08-01T17:03:11Z", "injected_at": "2026-08-01T17:03:12Z",
-            "completed_at": "2026-08-01T17:04:40Z"
+            "completed_at": "2026-08-01T17:04:40Z", "reason": null, "reason_code": null
         });
         assert_eq!(serde_json::to_value(&record).unwrap(), expected);
         let back: MessageRecord = serde_json::from_value(expected).unwrap();
@@ -213,17 +236,21 @@ mod tests {
             created_at: Timestamp("2026-08-01T17:03:11Z".into()),
             injected_at: None,
             completed_at: None,
+            reason: None,
+            reason_code: None,
         };
         let v = serde_json::to_value(&record).unwrap();
         assert!(v.get("code").unwrap().is_null());
         assert!(v.get("reply").unwrap().is_null());
         assert!(v.get("injected_at").unwrap().is_null());
         assert!(v.get("completed_at").unwrap().is_null());
+        assert!(v.get("reason").unwrap().is_null());
+        assert!(v.get("reason_code").unwrap().is_null());
     }
 
     #[test]
     fn origin_round_trips() {
-        for s in ["agent:planner", "user", "http:1f2e3d4c"] {
+        for s in ["agent:planner", "user", "http:1f2e3d4c", "trigger:1f2e3d4c"] {
             let o: Origin = s.parse().unwrap();
             assert_eq!(o.to_string(), s);
         }
@@ -232,7 +259,9 @@ mod tests {
 
     #[test]
     fn origin_rejects_invalid_forms() {
-        for bad in ["", "agent:", "http:", "robot:x", "User", "agent"] {
+        for bad in [
+            "", "agent:", "http:", "trigger:", "robot:x", "User", "agent",
+        ] {
             assert!(Origin::from_str(bad).is_err(), "should reject {bad:?}");
         }
     }

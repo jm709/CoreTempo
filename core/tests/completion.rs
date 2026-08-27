@@ -18,10 +18,12 @@ use coretempo_core::time::Timestamp;
 use coretempo_core::trigger::{
     Completion, WatchInputs, completion_status, normalize_payload, watch_completion,
 };
-use coretempo_core::types::agent::AgentState;
-use coretempo_core::types::config::{AgentConfig, FrozenWorkflow};
+use coretempo_core::types::agent::{AgentExit, AgentState};
+use coretempo_core::types::config::{
+    AgentConfig, Edge, EdgeKind, FrozenFlow, FrozenWorkflow, TriggerType,
+};
 use coretempo_core::types::event::{Event, EventPayload, LifecyclePhase};
-use coretempo_core::types::id::{AgentId, MessageId};
+use coretempo_core::types::id::{AgentId, FlowName, MessageId, RunId};
 use coretempo_core::types::message::{MessageKind, MessageRecord, MessageStatus, Origin};
 use coretempo_core::{api::PtySource, types::event::CompletionResult};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -132,7 +134,26 @@ impl PtySource for FakePty {
         tx.send_replace(state);
         Ok(())
     }
-    fn exit_code(&self, _id: &AgentId) -> Result<Option<i32>, PtyError> {
+    fn report_blocked(
+        &self,
+        _id: &AgentId,
+        _tool: Option<String>,
+        _agent_id: Option<String>,
+    ) -> Result<(), PtyError> {
+        Ok(())
+    }
+    fn report_refused(
+        &self,
+        _id: &AgentId,
+        _tool: Option<String>,
+        _input: Option<String>,
+    ) -> Result<(), PtyError> {
+        Ok(())
+    }
+    fn report_unblocked(&self, _id: &AgentId, _agent_id: Option<String>) -> Result<(), PtyError> {
+        Ok(())
+    }
+    fn exit(&self, _id: &AgentId) -> Result<Option<AgentExit>, PtyError> {
         Ok(None)
     }
     fn end_cursor(&self, _id: &AgentId) -> Result<Cursor, PtyError> {
@@ -161,6 +182,12 @@ impl PtySource for FakePty {
             .get(id)
             .ok_or_else(|| PtyError::UnknownAgent(id.clone()))?;
         Ok(tx.subscribe())
+    }
+    fn blocked(&self, _id: &AgentId) -> Result<bool, PtyError> {
+        Ok(false)
+    }
+    fn blocked_count(&self) -> usize {
+        0
     }
 }
 
@@ -193,22 +220,40 @@ fn contract(max_repairs: u32) -> Arc<OutputContract> {
         "required": ["name"],
         "additionalProperties": false
     });
-    Arc::new(OutputContract::compile(schema, agent("builder"), max_repairs).unwrap())
+    // The flow the watcher's workflow declares, so the rejection names the same
+    // one the kickoff's header does.
+    Arc::new(
+        OutputContract::compile(
+            schema,
+            FlowName("hook".to_string()),
+            agent("builder"),
+            max_repairs,
+        )
+        .unwrap(),
+    )
 }
 
-fn workflow(ids: &[&str], output: Option<Arc<OutputContract>>) -> Arc<FrozenWorkflow> {
+fn workflow(
+    ids: &[&str],
+    output: Option<Arc<OutputContract>>,
+    edges: &[(&str, &str, EdgeKind)],
+) -> Arc<FrozenWorkflow> {
     let mut agents = BTreeMap::new();
     for id in ids {
+        let agent_edges = edges
+            .iter()
+            .filter(|(from, _, _)| from == id)
+            .map(|(_, to, kind)| Edge {
+                to: agent(to),
+                kind: *kind,
+                max_rounds: None,
+            })
+            .collect();
         agents.insert(
             agent(id),
             AgentConfig {
-                dir: PathBuf::from("/tmp"),
-                prompt: "test agent".to_string(),
-                model: None,
-                permission_mode: None,
-                auto_clear: true,
-                edges: Vec::new(),
-                tools: Vec::new(),
+                edges: agent_edges,
+                ..AgentConfig::new(PathBuf::from("/tmp"), "test agent")
             },
         );
     }
@@ -220,8 +265,35 @@ fn workflow(ids: &[&str], output: Option<Arc<OutputContract>>) -> Arc<FrozenWork
         idle_debounce: DWELL,
         scrollback: 5_000,
         agents,
-        output,
+        mcp_servers: BTreeMap::new(),
+        flows: webhook_flows(ids, output),
     })
+}
+
+/// The router reads its reply contract off the webhook flow, so an output
+/// contract is frozen onto one: a single flow spanning the whole roster,
+/// kicked off at the contract's target.
+fn webhook_flows(
+    ids: &[&str],
+    output: Option<Arc<OutputContract>>,
+) -> BTreeMap<FlowName, FrozenFlow> {
+    let Some(contract) = output else {
+        return BTreeMap::new();
+    };
+    BTreeMap::from([(
+        FlowName("hook".to_string()),
+        FrozenFlow {
+            members: ids.iter().map(|id| agent(id)).collect(),
+            trigger_type: TriggerType::Webhook,
+            edge: Edge {
+                to: contract.target.clone(),
+                kind: EdgeKind::Ask,
+                max_rounds: None,
+            },
+            message: None,
+            output: Some(contract),
+        },
+    )])
 }
 
 fn harness(ids: &[&str], mode: InjectMode) -> Harness {
@@ -229,14 +301,34 @@ fn harness(ids: &[&str], mode: InjectMode) -> Harness {
 }
 
 fn harness_with(ids: &[&str], mode: InjectMode, output: Option<Arc<OutputContract>>) -> Harness {
-    let store = Store::open(&temp_db()).unwrap();
+    harness_from(ids, mode, output, &[])
+}
+
+/// Twin of `harness_with` that wires `edges` (`(from, to, kind)`) into each
+/// agent's `AgentConfig`, so tests can arm obligation turns.
+fn harness_with_edges(ids: &[&str], edges: &[(&str, &str, EdgeKind)]) -> Harness {
+    harness_from(ids, InjectMode::Auto, None, edges)
+}
+
+fn harness_from(
+    ids: &[&str],
+    mode: InjectMode,
+    output: Option<Arc<OutputContract>>,
+    edges: &[(&str, &str, EdgeKind)],
+) -> Harness {
+    let store = Store::open(&temp_db(), RunId("r-11111111".to_string())).unwrap();
     let bus = EventBus::new();
     let pty = FakePty::new(ids);
     let injector = Arc::new(MockInjector {
         mode,
         held: Mutex::new(Vec::new()),
     });
-    let router = Router::new(store, bus.clone(), injector, workflow(ids, output.clone()));
+    let router = Router::new(
+        store,
+        bus.clone(),
+        injector,
+        workflow(ids, output.clone(), edges),
+    );
     router.set_state_source(pty.clone());
     Harness {
         router,
@@ -267,7 +359,7 @@ const NO_DEADLINE: Duration = Duration::from_hours(24);
 async fn kickoff(h: &Harness, to: &str, kind: MessageKind) -> MessageRecord {
     h.router
         .create_message(
-            Origin::Http("cli".to_string()),
+            Origin::Trigger("cli".to_string()),
             agent(to),
             kind,
             "go".to_string(),
@@ -499,7 +591,7 @@ async fn agent_exit_fails_the_kickoff_fast() {
     h.bus.publish(EventPayload::AgentLifecycle {
         agent: agent("docs"),
         phase: LifecyclePhase::Exited,
-        exit_code: Some(1),
+        exit: Some(AgentExit::Code(1)),
     });
     let outcome = tokio::time::timeout(DWELL * 4, watcher)
         .await
@@ -551,10 +643,10 @@ async fn ask_kickoff_that_fails_is_not_a_reply() {
             reason_code,
         } => {
             assert!(
-                reason.contains("failed"),
-                "the reason must name the terminal status, got: {reason}"
+                reason.contains("restarted"),
+                "the reason must name why the record failed, got: {reason}"
             );
-            assert_eq!(reason_code, "agent_failed");
+            assert_eq!(reason_code, "agent_restarted");
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -675,4 +767,61 @@ async fn timeout_reason_code() {
     let wire = serde_json::to_value(completion_status(outcome)).unwrap();
     assert_eq!(wire["status"], "failed");
     assert_eq!(wire["reason_code"], "timeout");
+}
+
+#[tokio::test]
+async fn quiescence_ignores_a_non_member_agents_pending_ask() {
+    let h = harness(&["member", "outsider"], InjectMode::Auto);
+    // The outsider stays busy for the whole test; it is outside the roster,
+    // so only an unscoped counter or state check can see it.
+    h.pty.set("outsider", AgentState::Working);
+    // An ask FROM the outsider TO the outsider that never resolves: asker and
+    // target are both outside the roster, so the only thing that can block
+    // quiescence is the pending-ask counter being unscoped.
+    h.router
+        .create_message(
+            Origin::Agent(agent("outsider")),
+            agent("outsider"),
+            MessageKind::Ask,
+            "outsider blocks the pool, not the flow".to_string(),
+        )
+        .await
+        .unwrap();
+    let kick = arm_send(&h, "member").await;
+    h.pty.set("member", AgentState::Idle);
+    let mut watch = inputs(&h, Duration::from_secs(10));
+    watch.roster = vec![agent("member")];
+    let completion = watch_completion(watch, kick).await;
+    assert_eq!(
+        completion,
+        Completion::Quiesced,
+        "a member-scoped watcher must not wait on the outsider's ask"
+    );
+}
+
+#[tokio::test]
+async fn quiescence_ignores_a_non_member_agents_open_turn() {
+    // outsider has an edge, so an HTTP-origin message arms its turn; the turn
+    // stays open (its edge step is never met) while the member quiesces.
+    let h = harness_with_edges(
+        &["member", "outsider"],
+        &[("outsider", "member", EdgeKind::Send)],
+    );
+    let arming = h
+        .router
+        .create_message(
+            Origin::Http("cafe0123".into()),
+            agent("outsider"),
+            MessageKind::Send,
+            "arm the outsider's turn".to_string(),
+        )
+        .await
+        .unwrap();
+    h.pty.set("outsider", AgentState::Working);
+    wait_status(&h, &arming.id, MessageStatus::Working).await;
+    let kick = arm_send(&h, "member").await;
+    h.pty.set("member", AgentState::Idle);
+    let mut watch = inputs(&h, Duration::from_secs(10));
+    watch.roster = vec![agent("member")];
+    assert_eq!(watch_completion(watch, kick).await, Completion::Quiesced);
 }

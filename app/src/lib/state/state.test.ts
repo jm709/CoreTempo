@@ -23,12 +23,12 @@ describe("agents state", () => {
   });
   it("lifecycle exited records the exit code; spawned clears it", () => {
     setAgents(snapshotRunning.agents);
-    applyLifecycle("docs", "exited", 1);
+    applyLifecycle("docs", "exited", { code: 1 });
     expect(agentsState.byId["docs"]?.state).toBe("exited");
-    expect(agentsState.byId["docs"]?.exit_code).toBe(1);
+    expect(agentsState.byId["docs"]?.exit).toEqual({ code: 1 });
     applyLifecycle("docs", "spawned", null);
     expect(agentsState.byId["docs"]?.state).toBe("starting");
-    expect(agentsState.byId["docs"]?.exit_code).toBeNull();
+    expect(agentsState.byId["docs"]?.exit).toBeNull();
   });
   it("unknown agent ids are ignored (roster is frozen; snapshot precedes events)", () => {
     setAgents(snapshotRunning.agents);
@@ -37,7 +37,7 @@ describe("agents state", () => {
   });
   it("runningCount excludes exited and restarting agents", () => {
     setAgents(snapshotRunning.agents);
-    applyLifecycle("docs", "exited", 1);
+    applyLifecycle("docs", "exited", { code: 1 });
     expect(runningCount()).toBe(2);
   });
 });

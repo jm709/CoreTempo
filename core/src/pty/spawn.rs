@@ -2,7 +2,10 @@
 //! `--append-system-prompt` (the role prompt plus the protocol primer, built by
 //! [`crate::types::config::FrozenWorkflow::system_prompt`]), optional
 //! `--model`/`--permission-mode`, `--settings` pointing at the run's turn-boundary
-//! hooks, and the `CORETEMPO_*` env with `tempo` on PATH.
+//! hooks, `--strict-mcp-config` always plus `--mcp-config` for agents that opted
+//! into MCP servers (spec 2026-08-17 §2), and the `CORETEMPO_*` env with `tempo`
+//! on PATH plus `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` for
+//! `isolated_config` agents (spec 2026-08-24 §2, §4).
 
 use std::path::PathBuf;
 
@@ -66,6 +69,11 @@ pub(crate) fn spawn_spec(inputs: &SpawnInputs<'_>) -> SpawnSpec {
         args.push("--settings".to_string());
         args.push(settings.to_string_lossy().into_owned());
     }
+    args.push("--strict-mcp-config".to_string());
+    if let Some(mcp) = env.mcp_paths.get(id) {
+        args.push("--mcp-config".to_string());
+        args.push(mcp.to_string_lossy().into_owned());
+    }
 
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let mut paths = vec![env.tempo_bin_dir.clone()];
@@ -75,15 +83,29 @@ pub(crate) fn spawn_spec(inputs: &SpawnInputs<'_>) -> SpawnSpec {
         |p| p.to_string_lossy().into_owned(),
     );
 
+    let mut env_vars = vec![
+        ("CORETEMPO_AGENT_ID".to_string(), id.0.clone()),
+        ("CORETEMPO_PORT".to_string(), env.port.to_string()),
+        ("CORETEMPO_TOKEN".to_string(), env.token.0.clone()),
+        ("PATH".to_string(), path_value),
+    ];
+    if let Some(dir) = env.config_dirs.get(id) {
+        env_vars.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ));
+        if let Some(store) = &env.credential_store {
+            env_vars.push((
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
+                store.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+
     SpawnSpec {
         program: program.to_string(),
         args,
-        env: vec![
-            ("CORETEMPO_AGENT_ID".to_string(), id.0.clone()),
-            ("CORETEMPO_PORT".to_string(), env.port.to_string()),
-            ("CORETEMPO_TOKEN".to_string(), env.token.0.clone()),
-            ("PATH".to_string(), path_value),
-        ],
+        env: env_vars,
         unset_env: leaked_claude_vars(std::env::vars().map(|(k, _)| k)),
         cwd: cfg.dir.clone(),
     }
@@ -113,13 +135,12 @@ mod tests {
 
     fn cfg(model: Option<&str>, mode: Option<&str>) -> AgentConfig {
         AgentConfig {
-            dir: PathBuf::from("/home/u/projects/CoreTempo"),
-            prompt: "You are the planning agent".into(),
             model: model.map(str::to_string),
             permission_mode: mode.map(str::to_string),
-            auto_clear: true,
-            edges: Vec::new(),
-            tools: Vec::new(),
+            ..AgentConfig::new(
+                PathBuf::from("/home/u/projects/CoreTempo"),
+                "You are the planning agent",
+            )
         }
     }
 
@@ -129,6 +150,9 @@ mod tests {
             token: Token("ab".repeat(32)),
             tempo_bin_dir: PathBuf::from("/opt/coretempo/bin"),
             settings_paths: std::collections::BTreeMap::new(),
+            mcp_paths: std::collections::BTreeMap::new(),
+            config_dirs: std::collections::BTreeMap::new(),
+            credential_store: Some(PathBuf::from("/home/u/.claude")),
         }
     }
 
@@ -151,7 +175,12 @@ mod tests {
         assert_eq!(spec.program, "claude");
         assert_eq!(
             spec.args,
-            vec!["--append-system-prompt", "You are the planning agent"]
+            vec![
+                "--append-system-prompt",
+                "You are the planning agent",
+                "--strict-mcp-config"
+            ],
+            "strict MCP is unconditional: no --mcp-config means zero servers"
         );
         assert_eq!(spec.cwd, PathBuf::from("/home/u/projects/CoreTempo"));
         let get = |k: &str| {
@@ -188,7 +217,43 @@ mod tests {
                 "opus",
                 "--permission-mode",
                 "acceptEdits",
+                "--strict-mcp-config",
             ]
+        );
+    }
+
+    #[test]
+    fn agents_with_mcp_get_their_own_config_file_last() {
+        let id = AgentId("resolver".into());
+        let other = AgentId("helper".into());
+        let cfg = cfg(None, None);
+        let mut env = env();
+        env.settings_paths.insert(
+            id.clone(),
+            PathBuf::from("/home/u/.coretempo/runs/r1/agent-settings-resolver.json"),
+        );
+        env.mcp_paths.insert(
+            id.clone(),
+            PathBuf::from("/home/u/.coretempo/runs/r1/agent-mcp-resolver.json"),
+        );
+        let spec = spawn_spec(&inputs(&id, &cfg, &env));
+        let n = spec.args.len();
+        assert_eq!(
+            &spec.args[n - 3..],
+            [
+                "--strict-mcp-config",
+                "--mcp-config",
+                "/home/u/.coretempo/runs/r1/agent-mcp-resolver.json"
+            ],
+            "--mcp-config is variadic in claude, so it must be the final flag: {:?}",
+            spec.args
+        );
+        let spec = spawn_spec(&inputs(&other, &cfg, &env));
+        assert!(spec.args.contains(&"--strict-mcp-config".to_string()));
+        assert!(
+            !spec.args.contains(&"--mcp-config".to_string()),
+            "no file for helper: {:?}",
+            spec.args
         );
     }
 
@@ -221,6 +286,62 @@ mod tests {
     }
 
     #[test]
+    fn isolated_agents_get_config_dir_and_credential_store_and_others_do_not() {
+        let iso = AgentId("iso".into());
+        let plain = AgentId("plain".into());
+        let cfg = cfg(None, None);
+        let mut env = env();
+        env.config_dirs.insert(
+            iso.clone(),
+            PathBuf::from("/home/u/.coretempo/runs/r1/claude-config-iso"),
+        );
+        let get = |spec: &super::SpawnSpec, k: &str| {
+            spec.env
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        let spec = spawn_spec(&inputs(&iso, &cfg, &env));
+        assert_eq!(
+            get(&spec, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/home/u/.coretempo/runs/r1/claude-config-iso")
+        );
+        assert_eq!(
+            get(&spec, "CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+            Some("/home/u/.claude"),
+            "an isolated agent reads and refreshes the operator's credentials in place"
+        );
+        let spec = spawn_spec(&inputs(&plain, &cfg, &env));
+        assert_eq!(
+            get(&spec, "CLAUDE_CONFIG_DIR"),
+            None,
+            "a non-isolated agent's env is untouched (inheritance): {:?}",
+            spec.env
+        );
+        assert_eq!(get(&spec, "CLAUDE_SECURESTORAGE_CONFIG_DIR"), None);
+    }
+
+    #[test]
+    fn an_unknown_credential_store_sets_only_the_config_dir() {
+        let iso = AgentId("iso".into());
+        let cfg = cfg(None, None);
+        let mut env = env();
+        env.credential_store = None;
+        env.config_dirs
+            .insert(iso.clone(), PathBuf::from("/runs/r1/claude-config-iso"));
+        let spec = spawn_spec(&inputs(&iso, &cfg, &env));
+        assert!(spec.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+        assert!(
+            !spec
+                .env
+                .iter()
+                .any(|(k, _)| k == "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            "nothing to point at, so the var is left alone: {:?}",
+            spec.env
+        );
+    }
+
+    #[test]
     fn inherited_claude_code_vars_are_dropped() {
         let vars = [
             "PATH".to_string(),
@@ -239,13 +360,20 @@ mod tests {
         );
     }
 
+    /// `leaked_claude_vars` is pure and tested above; this proves `spawn_spec`
+    /// feeds it the live process environment.
     #[test]
     fn spawn_spec_marks_leaked_vars_for_removal() {
+        // SAFETY: tests share one process environment, so a concurrent reader can
+        // observe this variable — it is unique to this test, harmless to every
+        // other reader (no code path consumes it), and removed right after the
+        // one call under test.
         unsafe { std::env::set_var("CLAUDE_CODE_TEST_LEAK", "1") };
         let id = AgentId("a".to_string());
         let cfg = cfg(None, None);
         let env = env();
         let spec = spawn_spec(&inputs(&id, &cfg, &env));
+        // SAFETY: as above.
         unsafe { std::env::remove_var("CLAUDE_CODE_TEST_LEAK") };
         assert!(spec.unset_env.iter().any(|k| k == "CLAUDE_CODE_TEST_LEAK"));
     }

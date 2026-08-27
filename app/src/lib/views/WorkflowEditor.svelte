@@ -14,7 +14,6 @@
   let model = $state<WorkflowModel | null>(null);
   let selected = $state<string | null>(null);
   let loaded = $state(false);
-  let dirty = $state(false);
   let report = $state<ParseReport | null>(null);
   let ioError = $state<string | null>(null);
   let toggleError = $state<string | null>(null);
@@ -80,8 +79,14 @@
   });
 
   function markDirty(): void {
-    dirty = true;
+    uiState.editorDirty = true;
   }
+
+  // The flag gates ▶ Run; an editor that unmounts with edits pending must not
+  // leave Run disabled with nothing left to save.
+  $effect(() => () => {
+    uiState.editorDirty = false;
+  });
 
   async function showGraph(): Promise<void> {
     if (view === "graph") return; // already active; re-parsing would discard graph edits
@@ -99,7 +104,7 @@
 
   async function showToml(): Promise<void> {
     if (view === "toml") return; // already active
-    if (model !== null && dirty) {
+    if (model !== null && uiState.editorDirty) {
       try {
         text = await workflowMerge(text, model);
       } catch (e: unknown) {
@@ -127,7 +132,7 @@
       } else {
         await workflowSave(path, text);
       }
-      dirty = false;
+      uiState.editorDirty = false;
       pushRecent(localStorage, path);
     } catch (e: unknown) {
       ioError = toCmdError(e).message;
@@ -137,7 +142,7 @@
 
 <div class="editor">
   <div class="toolbar mono">
-    <span class="path">{uiState.editorPath}{dirty ? " •" : ""}</span>
+    <span class="path">{uiState.editorPath}{uiState.editorDirty ? " •" : ""}</span>
     <div class="views">
       <button
         class:active={view === "graph"}
@@ -157,7 +162,7 @@
       onclick={() => {
         void save();
       }}
-      disabled={!loaded || !dirty}>Save</button
+      disabled={!loaded || !uiState.editorDirty}>Save</button
     >
   </div>
   <div class="body" class:graph={graph !== null}>
@@ -179,7 +184,7 @@
         spellcheck="false"
         bind:value={text}
         oninput={() => {
-          dirty = true;
+          markDirty();
         }}
       ></textarea>
       <aside class="side">

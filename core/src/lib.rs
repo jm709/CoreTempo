@@ -14,6 +14,15 @@ pub mod api;
 pub mod bus;
 
 #[cfg(feature = "server")]
+pub mod claude_config;
+
+#[cfg(feature = "server")]
+pub mod locks;
+
+#[cfg(feature = "server")]
+pub mod mcp;
+
+#[cfg(feature = "server")]
 pub mod pty;
 
 #[cfg(feature = "server")]
@@ -30,6 +39,12 @@ pub mod store;
 
 #[cfg(feature = "server")]
 pub mod trigger;
+
+#[cfg(feature = "server")]
+pub mod user_config;
+
+#[cfg(feature = "server")]
+pub mod trust;
 
 #[cfg(feature = "server")]
 pub mod workflow;

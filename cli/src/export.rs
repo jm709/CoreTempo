@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
-use coretempo_core::export::{dockerfile, systemd_unit};
+use coretempo_core::export::{dockerfile, export_target, systemd_unit};
 use coretempo_core::types::WorkflowResponse;
 
 use crate::client::Client;
 
 /// Fetches `GET /v1/workflow` and writes the export directory, creating it if needed.
-pub fn cmd_export(client: &Client, dir: &Path) -> anyhow::Result<ExitCode> {
+pub fn cmd_export(client: &Client, dir: &Path, flow: Option<&str>) -> anyhow::Result<ExitCode> {
     let value = client.get("/workflow")?;
     let response: WorkflowResponse = serde_json::from_value(value)?;
     let config = toml::to_string_pretty(&response.workflow)
@@ -22,14 +22,15 @@ pub fn cmd_export(client: &Client, dir: &Path) -> anyhow::Result<ExitCode> {
     let config_path = write(dir, "tempo.toml", &config)?;
     // The unit runs on the host, so it needs the absolute path of the file just written.
     let absolute = std::path::absolute(&config_path).unwrap_or(config_path);
-    let trigger = response.workflow.trigger.as_ref().map(|t| t.trigger_type);
+    let target = export_target(&response.workflow, flow)
+        .map_err(|reason| anyhow::anyhow!("cannot export: {reason}"))?;
     let unit = systemd_unit(
         &response.workflow.workflow.name,
         &absolute.to_string_lossy(),
-        trigger,
+        &target,
     );
     write(dir, "coretempo.service", &unit)?;
-    write(dir, "Dockerfile", &dockerfile(trigger))?;
+    write(dir, "Dockerfile", &dockerfile(&target))?;
     Ok(ExitCode::SUCCESS)
 }
 

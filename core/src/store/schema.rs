@@ -1,5 +1,4 @@
-//! DDL for the v1 tables (spec §11): `messages` (the canonical record, §3.2), `runs`,
-//! and `agent_events`.
+//! DDL for the tables (spec §11): `messages` (the canonical record, §3.2) and `runs`.
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
@@ -14,7 +13,10 @@ CREATE TABLE IF NOT EXISTS messages (
   reply        TEXT,
   created_at   TEXT NOT NULL,
   injected_at  TEXT,
-  completed_at TEXT
+  completed_at TEXT,
+  run_id       TEXT,
+  reason       TEXT,
+  reason_code  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages (created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_to_status ON messages (to_agent, status);
@@ -25,13 +27,5 @@ CREATE TABLE IF NOT EXISTS runs (
   workflow_hash TEXT NOT NULL,
   started_at    TEXT NOT NULL,
   stopped_at    TEXT
-);
-
-CREATE TABLE IF NOT EXISTS agent_events (
-  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  agent     TEXT NOT NULL,
-  state     TEXT NOT NULL,
-  exit_code INTEGER,
-  ts        TEXT NOT NULL
 );
 ";

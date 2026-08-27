@@ -12,7 +12,8 @@ afterEach(async () => {
   server = undefined;
 });
 
-const client = (url: string) => new CoreTempoClient({ baseUrl: url, token: "tok-123" });
+const client = (url: string) =>
+  new CoreTempoClient({ baseUrl: url, token: "tok-123", flow: "post" });
 
 describe("fire", () => {
   it("POSTs the body verbatim with the bearer token and returns the accepted id", async () => {
@@ -22,7 +23,7 @@ describe("fire", () => {
     const accepted = await client(server.url).fire("translate to French: hello");
     expect(accepted).toEqual({ triggerId: "t-aa11bb22", position: 3 });
     expect(server.requests[0]?.method).toBe("POST");
-    expect(server.requests[0]?.url).toBe("/v1/trigger");
+    expect(server.requests[0]?.url).toBe("/v1/flows/post/trigger");
     expect(server.requests[0]?.authorization).toBe("Bearer tok-123");
     expect(server.requests[0]?.body).toBe("translate to French: hello");
   });
@@ -60,15 +61,23 @@ describe("fire", () => {
     server = await startScriptedServer([
       { status: 202, body: { trigger_id: "t-aa11bb22", position: 0 } },
     ]);
-    await new CoreTempoClient({ baseUrl: `${server.url}/`, token: "tok-123" }).fire("x");
-    expect(server.requests[0]?.url).toBe("/v1/trigger");
+    await new CoreTempoClient({ baseUrl: `${server.url}/`, token: "tok-123", flow: "post" }).fire(
+      "x",
+    );
+    expect(server.requests[0]?.url).toBe("/v1/flows/post/trigger");
   });
 
   it("wraps a connection failure in CoreTempoRequestError naming the URL", async () => {
-    const unreachable = new CoreTempoClient({ baseUrl: "http://127.0.0.1:9", token: "t" });
+    const unreachable = new CoreTempoClient({
+      baseUrl: "http://127.0.0.1:9",
+      token: "t",
+      flow: "post",
+    });
     const error = await unreachable.fire("x").catch((e: unknown) => e);
     expect(error).toBeInstanceOf(CoreTempoRequestError);
-    expect((error as CoreTempoRequestError).url).toContain("http://127.0.0.1:9/v1/trigger");
+    expect((error as CoreTempoRequestError).url).toContain(
+      "http://127.0.0.1:9/v1/flows/post/trigger",
+    );
     expect((error as CoreTempoRequestError).cause).toBeDefined();
   });
 });
@@ -138,7 +147,7 @@ describe("trigger", () => {
     expect(outcome.status).toBe("completed");
     if (outcome.status !== "completed") return;
     expect(outcome.output.translations).toEqual(["bonjour"]);
-    expect(server.requests[0]?.url).toBe("/v1/trigger?wait=30");
+    expect(server.requests[0]?.url).toBe("/v1/flows/post/trigger?wait=30");
   });
 
   it("falls back to GET polling on a 202, riding out queued and running", async () => {
@@ -164,7 +173,7 @@ describe("trigger", () => {
       reasonCode: "agent_exited",
     });
     expect(server.requests.map((r) => r.url)).toEqual([
-      "/v1/trigger?wait=30",
+      "/v1/flows/post/trigger?wait=30",
       "/v1/trigger/t-aa11bb22",
       "/v1/trigger/t-aa11bb22",
       "/v1/trigger/t-aa11bb22",
@@ -176,7 +185,7 @@ describe("trigger", () => {
       { status: 200, body: { trigger_id: "t-aa11bb22", status: "completed", result: "quiesced" } },
     ]);
     await client(server.url).trigger("go", { waitSecs: 120 });
-    expect(server.requests[0]?.url).toBe("/v1/trigger?wait=120");
+    expect(server.requests[0]?.url).toBe("/v1/flows/post/trigger?wait=120");
   });
 
   it("aborts polling when the signal fires", async () => {
@@ -247,5 +256,21 @@ describe("waitForOutcome", () => {
     ]);
     const outcome = await client(server.url).waitForOutcome("t-aa11bb22", { pollIntervalMs: 5 });
     expect(outcome).toEqual({ status: "declined", triggerId: "t-aa11bb22", code: 1, reply: "no" });
+  });
+});
+
+describe("flow option", () => {
+  it("is required and non-empty", () => {
+    expect(() => new CoreTempoClient({ baseUrl: "http://x", token: "t", flow: "" })).toThrow(
+      /flow/,
+    );
+  });
+
+  it("is URI-encoded into the trigger path", async () => {
+    server = await startScriptedServer([
+      { status: 202, body: { trigger_id: "t-aa11bb22", position: 0 } },
+    ]);
+    await new CoreTempoClient({ baseUrl: server.url, token: "t", flow: "flow-1" }).fire("x");
+    expect(server.requests[0]?.url).toBe("/v1/flows/flow-1/trigger");
   });
 });
