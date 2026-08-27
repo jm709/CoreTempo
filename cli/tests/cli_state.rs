@@ -23,7 +23,10 @@ fn state_posts_the_reported_state_for_the_calling_agent() -> anyhow::Result<()> 
     );
     assert_eq!(reqs[0].header("x-coretempo-agent"), Some("builder"));
     let body: serde_json::Value = serde_json::from_str(&reqs[0].body)?;
-    assert_eq!(body, serde_json::json!({"state": "working"}));
+    assert_eq!(
+        body,
+        serde_json::json!({"state": "working", "claude_session_id": null})
+    );
     Ok(())
 }
 
@@ -38,7 +41,10 @@ fn state_idle_is_accepted() -> anyhow::Result<()> {
     let reqs = srv.requests();
     assert_eq!(reqs[0].path, "/v1/agents/planner/state");
     let body: serde_json::Value = serde_json::from_str(&reqs[0].body)?;
-    assert_eq!(body, serde_json::json!({"state": "idle"}));
+    assert_eq!(
+        body,
+        serde_json::json!({"state": "idle", "claude_session_id": null})
+    );
     Ok(())
 }
 
@@ -79,7 +85,9 @@ fn state_blocked_forwards_the_tool_name_from_hook_stdin() -> anyhow::Result<()> 
     let body: serde_json::Value = serde_json::from_str(&reqs[0].body)?;
     assert_eq!(
         body,
-        serde_json::json!({"state": "blocked", "tool": "Read", "agent_id": null}),
+        serde_json::json!({
+            "state": "blocked", "tool": "Read", "agent_id": null, "claude_session_id": null
+        }),
         "a main-session payload carries no agent_id"
     );
     Ok(())
@@ -107,6 +115,7 @@ fn state_blocked_forwards_the_hook_agent_id() -> anyhow::Result<()> {
             "state": "blocked",
             "tool": "Bash",
             "agent_id": "a9c81c1e4a5cf2bbe",
+            "claude_session_id": null,
         })
     );
     Ok(())
@@ -126,7 +135,9 @@ fn state_blocked_tolerates_missing_or_invalid_stdin() -> anyhow::Result<()> {
         let body: serde_json::Value = serde_json::from_str(&req.body)?;
         assert_eq!(
             body,
-            serde_json::json!({"state": "blocked", "tool": null, "agent_id": null})
+            serde_json::json!({
+                "state": "blocked", "tool": null, "agent_id": null, "claude_session_id": null
+            })
         );
     }
     Ok(())
@@ -158,12 +169,16 @@ fn state_unblocked_forwards_only_the_hook_agent_id() -> anyhow::Result<()> {
     let first: serde_json::Value = serde_json::from_str(&reqs[0].body)?;
     assert_eq!(
         first,
-        serde_json::json!({"state": "unblocked", "agent_id": "ac3cef2916066bf6d"})
+        serde_json::json!({
+            "state": "unblocked", "agent_id": "ac3cef2916066bf6d", "claude_session_id": null
+        })
     );
     let second: serde_json::Value = serde_json::from_str(&reqs[1].body)?;
     assert_eq!(
         second,
-        serde_json::json!({"state": "unblocked", "agent_id": null}),
+        serde_json::json!({
+            "state": "unblocked", "agent_id": null, "claude_session_id": null
+        }),
         "a main-session payload has no agent_id"
     );
     Ok(())
@@ -209,7 +224,8 @@ fn state_refused_prints_a_deny_decision_and_reports_the_tool() -> anyhow::Result
     assert_eq!(
         body,
         serde_json::json!({
-            "state": "refused", "tool": "Bash", "input": "mkdir probe", "agent_id": null
+            "state": "refused", "tool": "Bash", "input": "mkdir probe", "agent_id": null,
+            "claude_session_id": null
         }),
         "a Bash refusal carries the command"
     );
@@ -290,5 +306,34 @@ fn state_refused_without_a_payload_still_denies() -> anyhow::Result<()> {
     let out = tempo_with_stdin(&["state", "refused"], srv.port, Some("builder"), "")?;
     assert_eq!(exit_code(&out), 0, "stderr: {}", stderr(&out));
     assert_eq!(decision(&stdout(&out))?["decision"]["behavior"], "deny");
+    Ok(())
+}
+
+#[test]
+fn state_forwards_the_hook_payloads_session_id() -> anyhow::Result<()> {
+    let srv = serve(vec![(
+        200,
+        r#"{"agent":"s-1f2e3d4c","state":"idle"}"#.to_string(),
+    )])?;
+    let stdin = r#"{"hook_event_name":"SessionStart","session_id":"0f9c1b2a-4d5e","cwd":"/w"}"#;
+    let out = tempo_with_stdin(&["state", "idle"], srv.port, Some("s-1f2e3d4c"), stdin)?;
+    assert_eq!(exit_code(&out), 0, "stderr: {}", stderr(&out));
+    let reqs = srv.requests();
+    let body: serde_json::Value = serde_json::from_str(&reqs[0].body)?;
+    assert_eq!(body["state"], "idle");
+    assert_eq!(body["claude_session_id"], "0f9c1b2a-4d5e");
+    Ok(())
+}
+
+#[test]
+fn state_without_a_payload_sends_a_null_session_id() -> anyhow::Result<()> {
+    let srv = serve(vec![(
+        200,
+        r#"{"agent":"builder","state":"working"}"#.to_string(),
+    )])?;
+    let out = tempo(&["state", "working"], srv.port, Some("builder"))?;
+    assert_eq!(exit_code(&out), 0, "stderr: {}", stderr(&out));
+    let body: serde_json::Value = serde_json::from_str(&srv.requests()[0].body)?;
+    assert_eq!(body["claude_session_id"], serde_json::Value::Null);
     Ok(())
 }

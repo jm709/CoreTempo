@@ -222,7 +222,7 @@ fn cmd_state(client: &Client, state: StateArg) -> anyhow::Result<ExitCode> {
     if state == ReportedState::Refused {
         return Ok(refuse_permission(client, agent, payload));
     }
-    let body = match state {
+    let mut body = match state {
         // A subagent's dialog fires the parent's PermissionRequest hook, and a
         // sibling helper agent fires PostToolBatch for tools it did not run, so
         // both reports carry the hook payload's agent_id to scope the clear.
@@ -238,6 +238,9 @@ fn cmd_state(client: &Client, state: StateArg) -> anyhow::Result<ExitCode> {
         ReportedState::Working | ReportedState::Idle => json!({"state": state}),
         ReportedState::Refused => unreachable!("handled above"),
     };
+    // Every hook payload carries the Claude Code session id; the sessions
+    // daemon stores the latest one for `--resume` (spec 2026-08-27 §4).
+    body["claude_session_id"] = json!(hook_field(payload, "session_id"));
     client.post(&format!("/agents/{agent}/state"), &body)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -269,6 +272,7 @@ fn refuse_permission(client: &Client, agent: &str, payload: Option<&str>) -> Exi
         "tool": tool,
         "input": hook_input_summary(payload),
         "agent_id": hook_field(payload, "agent_id"),
+        "claude_session_id": hook_field(payload, "session_id"),
     });
     if let Err(error) = client.post(&format!("/agents/{agent}/state"), &body) {
         eprintln!("tempo: could not report the refusal to CoreTempo: {error}");
