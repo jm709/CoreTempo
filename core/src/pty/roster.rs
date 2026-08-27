@@ -33,7 +33,9 @@ pub struct RosterEntry {
     pub config_dir: Option<PathBuf>,
     /// Overrides `AgentEnv::token` as `CORETEMPO_TOKEN` (per-session hook tokens).
     pub token: Option<Token>,
-    /// `--resume <claude_session_id>` for the next spawn only; `spawn` consumes it.
+    /// `--resume <claude_session_id>` for the next spawn only; consumed by the
+    /// next spawn that succeeds. A spawn refused by a [`crate::pty::SpawnGate`]
+    /// or that fails to open a pty leaves it armed for the next attempt.
     pub resume: Option<String>,
 }
 

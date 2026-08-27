@@ -89,7 +89,7 @@ pub enum InjectError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
-    #[error("unknown agent '{0}'; the roster is frozen in tempo.toml")]
+    #[error("unknown agent '{0}'; not in the roster")]
     UnknownAgent(AgentId),
     #[error("agent '{0}' has exited; restart it first")]
     AgentExited(AgentId),
@@ -97,6 +97,8 @@ pub enum PtyError {
     Spawn { agent: AgentId, reason: String },
     #[error("pty i/o for agent '{agent}' failed: {reason}")]
     Io { agent: AgentId, reason: String },
+    #[error("agent '{0}' already exists in the roster")]
+    AgentExists(AgentId),
 }
 
 /// Implemented by `PtyManager`; the ONLY write path the router uses.
@@ -262,7 +264,8 @@ enum UnblockOutcome {
 }
 
 struct AgentHandle {
-    /// The spawn inputs for this agent; `resume` is consumed by `spawn`.
+    /// The spawn inputs for this agent; `resume` is consumed by the next
+    /// spawn that succeeds.
     entry: RosterEntry,
     raw_tx: watch::Sender<AgentState>,
     debounced_rx: watch::Receiver<AgentState>,
@@ -292,10 +295,6 @@ struct AgentHandle {
 
 pub struct PtyManager {
     /// The roster's debounce, kept for agents added after construction.
-    #[expect(
-        dead_code,
-        reason = "read by the add_agent path; nothing adds agents to a workflow run"
-    )]
     idle_debounce: Duration,
     bus: EventBus,
     env: AgentEnv,
@@ -415,7 +414,7 @@ fn default_pty_size() -> portable_pty::PtySize {
 }
 
 /// One agent's channels, ring, queue worker and write pump, before any spawn.
-/// Shared by construction and, once it lands, `PtyManager::add_agent`.
+/// Shared by construction and, once it lands, [`PtyManager::add_agent`].
 fn new_handle(
     id: &AgentId,
     entry: RosterEntry,
@@ -530,6 +529,37 @@ impl PtyManager {
         }
     }
 
+    /// Adds an agent to the roster without spawning it: creates its channels,
+    /// ring, queue worker and write pump. Call [`PtyManager::spawn`] next.
+    /// Must be called inside a tokio runtime (spawns per-agent workers).
+    ///
+    /// # Errors
+    /// [`PtyError::AgentExists`] if the id is already in the roster.
+    pub fn add_agent(&self, id: AgentId, entry: RosterEntry) -> Result<(), PtyError> {
+        let mut agents = lock(&self.agents);
+        if agents.contains_key(&id) {
+            return Err(PtyError::AgentExists(id));
+        }
+        let handle = new_handle(&id, entry, self.idle_debounce, &self.clear_gate);
+        agents.insert(id, handle);
+        Ok(())
+    }
+
+    /// Sets (or clears) the `--resume <claude_session_id>` the next spawn of
+    /// `agent` passes. Consumed by the next spawn that succeeds; a refused or
+    /// failed spawn leaves it armed, and a later respawn never reuses it.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] off-roster.
+    pub fn set_resume(&self, agent: &AgentId, resume: Option<String>) -> Result<(), PtyError> {
+        let mut agents = lock(&self.agents);
+        let handle = agents
+            .get_mut(agent)
+            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+        handle.entry.resume = resume;
+        Ok(())
+    }
+
     /// Spawns every agent in the roster, in lexicographic order.
     ///
     /// # Errors
@@ -562,9 +592,11 @@ impl PtyManager {
             if handle.session.is_some() {
                 return Ok(());
             }
-            // `resume` is for this spawn only; a later respawn must not reuse it.
+            // `resume` is for this spawn only; only cleared once this spawn
+            // actually lands a session (below) so a refused or failed attempt
+            // leaves it armed for the next one.
             let entry = RosterEntry {
-                resume: handle.entry.resume.take(),
+                resume: handle.entry.resume.clone(),
                 ..handle.entry.clone()
             };
             (entry, handle.size)
@@ -600,6 +632,8 @@ impl PtyManager {
             *lock(&handle.writer_slot) = Some(writer);
             handle.exit = None;
             handle.session = Some(session);
+            // This spawn landed a session; the resume id (if any) is consumed.
+            handle.entry.resume = None;
             spawn_reader(reader, raw_bytes_tx, Arc::clone(&handle.pause));
             tokio::spawn(pipeline(
                 Arc::clone(&handle.hub),
