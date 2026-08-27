@@ -637,6 +637,20 @@ impl PtyManager {
                         "kill after agent vanished mid-spawn failed"
                     );
                 }
+                // Nothing will `wait` this child otherwise: the reaper thread
+                // below is never started on this path, and an unreaped child
+                // is a zombie until the daemon exits. `exited_tx` is dropped
+                // with it; nobody awaits that oneshot here.
+                let reap_agent = agent.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = child.wait() {
+                        tracing::debug!(
+                            agent = %reap_agent,
+                            error = %err,
+                            "mid-spawn reap failed"
+                        );
+                    }
+                });
                 return Err(PtyError::UnknownAgent(agent.clone()));
             };
             my_epoch = *handle.epoch_tx.borrow();
@@ -1329,6 +1343,27 @@ impl PtyManager {
             .get(agent)
             .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
         Ok(handle.queue_depth.load(Ordering::SeqCst))
+    }
+
+    /// Every id in the roster, live or not, in id order. The sessions
+    /// daemon's `Roster` (amendment 47) is this set.
+    #[must_use]
+    pub fn agent_ids(&self) -> Vec<AgentId> {
+        lock(&self.agents).keys().cloned().collect()
+    }
+
+    /// Whether the agent has a running process right now. `false` for an
+    /// added-but-unspawned agent and after `stop`/exit — the raw state alone
+    /// cannot tell those apart from `Starting`.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
+    pub fn is_live(&self, agent: &AgentId) -> Result<bool, PtyError> {
+        let agents = lock(&self.agents);
+        let handle = agents
+            .get(agent)
+            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+        Ok(handle.session.is_some())
     }
 }
 
