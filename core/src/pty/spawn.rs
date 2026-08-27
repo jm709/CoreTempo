@@ -1,16 +1,17 @@
-//! Spawn recipe (spec §4.1): `claude` at the agent's frozen `dir` with
-//! `--append-system-prompt` (the role prompt plus the protocol primer, built by
-//! [`crate::types::config::FrozenWorkflow::system_prompt`]), optional
-//! `--model`/`--permission-mode`, `--settings` pointing at the run's turn-boundary
-//! hooks, `--strict-mcp-config` always plus `--mcp-config` for agents that opted
-//! into MCP servers (spec 2026-08-17 §2), and the `CORETEMPO_*` env with `tempo`
+//! Spawn recipe (spec §4.1, amended by spec 2026-08-27 §4): `claude` at the
+//! entry's `dir` with, per [`RosterEntry`], an optional `--append-system-prompt`
+//! (the role prompt plus the protocol primer for workflow agents, built by
+//! [`crate::types::config::FrozenWorkflow::system_prompt`]; omitted for
+//! sessions), optional `--model`/`--permission-mode`, optional `--resume`,
+//! optional `--settings`, the MCP policy (`--strict-mcp-config` plus an
+//! optional `--mcp-config`, or neither), and the `CORETEMPO_*` env with `tempo`
 //! on PATH plus `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` for
-//! `isolated_config` agents (spec 2026-08-24 §2, §4).
+//! entries with a config dir (spec 2026-08-24 §2, §4).
 
 use std::path::PathBuf;
 
 use crate::pty::AgentEnv;
-use crate::types::config::AgentConfig;
+use crate::pty::roster::{McpPolicy, RosterEntry};
 use crate::types::id::AgentId;
 
 pub(crate) struct SpawnSpec {
@@ -38,25 +39,25 @@ where
 /// single-argument call as it grows (precedent: `PipelineCtx`).
 pub(crate) struct SpawnInputs<'a> {
     pub(crate) id: &'a AgentId,
-    pub(crate) cfg: &'a AgentConfig,
+    pub(crate) entry: &'a RosterEntry,
     pub(crate) env: &'a AgentEnv,
     pub(crate) program: &'a str,
-    pub(crate) system_prompt: &'a str,
 }
 
 pub(crate) fn spawn_spec(inputs: &SpawnInputs<'_>) -> SpawnSpec {
     let SpawnInputs {
         id,
-        cfg,
+        entry,
         env,
         program,
-        system_prompt,
     } = *inputs;
+    let cfg = &entry.cfg;
 
-    let mut args = vec![
-        "--append-system-prompt".to_string(),
-        system_prompt.to_string(),
-    ];
+    let mut args = Vec::new();
+    if let Some(prompt) = &entry.system_prompt {
+        args.push("--append-system-prompt".to_string());
+        args.push(prompt.clone());
+    }
     if let Some(model) = &cfg.model {
         args.push("--model".to_string());
         args.push(model.clone());
@@ -65,14 +66,23 @@ pub(crate) fn spawn_spec(inputs: &SpawnInputs<'_>) -> SpawnSpec {
         args.push("--permission-mode".to_string());
         args.push(mode.clone());
     }
-    if let Some(settings) = env.settings_paths.get(id) {
+    if let Some(session) = &entry.resume {
+        args.push("--resume".to_string());
+        args.push(session.clone());
+    }
+    if let Some(settings) = &entry.settings_path {
         args.push("--settings".to_string());
         args.push(settings.to_string_lossy().into_owned());
     }
-    args.push("--strict-mcp-config".to_string());
-    if let Some(mcp) = env.mcp_paths.get(id) {
-        args.push("--mcp-config".to_string());
-        args.push(mcp.to_string_lossy().into_owned());
+    match &entry.mcp {
+        McpPolicy::Strict(file) => {
+            args.push("--strict-mcp-config".to_string());
+            if let Some(mcp) = file {
+                args.push("--mcp-config".to_string());
+                args.push(mcp.to_string_lossy().into_owned());
+            }
+        }
+        McpPolicy::Inherit => {}
     }
 
     let inherited = std::env::var_os("PATH").unwrap_or_default();
@@ -83,13 +93,14 @@ pub(crate) fn spawn_spec(inputs: &SpawnInputs<'_>) -> SpawnSpec {
         |p| p.to_string_lossy().into_owned(),
     );
 
+    let token = entry.token.as_ref().unwrap_or(&env.token);
     let mut env_vars = vec![
         ("CORETEMPO_AGENT_ID".to_string(), id.0.clone()),
         ("CORETEMPO_PORT".to_string(), env.port.to_string()),
-        ("CORETEMPO_TOKEN".to_string(), env.token.0.clone()),
+        ("CORETEMPO_TOKEN".to_string(), token.0.clone()),
         ("PATH".to_string(), path_value),
     ];
-    if let Some(dir) = env.config_dirs.get(id) {
+    if let Some(dir) = &entry.config_dir {
         env_vars.push((
             "CLAUDE_CONFIG_DIR".to_string(),
             dir.to_string_lossy().into_owned(),
@@ -129,18 +140,23 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::pty::AgentEnv;
+    use crate::pty::roster::{McpPolicy, RosterEntry};
     use crate::pty::spawn::{SpawnInputs, spawn_spec};
     use crate::types::config::AgentConfig;
     use crate::types::id::{AgentId, Token};
 
-    fn cfg(model: Option<&str>, mode: Option<&str>) -> AgentConfig {
-        AgentConfig {
+    fn entry(model: Option<&str>, mode: Option<&str>) -> RosterEntry {
+        let cfg = AgentConfig {
             model: model.map(str::to_string),
             permission_mode: mode.map(str::to_string),
             ..AgentConfig::new(
                 PathBuf::from("/home/u/projects/CoreTempo"),
                 "You are the planning agent",
             )
+        };
+        RosterEntry {
+            system_prompt: Some("You are the planning agent".to_string()),
+            ..RosterEntry::new(cfg)
         }
     }
 
@@ -149,29 +165,32 @@ mod tests {
             port: 4820,
             token: Token("ab".repeat(32)),
             tempo_bin_dir: PathBuf::from("/opt/coretempo/bin"),
-            settings_paths: std::collections::BTreeMap::new(),
-            mcp_paths: std::collections::BTreeMap::new(),
-            config_dirs: std::collections::BTreeMap::new(),
             credential_store: Some(PathBuf::from("/home/u/.claude")),
         }
     }
 
-    fn inputs<'a>(id: &'a AgentId, cfg: &'a AgentConfig, env: &'a AgentEnv) -> SpawnInputs<'a> {
+    fn inputs<'a>(id: &'a AgentId, entry: &'a RosterEntry, env: &'a AgentEnv) -> SpawnInputs<'a> {
         SpawnInputs {
             id,
-            cfg,
+            entry,
             env,
             program: "claude",
-            system_prompt: "You are the planning agent",
         }
+    }
+
+    fn get(spec: &super::SpawnSpec, k: &str) -> Option<String> {
+        spec.env
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
     }
 
     #[test]
     fn minimal_spec_has_prompt_env_and_cwd() {
         let id = AgentId("planner".into());
-        let cfg = cfg(None, None);
+        let entry = entry(None, None);
         let env = env();
-        let spec = spawn_spec(&inputs(&id, &cfg, &env));
+        let spec = spawn_spec(&inputs(&id, &entry, &env));
         assert_eq!(spec.program, "claude");
         assert_eq!(
             spec.args,
@@ -180,22 +199,16 @@ mod tests {
                 "You are the planning agent",
                 "--strict-mcp-config"
             ],
-            "strict MCP is unconditional: no --mcp-config means zero servers"
+            "strict MCP is the workflow default: no --mcp-config means zero servers"
         );
         assert_eq!(spec.cwd, PathBuf::from("/home/u/projects/CoreTempo"));
-        let get = |k: &str| {
-            spec.env
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.clone())
-        };
-        assert_eq!(get("CORETEMPO_AGENT_ID").as_deref(), Some("planner"));
-        assert_eq!(get("CORETEMPO_PORT").as_deref(), Some("4820"));
+        assert_eq!(get(&spec, "CORETEMPO_AGENT_ID").as_deref(), Some("planner"));
+        assert_eq!(get(&spec, "CORETEMPO_PORT").as_deref(), Some("4820"));
         assert_eq!(
-            get("CORETEMPO_TOKEN").as_deref(),
+            get(&spec, "CORETEMPO_TOKEN").as_deref(),
             Some("ab".repeat(32).as_str())
         );
-        let path = get("PATH").unwrap();
+        let path = get(&spec, "PATH").unwrap();
         assert!(
             path.starts_with("/opt/coretempo/bin"),
             "tempo dir prepended, got {path}"
@@ -205,9 +218,9 @@ mod tests {
     #[test]
     fn optional_flags_pass_through_in_order() {
         let id = AgentId("builder".into());
-        let cfg = cfg(Some("opus"), Some("acceptEdits"));
+        let entry = entry(Some("opus"), Some("acceptEdits"));
         let env = env();
-        let spec = spawn_spec(&inputs(&id, &cfg, &env));
+        let spec = spawn_spec(&inputs(&id, &entry, &env));
         assert_eq!(
             spec.args,
             vec![
@@ -223,20 +236,16 @@ mod tests {
     }
 
     #[test]
-    fn agents_with_mcp_get_their_own_config_file_last() {
+    fn strict_with_a_file_puts_mcp_config_last() {
         let id = AgentId("resolver".into());
-        let other = AgentId("helper".into());
-        let cfg = cfg(None, None);
-        let mut env = env();
-        env.settings_paths.insert(
-            id.clone(),
-            PathBuf::from("/home/u/.coretempo/runs/r1/agent-settings-resolver.json"),
-        );
-        env.mcp_paths.insert(
-            id.clone(),
-            PathBuf::from("/home/u/.coretempo/runs/r1/agent-mcp-resolver.json"),
-        );
-        let spec = spawn_spec(&inputs(&id, &cfg, &env));
+        let mut entry = entry(None, None);
+        entry.settings_path = Some(PathBuf::from(
+            "/home/u/.coretempo/runs/r1/agent-settings-resolver.json",
+        ));
+        entry.mcp = McpPolicy::Strict(Some(PathBuf::from(
+            "/home/u/.coretempo/runs/r1/agent-mcp-resolver.json",
+        )));
+        let spec = spawn_spec(&inputs(&id, &entry, &env()));
         let n = spec.args.len();
         assert_eq!(
             &spec.args[n - 3..],
@@ -248,26 +257,68 @@ mod tests {
             "--mcp-config is variadic in claude, so it must be the final flag: {:?}",
             spec.args
         );
-        let spec = spawn_spec(&inputs(&other, &cfg, &env));
-        assert!(spec.args.contains(&"--strict-mcp-config".to_string()));
+    }
+
+    #[test]
+    fn inherit_passes_no_mcp_flags() {
+        let id = AgentId("s-1".into());
+        let mut entry = entry(None, None);
+        entry.mcp = McpPolicy::Inherit;
+        let spec = spawn_spec(&inputs(&id, &entry, &env()));
         assert!(
-            !spec.args.contains(&"--mcp-config".to_string()),
-            "no file for helper: {:?}",
+            !spec
+                .args
+                .iter()
+                .any(|a| a.starts_with("--strict-mcp") || a == "--mcp-config"),
+            "a session inherits the operator's MCP setup: {:?}",
             spec.args
+        );
+    }
+
+    #[test]
+    fn no_system_prompt_omits_the_flag() {
+        let id = AgentId("s-1".into());
+        let mut entry = entry(Some("haiku"), None);
+        entry.system_prompt = None;
+        let spec = spawn_spec(&inputs(&id, &entry, &env()));
+        assert_eq!(
+            spec.args,
+            vec!["--model", "haiku", "--strict-mcp-config"],
+            "sessions get no protocol primer"
+        );
+    }
+
+    #[test]
+    fn resume_sits_before_settings() {
+        let id = AgentId("s-1".into());
+        let mut entry = entry(None, None);
+        entry.resume = Some("0f3a-claude".to_string());
+        entry.settings_path = Some(PathBuf::from(
+            "/home/u/.coretempo/sessions/s-1/settings.json",
+        ));
+        let spec = spawn_spec(&inputs(&id, &entry, &env()));
+        assert_eq!(
+            spec.args,
+            vec![
+                "--append-system-prompt",
+                "You are the planning agent",
+                "--resume",
+                "0f3a-claude",
+                "--settings",
+                "/home/u/.coretempo/sessions/s-1/settings.json",
+                "--strict-mcp-config",
+            ]
         );
     }
 
     #[test]
     fn agents_get_their_own_settings_file() {
         let id = AgentId("pa".into());
-        let other = AgentId("helper".into());
-        let cfg = cfg(None, None);
-        let mut env = env();
-        env.settings_paths.insert(
-            id.clone(),
-            PathBuf::from("/home/u/.coretempo/runs/r1/agent-settings-pa.json"),
-        );
-        let spec = spawn_spec(&inputs(&id, &cfg, &env));
+        let mut entry = entry(None, None);
+        entry.settings_path = Some(PathBuf::from(
+            "/home/u/.coretempo/runs/r1/agent-settings-pa.json",
+        ));
+        let spec = spawn_spec(&inputs(&id, &entry, &env()));
         let pos = spec
             .args
             .iter()
@@ -277,31 +328,39 @@ mod tests {
             spec.args[pos + 1],
             "/home/u/.coretempo/runs/r1/agent-settings-pa.json"
         );
-        let spec = spawn_spec(&inputs(&other, &cfg, &env));
+        let plain = RosterEntry::new(AgentConfig::new(
+            PathBuf::from("/home/u/projects/CoreTempo"),
+            "x",
+        ));
+        let spec = spawn_spec(&inputs(&id, &plain, &env()));
         assert!(
             !spec.args.contains(&"--settings".to_string()),
-            "no file for helper: {:?}",
+            "no file: {:?}",
             spec.args
+        );
+    }
+
+    #[test]
+    fn entry_token_overrides_the_env_token() {
+        let id = AgentId("s-1".into());
+        let mut entry = entry(None, None);
+        entry.token = Some(Token("cd".repeat(32)));
+        let spec = spawn_spec(&inputs(&id, &entry, &env()));
+        assert_eq!(
+            get(&spec, "CORETEMPO_TOKEN").as_deref(),
+            Some("cd".repeat(32).as_str()),
+            "a session exports its own hook token"
         );
     }
 
     #[test]
     fn isolated_agents_get_config_dir_and_credential_store_and_others_do_not() {
         let iso = AgentId("iso".into());
-        let plain = AgentId("plain".into());
-        let cfg = cfg(None, None);
-        let mut env = env();
-        env.config_dirs.insert(
-            iso.clone(),
-            PathBuf::from("/home/u/.coretempo/runs/r1/claude-config-iso"),
-        );
-        let get = |spec: &super::SpawnSpec, k: &str| {
-            spec.env
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.clone())
-        };
-        let spec = spawn_spec(&inputs(&iso, &cfg, &env));
+        let mut isolated = entry(None, None);
+        isolated.config_dir = Some(PathBuf::from(
+            "/home/u/.coretempo/runs/r1/claude-config-iso",
+        ));
+        let spec = spawn_spec(&inputs(&iso, &isolated, &env()));
         assert_eq!(
             get(&spec, "CLAUDE_CONFIG_DIR").as_deref(),
             Some("/home/u/.coretempo/runs/r1/claude-config-iso")
@@ -311,7 +370,8 @@ mod tests {
             Some("/home/u/.claude"),
             "an isolated agent reads and refreshes the operator's credentials in place"
         );
-        let spec = spawn_spec(&inputs(&plain, &cfg, &env));
+        let plain = AgentId("plain".into());
+        let spec = spawn_spec(&inputs(&plain, &entry(None, None), &env()));
         assert_eq!(
             get(&spec, "CLAUDE_CONFIG_DIR"),
             None,
@@ -324,21 +384,18 @@ mod tests {
     #[test]
     fn an_unknown_credential_store_sets_only_the_config_dir() {
         let iso = AgentId("iso".into());
-        let cfg = cfg(None, None);
         let mut env = env();
         env.credential_store = None;
-        env.config_dirs
-            .insert(iso.clone(), PathBuf::from("/runs/r1/claude-config-iso"));
-        let spec = spawn_spec(&inputs(&iso, &cfg, &env));
-        assert!(spec.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
-        assert!(
-            !spec
-                .env
-                .iter()
-                .any(|(k, _)| k == "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
-            "nothing to point at, so the var is left alone: {:?}",
-            spec.env
+        let mut isolated = entry(None, None);
+        isolated.config_dir = Some(PathBuf::from(
+            "/home/u/.coretempo/runs/r1/claude-config-iso",
+        ));
+        let spec = spawn_spec(&inputs(&iso, &isolated, &env));
+        assert_eq!(
+            get(&spec, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/home/u/.coretempo/runs/r1/claude-config-iso")
         );
+        assert_eq!(get(&spec, "CLAUDE_SECURESTORAGE_CONFIG_DIR"), None);
     }
 
     #[test]
@@ -370,9 +427,9 @@ mod tests {
         // one call under test.
         unsafe { std::env::set_var("CLAUDE_CODE_TEST_LEAK", "1") };
         let id = AgentId("a".to_string());
-        let cfg = cfg(None, None);
+        let entry = entry(None, None);
         let env = env();
-        let spec = spawn_spec(&inputs(&id, &cfg, &env));
+        let spec = spawn_spec(&inputs(&id, &entry, &env));
         // SAFETY: as above.
         unsafe { std::env::remove_var("CLAUDE_CODE_TEST_LEAK") };
         assert!(spec.unset_env.iter().any(|k| k == "CLAUDE_CODE_TEST_LEAK"));

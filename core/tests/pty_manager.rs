@@ -15,9 +15,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use coretempo_core::bus::EventBus;
-use coretempo_core::pty::{AgentEnv, Cursor, InjectError, InjectionQueue, PtyError, PtyManager};
+use coretempo_core::pty::{
+    AgentEnv, Cursor, InjectError, InjectionQueue, PtyError, PtyManager, PtyRoster, RosterEntry,
+};
 use coretempo_core::types::config::AgentConfig;
-use coretempo_core::types::config::FrozenWorkflow;
 use coretempo_core::types::{AgentExit, AgentId, AgentState, EventPayload, LifecyclePhase, Token};
 
 const IDLE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -46,26 +47,22 @@ fn write_fake_agent(dir: &Path) -> PathBuf {
     path
 }
 
-fn workflow(dir: &Path) -> Arc<FrozenWorkflow> {
+fn roster(dir: &Path) -> PtyRoster {
     let mut agents = BTreeMap::new();
     agents.insert(
         AgentId("fake".into()),
-        AgentConfig {
-            auto_clear: false, // auto-/clear behavior is covered by queue unit tests
-            ..AgentConfig::new(dir.to_path_buf(), "test prompt")
+        RosterEntry {
+            system_prompt: Some("test prompt".to_string()),
+            ..RosterEntry::new(AgentConfig {
+                auto_clear: false, // auto-/clear behavior is covered by queue unit tests
+                ..AgentConfig::new(dir.to_path_buf(), "test prompt")
+            })
         },
     );
-    Arc::new(FrozenWorkflow {
-        name: "pty-test".into(),
-        hash: "0".repeat(64),
-        source_path: dir.join("tempo.toml"),
-        ask_timeout: Duration::from_mins(30),
-        idle_debounce: IDLE_DEBOUNCE,
-        scrollback: 5_000,
+    PtyRoster {
         agents,
-        mcp_servers: BTreeMap::new(),
-        flows: BTreeMap::new(),
-    })
+        idle_debounce: IDLE_DEBOUNCE,
+    }
 }
 
 /// Boot-scoped temp dir (no tempdir crate); the OS cleans it up. Each boot gets
@@ -87,13 +84,9 @@ fn fake_manager(dir: &Path) -> (Arc<PtyManager>, EventBus) {
         port: 4820,
         token: Token("ab".repeat(32)),
         tempo_bin_dir: PathBuf::from("/usr/bin"),
-        settings_paths: std::collections::BTreeMap::new(),
-        mcp_paths: std::collections::BTreeMap::new(),
-        config_dirs: std::collections::BTreeMap::new(),
         credential_store: None,
     };
-    let mgr =
-        PtyManager::new_with_program(workflow(dir), bus.clone(), env, script.to_str().unwrap());
+    let mgr = PtyManager::new_with_program(roster(dir), bus.clone(), env, script.to_str().unwrap());
     (mgr, bus)
 }
 
