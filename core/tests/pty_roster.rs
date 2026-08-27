@@ -311,3 +311,51 @@ async fn stop_without_a_live_session_is_an_error() {
     let err = mgr.stop(&AgentId("nope".into())).await.unwrap_err();
     assert!(matches!(err, PtyError::UnknownAgent(_)), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_agent_stops_it_and_ends_its_subscribers() {
+    let dir = fresh_dir();
+    let (mgr, _bus) = empty_manager(&dir);
+    let id = AgentId("s-1".into());
+    mgr.add_agent(id.clone(), entry(&dir)).unwrap();
+    mgr.spawn(&id).await.unwrap();
+    let mut out = mgr.subscribe_output(&id, None).unwrap();
+    let mut state = mgr.subscribe_state_raw(&id).unwrap();
+
+    mgr.remove_agent(&id).await.unwrap();
+
+    // Drain whatever was buffered; the channel must then close.
+    let closed = tokio::time::timeout(DEADLINE, async { while out.recv().await.is_some() {} })
+        .await
+        .is_ok();
+    assert!(closed, "output subscriber ends when the agent is removed");
+    assert!(
+        tokio::time::timeout(DEADLINE, async { while state.changed().await.is_ok() {} })
+            .await
+            .is_ok(),
+        "state subscriber ends when the agent is removed"
+    );
+    assert!(matches!(
+        mgr.state(&id).unwrap_err(),
+        PtyError::UnknownAgent(_)
+    ));
+    assert!(
+        mgr.add_agent(id.clone(), entry(&dir)).is_ok(),
+        "the id is free again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_agent_works_on_a_stopped_agent_too() {
+    let dir = fresh_dir();
+    let (mgr, _bus) = empty_manager(&dir);
+    let id = AgentId("s-1".into());
+    mgr.add_agent(id.clone(), entry(&dir)).unwrap();
+    mgr.spawn(&id).await.unwrap();
+    mgr.stop(&id).await.unwrap();
+    mgr.remove_agent(&id).await.unwrap();
+    assert!(matches!(
+        mgr.remove_agent(&id).await.unwrap_err(),
+        PtyError::UnknownAgent(_)
+    ));
+}

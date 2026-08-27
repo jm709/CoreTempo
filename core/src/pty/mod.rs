@@ -854,6 +854,26 @@ impl PtyManager {
         Ok(())
     }
 
+    /// `stop()` if live, then drop the handle. Output subscribers are closed
+    /// explicitly; the queue worker, write pump and state subscribers end
+    /// when their senders drop with the handle. The id becomes unknown.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] off-roster.
+    pub async fn remove_agent(&self, agent: &AgentId) -> Result<(), PtyError> {
+        match self.stop(agent).await {
+            Ok(()) | Err(PtyError::AgentExited(_)) => {}
+            Err(err) => return Err(err),
+        }
+        let handle = lock(&self.agents)
+            .remove(agent)
+            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+        lock(&handle.hub).subscribers.clear();
+        drop(handle);
+        tracing::info!(agent = %agent, "removed agent from roster");
+        Ok(())
+    }
+
     /// Kills every agent PTY, stops the reader/coalescer/queue tasks, and fails
     /// queued injections with `InjectError::AgentExited`. Returns once every
     /// agent process has actually exited (SIGHUP, then SIGKILL after
