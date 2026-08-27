@@ -610,8 +610,12 @@ impl SessionManager {
 
     async fn rollback(&self, staged: Staged) {
         let id = staged.id;
-        if staged.row_inserted {
-            let _ = self.store.delete_session(&id).await;
+        if staged.row_inserted
+            && let Err(error) = self.store.delete_session(&id).await
+        {
+            // The files and the handle are gone but the row survives: nothing
+            // can reach it again (`is_live` fails `UnknownAgent`), so say so.
+            tracing::error!(session = %id, %error, "could not remove the session row on rollback");
         }
         if staged.attached {
             self.detach(&id).await;
