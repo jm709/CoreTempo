@@ -102,6 +102,8 @@ run_live() {
   cargo build --workspace
   printf '==> live claude test\n'
   cargo test -p coretempo-daemon --test live_claude -- --ignored --nocapture
+  printf '==> live sessions test\n'
+  cargo test -p coretempo-daemon --test live_sessions -- --ignored --nocapture
 }
 
 case "${1:-app}" in

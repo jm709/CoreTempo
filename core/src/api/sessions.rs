@@ -126,7 +126,10 @@ async fn create_session(
 ) -> Result<Response, ApiError> {
     let req: CreateSessionRequest = parse_as(
         &body,
-        r#"{"project":"p-0a1b2c3d","worktree":true,"cwd":"pkg","title":null,"prompt":null,"model":null,"permission_mode":null,"isolated_config":false}"#,
+        concat!(
+            r#"{"project":"p-0a1b2c3d","worktree":true,"cwd":"pkg","title":null,"#,
+            r#""prompt":null,"model":null,"permission_mode":null,"isolated_config":false}"#
+        ),
     )?;
     let view = api
         .sessions

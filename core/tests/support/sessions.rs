@@ -76,7 +76,8 @@ const FAKE_POST: &str = r#"post() {
   cat <&3 >/dev/null
   exec 3>&-
 }
-post "/v1/agents/$CORETEMPO_AGENT_ID/state" "{\"state\":\"idle\",\"claude_session_id\":\"${FAKE_SESSION_ID:-fake-sid}\"}"
+start="{\"state\":\"idle\",\"claude_session_id\":\"${FAKE_SESSION_ID:-fake-sid}\"}"
+post "/v1/agents/$CORETEMPO_AGENT_ID/state" "$start"
 "#;
 
 const FAKE_ECHO: &str = "printf 'booted\\n'\n\

@@ -1401,3 +1401,103 @@ frozen alongside the sections above:
     the handle: queue worker, write pump and state subscribers all end).
     `PtyError::UnknownAgent`'s text is now "unknown agent '<id>'; not in
     the roster". Workflow runs call none of the new methods.
+47. **Session manager core, daemon and API** (spec 2026-08-27 §2, §3,
+    §5, §6, §9). Types (`core/src/types/session.rs`, types-only build):
+    `ProjectId` (`p-` + 8 hex), `SessionState { starting, idle, working,
+    stopped, exited }`, `WorktreeStatus { present, missing, none }`,
+    `WorktreeInfo { path, branch, base }`, `BlockedView { tool, since }`,
+    `ProjectView`, `SessionView` (every §2 field plus `state`, `blocked`,
+    `exit`, `pty_cursor`, `branch`, `changed_files`, `ahead`,
+    `worktree_status`), `CreateProjectRequest { path, name? }`,
+    `CreateSessionRequest { project, worktree, cwd?, title?, prompt?,
+    model?, permission_mode?, isolated_config }`, `ResumeResponse {
+    session, resumed }`, `DeleteSessionResponse { branch_kept }`,
+    `SessionCounts { live, total }`, `SessionsHealth { ok, sessions }`,
+    `SessionsApiFile { port, token, pid }`. `ReportStateRequest` gains
+    optional `claude_session_id` (forwarded by `tempo state` from every
+    hook payload's `session_id`; runs ignore it, the daemon stores the
+    latest). Events: `session.created|stopped|deleted { agent }`,
+    `session.resumed { agent, resumed }` (pass `?agent=`),
+    `project.registered|forgotten { project }` (always pass).
+    API split: `ApiCore { pty, bus, roster: Arc<dyn Roster>, auth:
+    Arc<dyn TokenAuth>, token_provisioned, bind, port, started_at,
+    started }`, `ApiContext { core, router, workflow, workflow_file,
+    run_id, triggers, agent_locks, stopping }` (`FromRef`).
+    `trait Roster { contains, ids, on_claude_session_id }` (impl for
+    `FrozenWorkflow` and `SessionManager`); `trait TokenAuth { classify
+    -> Caller::{Operator, Hook(AgentId), Unknown}, hint }`
+    (`OperatorToken` for runs). Guard: `Hook(id)` may only `POST
+    /v1/agents/{id}/state` (403 `forbidden_scope` elsewhere); a hook
+    token's identity beats `X-CoreTempo-Agent` (403 `wrong_agent` on
+    mismatch); `TokenHint::Sessions`; raw-body `POST …/pty` skips the JSON
+    content-type check. `core::api::auth::write_private_file` is now
+    `pub` — the daemon writes its own `api.json` with it. `PtySource`
+    gains `write`, `resize`, `pause`.
+    Shared routes (`shared_routes()`): `POST /v1/agents/{id}/state`,
+    `GET /v1/events`; `pty_routes(prefix)`: `GET|POST {prefix}/{id}/pty`
+    (POST = raw bytes, 204), `POST …/pty/resize { cols, rows }` (204),
+    `POST …/pty/pause { paused }` (204), 409 `agent_exited` with no live
+    session — mounted at `/v1/agents` on runs and `/v1/sessions` on the
+    daemon. `serve_app(listener, app, bind, token_provisioned)`.
+    `PtyManager::agent_ids()`, `is_live(&id)`; a mid-spawn `UnknownAgent`
+    reaps the orphan. `TrustStore::project_keys` / `set_project_keys`.
+    `core/src/pid.rs`: `pid_alive(pid) -> bool`, an unconditional module
+    — `libc` is no longer an optional dependency of `core` — shared by
+    `coretempod sessions stop` and `tempo session` discovery (pid 0 is
+    never alive).
+    `core/src/sessions/`: `SessionsRoot { dir, worktrees }`
+    (`from_home`, `at`), `SessionStore` (own `sessions.db`, 0600, WAL,
+    `user_version` 1, schema of spec §9 plus `exit_code`/`exit_signal`),
+    `worktree::{create, status, ahead, is_listed, remove, prune,
+    delete_branch_if_unmoved, toplevel, slug}`, `SessionTrustGate`
+    (`SessionTrust { project_root, derived_worktree, mirror }`; derived
+    grants copy `MCP_APPROVAL_KEYS`), `files::{write_session_files,
+    remove_session_files}`, `SessionManager::boot(SessionManagerInputs)`
+    with `register_project`, `list_projects`, `forget_project`, `create`,
+    `get`, `list`, `stop`, `resume`, `delete(id, remove_worktree, force)`,
+    `record_claude_session_id`, `counts`, `shutdown`; `SessionError`
+    (`unknown_session` 404, `unknown_project` 404, `project_exists` 409,
+    `project_in_use` 409, `not_a_git_repo` 422, `cwd_outside_project` 422,
+    `cwd_missing` 422, `wrong_state` 409, `worktree_missing` 409,
+    `dirty_worktree` 422, `untrusted` 409 (create *and* resume re-check the
+    project root), `git_failed` 422, `spawn_failed` 500, `shutting_down` 503
+    for a create/resume that reaches the manager after shutdown began).
+    `stop` on a session whose child left first records `exited` rather
+    than failing. Known gap: the derived `projects[<worktree>]` entries a
+    worktree session writes into the operator's `.claude.json` are not
+    removed on delete or on a rolled-back create. `POST
+    /v1/agents/{id}/state` with the operator token still requires
+    `X-CoreTempo-Agent: <id>` (the run rule, unchanged); a hook token
+    needs no header and may repeat its own id. `core/src/api/sessions.rs`:
+    `SessionsApi { core,
+    sessions }`, `build_sessions_router`; routes as spec §6 with `POST
+    /v1/sessions` → 201, `DELETE /v1/projects/{id}` → 204.
+    `coretempod sessions [--root DIR] [--port N] [stop]`: loopback,
+    generated token (so `serve_app` is called with `token_provisioned:
+    false`), `api.json` 0600 with pid (removed on clean exit),
+    `sessions.lock` `flock`ed (second start exits 1 naming pid/port),
+    `daemon.log`; `--root` overrides `~/.coretempo/sessions` (worktrees
+    then under `<root>/worktrees`). Both `sessions stop` and that
+    second-start refusal treat the lock — probed with a non-blocking
+    `flock` — as the authority for "a daemon holds this root": `api.json`
+    alone never triggers a signal, because a daemon that crashed leaves
+    it behind naming a pid the kernel recycles. `coretempod` loads a
+    workflow only under `run`/`serve`; `tempo` resolves a run connection
+    only for run-scoped commands.
+48. **`tempo session`** (spec 2026-08-27 §7). `tempo session [--root DIR]
+    new <project-path> [--worktree] [--cwd DIR] [--title T] [--prompt P]
+    [--model M] [--permission-mode PM] [--isolated-config]` (prints the id,
+    then the branch for a worktree), `list` (tab-separated `id project
+    branch state changed ahead title`, `-` for absent, `blocked` shown
+    while the flag is set), `show <id>` (JSON), `stop <id>`, `resume <id>`
+    (`resumed conversation <id>` / `started fresh`), `rm <id>
+    [--remove-worktree] [--force]` (`branch kept` when it was), `attach
+    <id>` (raw passthrough, `Ctrl-]` detaches; exit 0 on detach, 1 when the
+    session exits or is not live), `projects [rm <id>]`. Discovery reads
+    `<root>/api.json` only (default `~/.coretempo/sessions/api.json`) and
+    treats a dead pid as no daemon; only a `NotFound` on that file reads as
+    "no session daemon running", and any other io error is reported as
+    itself (`cannot read <path>: …`), or the operator would go start a
+    daemon that is already running. Exit statuses: 0, 1 (attach as above),
+    3 (usage, transport, or an API refusal — the server's message printed
+    verbatim).
