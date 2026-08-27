@@ -289,9 +289,9 @@ fn watch_inputs_for(
     id: String,
 ) -> WatchInputs {
     WatchInputs {
-        bus: ctx.bus.clone(),
+        bus: ctx.core.bus.clone(),
         router: Arc::clone(&ctx.router),
-        pty: Arc::clone(&ctx.pty),
+        pty: Arc::clone(&ctx.core.pty),
         roster: flow.members.iter().cloned().collect(),
         idle_debounce: ctx.workflow.idle_debounce,
         deadline,

@@ -15,7 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use coretempo_core::api::{ApiContext, ApiServerHandle, PtySource, serve};
+use coretempo_core::api::auth::{TokenHint, token_matches};
+use coretempo_core::api::{
+    ApiContext, ApiCore, ApiServerHandle, Caller, OperatorToken, PtyFuture, PtySource, Roster,
+    TokenAuth, serve,
+};
 use coretempo_core::bus::EventBus;
 use coretempo_core::pty::{Cursor, InjectError, Injected, InjectionQueue, PtyChunk, PtyError};
 use coretempo_core::router::Router;
@@ -86,6 +90,12 @@ pub struct FakePty {
     /// The hook `agent_id` of every `report_blocked` call, in the same order as
     /// `blocked_reports`.
     pub blocked_agent_ids: Mutex<Vec<Option<String>>>,
+    /// Every raw `write` call: the agent and the exact bytes.
+    pub writes: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Every `resize` call: the agent, cols, rows.
+    pub resizes: Mutex<Vec<(String, u16, u16)>>,
+    /// Every `pause` call: the agent and the flag it was set to.
+    pub pauses: Mutex<Vec<(String, bool)>>,
 }
 
 impl FakePty {
@@ -101,6 +111,9 @@ impl FakePty {
             unblocked_reports: Mutex::new(Vec::new()),
             refused_reports: Mutex::new(Vec::new()),
             blocked_agent_ids: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+            resizes: Mutex::new(Vec::new()),
+            pauses: Mutex::new(Vec::new()),
         })
     }
 
@@ -179,9 +192,34 @@ impl FakePty {
             .unwrap_or_default()
     }
 
+    /// Every raw `write` call, in call order.
+    pub fn writes(&self) -> Vec<(String, Vec<u8>)> {
+        self.writes.lock().map(|w| w.clone()).unwrap_or_default()
+    }
+
+    /// Every `resize` call, in call order.
+    pub fn resizes(&self) -> Vec<(String, u16, u16)> {
+        self.resizes.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// Every `pause` call, in call order.
+    pub fn pauses(&self) -> Vec<(String, bool)> {
+        self.pauses.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+
     fn lookup(&self, agent: &AgentId) -> Result<FakeAgent, PtyError> {
         let agents = self.agents.lock().map_err(|_| poisoned())?;
         agents.get(agent).cloned().ok_or_else(|| unknown(agent))
+    }
+
+    /// The real manager refuses a write or resize with no live session; an
+    /// `exited` fake agent is that state.
+    fn live(&self, agent: &AgentId) -> Result<(), PtyError> {
+        let (state, _, _) = self.lookup(agent)?;
+        if state == AgentState::Exited {
+            return Err(PtyError::AgentExited(agent.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -306,6 +344,55 @@ impl PtySource for FakePty {
     fn blocked_count(&self) -> usize {
         self.blocked.lock().map_or(0, |blocked| blocked.len())
     }
+    fn write<'a>(&'a self, agent: &'a AgentId, bytes: Vec<u8>) -> PtyFuture<'a, ()> {
+        Box::pin(async move {
+            self.live(agent)?;
+            self.writes
+                .lock()
+                .map_err(|_| poisoned())?
+                .push((agent.0.clone(), bytes));
+            Ok(())
+        })
+    }
+    fn resize<'a>(&'a self, agent: &'a AgentId, cols: u16, rows: u16) -> PtyFuture<'a, ()> {
+        Box::pin(async move {
+            self.live(agent)?;
+            self.resizes
+                .lock()
+                .map_err(|_| poisoned())?
+                .push((agent.0.clone(), cols, rows));
+            Ok(())
+        })
+    }
+    fn pause(&self, agent: &AgentId, paused: bool) {
+        if let Ok(mut pauses) = self.pauses.lock() {
+            pauses.push((agent.0.clone(), paused));
+        }
+    }
+}
+
+/// A [`TokenAuth`] with an operator token and one hook token per agent — the
+/// sessions daemon's shape, for tests that exercise the hook-token scope.
+pub struct HookTokens {
+    pub operator: Token,
+    pub hooks: Vec<(AgentId, Token)>,
+}
+
+impl TokenAuth for HookTokens {
+    fn classify(&self, bearer: &str) -> Caller {
+        if token_matches(&self.operator, bearer) {
+            return Caller::Operator;
+        }
+        for (id, token) in &self.hooks {
+            if token_matches(token, bearer) {
+                return Caller::Hook(id.clone());
+            }
+        }
+        Caller::Unknown
+    }
+    fn hint(&self) -> TokenHint {
+        TokenHint::Sessions
+    }
 }
 
 pub fn temp_path(name: &str) -> PathBuf {
@@ -406,6 +493,9 @@ pub struct TestHandles {
     pub router: Arc<Router>,
     pub fake_pty: Arc<FakePty>,
     pub injector: Arc<StubInjector>,
+    /// The operator token the context was built with. `ApiCore` keeps only an
+    /// `Arc<dyn TokenAuth>`, which no test can read a token back out of.
+    pub token: Token,
     /// The context's stop signal, held here so a test can trip it the way
     /// `Run::stop` does — and so it outlives a test that drops the runtime.
     pub stopping: watch::Sender<bool>,
@@ -595,19 +685,23 @@ fn ctx_from(
     fake_pty.set_agent("builder", AgentState::Idle, None, Vec::new());
     let agent_locks = Arc::new(coretempo_core::locks::AgentLocks::new(&workflow.agents));
     let (stopping, stopping_rx) = watch::channel(false);
+    let token = Token::generate();
     let ctx = ApiContext {
+        core: ApiCore {
+            pty: fake_pty.clone() as Arc<dyn PtySource>,
+            bus: bus.clone(),
+            roster: workflow.clone() as Arc<dyn Roster>,
+            auth: Arc::new(OperatorToken(token.clone())),
+            token_provisioned: true,
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 0,
+            started_at: Timestamp::now(),
+            started: Instant::now(),
+        },
         router: router.clone(),
-        pty: fake_pty.clone() as Arc<dyn PtySource>,
-        bus: bus.clone(),
         workflow,
         workflow_file,
         run_id: RunId::generate(),
-        started_at: Timestamp::now(),
-        started: Instant::now(),
-        token: Token::generate(),
-        token_provisioned: true,
-        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        port: 0,
         triggers: TriggerHub::new(),
         agent_locks,
         stopping: stopping_rx,
@@ -619,6 +713,7 @@ fn ctx_from(
             router,
             fake_pty,
             injector,
+            token,
             stopping,
             rt,
         },
@@ -644,7 +739,7 @@ pub struct TestServer {
 }
 
 pub fn start(ctx: ApiContext, handles: TestHandles) -> anyhow::Result<TestServer> {
-    let token = ctx.token.0.clone();
+    let token = handles.token.0.clone();
     let rt = handles.rt.clone();
     let server = rt.block_on(serve(ctx))?;
     let addr = server.local_addr();
@@ -684,10 +779,23 @@ impl TestServer {
         format!("http://{}{path}", self.addr)
     }
 
+    /// The status and parsed body of one response. A 204 carries no body at
+    /// all, so an empty one reads as `null` rather than a parse error.
+    fn finish(
+        res: &mut ureq::http::Response<ureq::Body>,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        let status = res.status().as_u16();
+        let raw = res.body_mut().read_to_string()?;
+        if raw.trim().is_empty() {
+            return Ok((status, serde_json::Value::Null));
+        }
+        Ok((status, serde_json::from_str(&raw)?))
+    }
+
     /// GET without auth header.
     pub fn get_raw(&self, path: &str) -> anyhow::Result<(u16, serde_json::Value)> {
         let mut res = TestServer::agent().get(self.url(path)).call()?;
-        Ok((res.status().as_u16(), res.body_mut().read_json()?))
+        TestServer::finish(&mut res)
     }
 
     /// GET with bearer token and optional X-CoreTempo-Agent header.
@@ -703,7 +811,21 @@ impl TestServer {
             req = req.header("X-CoreTempo-Agent", a);
         }
         let mut res = req.call()?;
-        Ok((res.status().as_u16(), res.body_mut().read_json()?))
+        TestServer::finish(&mut res)
+    }
+
+    /// GET as an arbitrary bearer token (`None` uses the operator token).
+    pub fn get_as(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        let token = token.unwrap_or(&self.token);
+        let mut res = TestServer::agent()
+            .get(self.url(path))
+            .header("Authorization", format!("Bearer {token}"))
+            .call()?;
+        TestServer::finish(&mut res)
     }
 
     /// POST an arbitrary body: the trigger endpoint takes any content type, and a
@@ -734,7 +856,40 @@ impl TestServer {
             req = req.header("X-CoreTempo-Agent", a);
         }
         let mut res = req.send_json(body)?;
-        Ok((res.status().as_u16(), res.body_mut().read_json()?))
+        TestServer::finish(&mut res)
+    }
+
+    /// POST JSON as an arbitrary bearer token, with no identity header.
+    pub fn post_json_as(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        token: Option<&str>,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        let token = token.unwrap_or(&self.token);
+        let mut res = TestServer::agent()
+            .post(self.url(path))
+            .header("Authorization", format!("Bearer {token}"))
+            .send_json(body)?;
+        TestServer::finish(&mut res)
+    }
+
+    /// POST JSON as an arbitrary bearer token, claiming `agent` in
+    /// X-CoreTempo-Agent.
+    pub fn post_json_as_agent(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        token: Option<&str>,
+        agent: &str,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        let token = token.unwrap_or(&self.token);
+        let mut res = TestServer::agent()
+            .post(self.url(path))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-CoreTempo-Agent", agent)
+            .send_json(body)?;
+        TestServer::finish(&mut res)
     }
 }
 

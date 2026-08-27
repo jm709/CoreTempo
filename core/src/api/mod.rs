@@ -4,15 +4,17 @@
 pub mod agents;
 pub mod auth;
 pub mod messages;
+pub mod pty;
 pub mod sse;
 pub mod trigger;
 
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{FromRef, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -122,6 +124,21 @@ pub trait PtySource: Send + Sync + 'static {
 
     /// How many agents are parked on a permission dialog.
     fn blocked_count(&self) -> usize;
+
+    /// Raw keystrokes (bypasses the injection queue; shares the write pump).
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`], [`PtyError::AgentExited`] with no live session.
+    fn write<'a>(&'a self, agent: &'a AgentId, bytes: Vec<u8>) -> PtyFuture<'a, ()>;
+
+    /// Resizes the agent's pty window.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`], [`PtyError::AgentExited`], [`PtyError::Io`].
+    fn resize<'a>(&'a self, agent: &'a AgentId, cols: u16, rows: u16) -> PtyFuture<'a, ()>;
+
+    /// UI backpressure flag; unknown agents are logged and ignored.
+    fn pause(&self, agent: &AgentId, paused: bool);
 }
 
 /// Production `PtySource` over `PtyManager` (constructed by `Run::start`).
@@ -189,23 +206,112 @@ impl PtySource for PtyManagerSource {
     fn blocked_count(&self) -> usize {
         self.0.blocked_count()
     }
+    fn write<'a>(&'a self, agent: &'a AgentId, bytes: Vec<u8>) -> PtyFuture<'a, ()> {
+        Box::pin(async move { self.0.write(agent, &bytes).await })
+    }
+    fn resize<'a>(&'a self, agent: &'a AgentId, cols: u16, rows: u16) -> PtyFuture<'a, ()> {
+        Box::pin(async move { self.0.resize(agent, cols, rows).await })
+    }
+    fn pause(&self, agent: &AgentId, paused: bool) {
+        self.0.pause_output(agent, paused);
+    }
 }
 
-/// Everything the handlers need; `Clone` is cheap (Arcs + small values).
+/// The ids an API instance answers for. A workflow run's is its frozen
+/// roster; the sessions daemon's is its live handle set (amendment 47).
+pub trait Roster: Send + Sync + 'static {
+    fn contains(&self, id: &AgentId) -> bool;
+
+    /// Every id, in id order — what an unknown-id error lists.
+    fn ids(&self) -> Vec<AgentId>;
+
+    /// `POST /v1/agents/{id}/state` carried a `claude_session_id`. The
+    /// sessions daemon stores it for `--resume`; runs keep this no-op. The
+    /// handler awaits it *before* publishing the state, so once a caller
+    /// observes `idle` the id is durable (spec §2: latest `SessionStart` wins).
+    fn on_claude_session_id<'a>(
+        &'a self,
+        _id: &'a AgentId,
+        _session_id: String,
+    ) -> RosterFuture<'a> {
+        Box::pin(async {})
+    }
+}
+
+/// A boxed future so [`Roster`] stays object-safe with an async hook.
+pub type RosterFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+impl Roster for FrozenWorkflow {
+    fn contains(&self, id: &AgentId) -> bool {
+        self.agents.contains_key(id)
+    }
+    fn ids(&self) -> Vec<AgentId> {
+        self.agents.keys().cloned().collect()
+    }
+}
+
+/// Who a bearer token says the caller is (spec 2026-08-27 §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// The operator token: everything.
+    Operator,
+    /// An agent's own hook token: exactly `POST /v1/agents/{id}/state`.
+    Hook(AgentId),
+    Unknown,
+}
+
+/// Classifies bearer tokens. Runs implement it as the single operator token;
+/// the sessions daemon compares the operator token, then every live hook
+/// token, in constant time.
+pub trait TokenAuth: Send + Sync + 'static {
+    fn classify(&self, bearer: &str) -> Caller;
+
+    /// Which token a 401 points the caller at.
+    fn hint(&self) -> auth::TokenHint;
+}
+
+/// The one-token model of a workflow run.
+pub struct OperatorToken(pub Token);
+
+impl TokenAuth for OperatorToken {
+    fn classify(&self, bearer: &str) -> Caller {
+        if auth::token_matches(&self.0, bearer) {
+            Caller::Operator
+        } else {
+            Caller::Unknown
+        }
+    }
+    fn hint(&self) -> auth::TokenHint {
+        auth::TokenHint::Run
+    }
+}
+
+/// A boxed PTY future, so [`PtySource`] stays object-safe with async writes.
+pub type PtyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PtyError>> + Send + 'a>>;
+
+/// What every `/v1` instance needs — a workflow run and the sessions daemon
+/// alike. `Clone` is cheap (Arcs + small values). Amendment 47.
 #[derive(Clone)]
-pub struct ApiContext {
-    pub router: Arc<CoreRouter>,
+pub struct ApiCore {
     pub pty: Arc<dyn PtySource>,
     pub bus: EventBus,
-    pub workflow: Arc<FrozenWorkflow>,
-    pub workflow_file: Arc<WorkflowFile>,
-    pub run_id: RunId,
-    pub started_at: Timestamp,
-    pub started: Instant,
-    pub token: Token,
+    pub roster: Arc<dyn Roster>,
+    pub auth: Arc<dyn TokenAuth>,
     pub token_provisioned: bool,
     pub bind: IpAddr,
     pub port: u16,
+    pub started_at: Timestamp,
+    pub started: Instant,
+}
+
+/// The core plus the run-only extension (router, frozen workflow, triggers).
+#[derive(Clone)]
+pub struct ApiContext {
+    pub core: ApiCore,
+    pub router: Arc<CoreRouter>,
+    pub workflow: Arc<FrozenWorkflow>,
+    pub workflow_file: Arc<WorkflowFile>,
+    pub run_id: RunId,
     /// Trigger bookkeeping for `/v1/trigger` (spec triggers §4). Warm runs of a
     /// webhook workflow fire against the live roster.
     pub triggers: Arc<TriggerHub>,
@@ -221,6 +327,12 @@ pub struct ApiContext {
     /// typed into nothing. A dropped sender counts as stopped — the run it
     /// belonged to is gone.
     pub stopping: watch::Receiver<bool>,
+}
+
+impl FromRef<ApiContext> for ApiCore {
+    fn from_ref(ctx: &ApiContext) -> ApiCore {
+        ctx.core.clone()
+    }
 }
 
 /// Uniform error response: `{"error":{"code","message"}}`, message written for LLM readers.
@@ -270,24 +382,20 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub(crate) fn roster_list(workflow: &FrozenWorkflow) -> String {
-    workflow
-        .agents
-        .keys()
+pub(crate) fn roster_list(roster: &dyn Roster) -> String {
+    roster
+        .ids()
+        .iter()
         .map(|a| a.0.as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-pub(crate) fn unknown_agent(workflow: &FrozenWorkflow, id: &AgentId) -> ApiError {
+pub(crate) fn unknown_agent(roster: &dyn Roster, id: &AgentId) -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         "unknown_agent",
-        format!(
-            "no agent named '{}'; roster: {}",
-            id.0,
-            roster_list(workflow)
-        ),
+        format!("no agent named '{}'; roster: {}", id.0, roster_list(roster)),
     )
 }
 
@@ -368,10 +476,10 @@ async fn health(State(ctx): State<ApiContext>) -> Json<Health> {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         run_id: ctx.run_id.clone(),
-        uptime_secs: ctx.started.elapsed().as_secs(),
+        uptime_secs: ctx.core.started.elapsed().as_secs(),
         queued,
         running: ctx.triggers.in_flight_by_flow().len(),
-        blocked: ctx.pty.blocked_count(),
+        blocked: ctx.core.pty.blocked_count(),
     })
 }
 
@@ -383,7 +491,9 @@ async fn not_found(req: axum::extract::Request) -> ApiError {
             "no route {} {}; valid routes: POST/GET /v1/messages, \
              GET /v1/messages/{{id}}, POST /v1/messages/{{id}}/reply, GET /v1/agents, \
              GET /v1/agents/{{id}}, POST /v1/agents/{{id}}/state, \
-             POST /v1/agents/{{id}}/restart, GET /v1/agents/{{id}}/pty, GET /v1/events, \
+             POST /v1/agents/{{id}}/restart, GET /v1/agents/{{id}}/pty, \
+             POST /v1/agents/{{id}}/pty, POST /v1/agents/{{id}}/pty/resize, \
+             POST /v1/agents/{{id}}/pty/pause, GET /v1/events, \
              GET /v1/workflow, GET /v1/health, GET /v1/flows, \
              POST /v1/flows/{{name}}/trigger, GET /v1/trigger/{{id}}",
             req.method(),
@@ -395,14 +505,47 @@ async fn not_found(req: axum::extract::Request) -> ApiError {
 async fn get_workflow(State(ctx): State<ApiContext>) -> Json<WorkflowResponse> {
     Json(WorkflowResponse {
         run_id: ctx.run_id.clone(),
-        started_at: ctx.started_at.clone(),
+        started_at: ctx.core.started_at.clone(),
         workflow: (*ctx.workflow_file).clone(),
     })
 }
 
-/// Assembles the full /v1 router. Public so tests and `Run` can serve it themselves.
+/// Routes both a run and the sessions daemon mount (amendment 47): the hook
+/// target and the control-plane stream.
+pub fn shared_routes<S>() -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    ApiCore: FromRef<S>,
+{
+    axum::Router::new()
+        .route("/v1/agents/{id}/state", post(agents::report_state))
+        .route("/v1/events", get(sse::events))
+}
+
+/// The PTY routes under `prefix` (`/v1/agents` for runs, `/v1/sessions` for
+/// the daemon): stream, raw write, resize, pause.
+pub fn pty_routes<S>(prefix: &str) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    ApiCore: FromRef<S>,
+{
+    axum::Router::new()
+        .route(
+            &format!("{prefix}/{{id}}/pty"),
+            get(pty::pty_stream).post(pty::pty_write),
+        )
+        .route(
+            &format!("{prefix}/{{id}}/pty/resize"),
+            post(pty::pty_resize),
+        )
+        .route(&format!("{prefix}/{{id}}/pty/pause"), post(pty::pty_pause))
+}
+
+/// Assembles the full run /v1 router. Public so tests and `Run` can serve it themselves.
 pub fn build_router(ctx: ApiContext) -> axum::Router {
     axum::Router::new()
+        .merge(shared_routes())
+        .merge(pty_routes("/v1/agents"))
         .route(
             "/v1/messages",
             post(messages::create_message).get(messages::list_messages),
@@ -411,11 +554,8 @@ pub fn build_router(ctx: ApiContext) -> axum::Router {
         .route("/v1/messages/{id}/reply", post(messages::reply_message))
         .route("/v1/agents", get(agents::list_agents))
         .route("/v1/agents/{id}", get(agents::get_agent))
-        .route("/v1/agents/{id}/state", post(agents::report_state))
         .route("/v1/agents/{id}/restart", post(agents::restart_agent))
         .route("/v1/agents/{id}/loop-done", post(agents::loop_done))
-        .route("/v1/agents/{id}/pty", get(sse::agent_pty))
-        .route("/v1/events", get(sse::events))
         .route("/v1/trigger", post(trigger::removed_trigger_route))
         .route("/v1/trigger/{id}", get(trigger::get_trigger))
         .route("/v1/flows", get(trigger::list_flows))
@@ -424,7 +564,7 @@ pub fn build_router(ctx: ApiContext) -> axum::Router {
         .route("/v1/health", get(health))
         .fallback(not_found)
         .layer(axum::middleware::from_fn_with_state(
-            ctx.clone(),
+            ctx.core.clone(),
             auth::guard,
         ))
         .with_state(ctx)
@@ -503,15 +643,15 @@ pub(crate) fn check_bind(bind: IpAddr, token_provisioned: bool) -> Result<(), Se
     Ok(())
 }
 
-/// Binds `ctx.bind:ctx.port` and serves the /v1 app. Refuses non-loopback binds unless the
-/// token was explicitly provisioned (defense in depth on top of `resolve_server`).
+/// Binds `ctx.core.bind:ctx.core.port` and serves the /v1 app. Refuses non-loopback binds
+/// unless the token was explicitly provisioned (defense in depth on top of `resolve_server`).
 ///
 /// # Errors
 /// [`ServeError::NonLoopbackWithoutToken`] when a non-loopback bind is requested with a
 /// generated token; [`ServeError::Bind`] when the listener cannot be bound.
 pub async fn serve(ctx: ApiContext) -> Result<ApiServerHandle, ServeError> {
-    check_bind(ctx.bind, ctx.token_provisioned)?;
-    let addr = SocketAddr::new(ctx.bind, ctx.port);
+    check_bind(ctx.core.bind, ctx.core.token_provisioned)?;
+    let addr = SocketAddr::new(ctx.core.bind, ctx.core.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|source| ServeError::Bind { addr, source })?;
@@ -523,18 +663,32 @@ pub async fn serve(ctx: ApiContext) -> Result<ApiServerHandle, ServeError> {
 /// environment. Must be called inside a tokio runtime.
 ///
 /// # Errors
-/// [`ServeError::NonLoopbackWithoutToken`] when a non-loopback bind is requested with a
-/// generated token; [`ServeError::Bind`] when the listener has no local address.
+/// As [`serve_app`].
 pub fn serve_on(
     listener: tokio::net::TcpListener,
     ctx: ApiContext,
 ) -> Result<ApiServerHandle, ServeError> {
-    check_bind(ctx.bind, ctx.token_provisioned)?;
+    let (bind, provisioned) = (ctx.core.bind, ctx.core.token_provisioned);
+    serve_app(listener, build_router(ctx), bind, provisioned)
+}
+
+/// Serves an assembled app on an already-bound listener. [`serve_on`] is this
+/// over [`build_router`]; the sessions daemon calls it with its own router.
+///
+/// # Errors
+/// [`ServeError::NonLoopbackWithoutToken`] when a non-loopback bind is requested with a
+/// generated token; [`ServeError::Bind`] when the listener has no local address.
+pub fn serve_app(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    bind: IpAddr,
+    token_provisioned: bool,
+) -> Result<ApiServerHandle, ServeError> {
+    check_bind(bind, token_provisioned)?;
     let local_addr = listener.local_addr().map_err(|source| ServeError::Bind {
-        addr: SocketAddr::new(ctx.bind, ctx.port),
+        addr: SocketAddr::new(bind, 0),
         source,
     })?;
-    let app = build_router(ctx);
     let (shutdown, mut rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let wait = async move {

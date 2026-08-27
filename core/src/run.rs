@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, watch};
 
 use crate::api::auth::{default_runs_dir, repoint_current, write_api_file};
-use crate::api::{ApiContext, ApiServerHandle, PtyManagerSource, ServeError, check_bind, serve_on};
+use crate::api::{
+    ApiContext, ApiCore, ApiServerHandle, OperatorToken, PtyManagerSource, Roster, ServeError,
+    check_bind, serve_on,
+};
 use crate::bus::EventBus;
 use crate::locks::{AgentLocks, MemberGuards};
 use crate::pty::hooks::write_agent_settings_files;
@@ -427,21 +430,25 @@ impl Run {
         let triggers = TriggerHub::new();
         let agent_locks = Arc::new(AgentLocks::new(&workflow.agents));
         let (stopping, stopping_rx) = watch::channel(false);
+        let core = ApiCore {
+            pty: Arc::new(PtyManagerSource(Arc::clone(&pty))),
+            bus: bus.clone(),
+            roster: Arc::clone(&workflow) as Arc<dyn Roster>,
+            auth: Arc::new(OperatorToken(server.token.clone())),
+            token_provisioned: server.token_provisioned,
+            bind: server.bind,
+            port,
+            started_at: started_at.clone(),
+            started: std::time::Instant::now(),
+        };
         let api = serve_on(
             listener,
             ApiContext {
+                core,
                 router: Arc::clone(&router),
-                pty: Arc::new(PtyManagerSource(Arc::clone(&pty))),
-                bus: bus.clone(),
                 workflow: Arc::clone(&workflow),
                 workflow_file: Arc::clone(&workflow_file),
                 run_id: run_id.clone(),
-                started_at: started_at.clone(),
-                started: std::time::Instant::now(),
-                token: server.token.clone(),
-                token_provisioned: server.token_provisioned,
-                bind: server.bind,
-                port,
                 triggers: Arc::clone(&triggers),
                 agent_locks: Arc::clone(&agent_locks),
                 stopping: stopping_rx,

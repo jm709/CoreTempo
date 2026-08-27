@@ -25,7 +25,10 @@ use coretempo_core::types::config::{
 use coretempo_core::types::event::{Event, EventPayload, LifecyclePhase};
 use coretempo_core::types::id::{AgentId, FlowName, MessageId, RunId};
 use coretempo_core::types::message::{MessageKind, MessageRecord, MessageStatus, Origin};
-use coretempo_core::{api::PtySource, types::event::CompletionResult};
+use coretempo_core::{
+    api::{PtyFuture, PtySource},
+    types::event::CompletionResult,
+};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// One dwell, kept short because these tests wait on it for real.
@@ -189,6 +192,15 @@ impl PtySource for FakePty {
     fn blocked_count(&self) -> usize {
         0
     }
+    // The completion watcher never drives a terminal; these exist to satisfy
+    // the trait.
+    fn write<'a>(&'a self, _id: &'a AgentId, _bytes: Vec<u8>) -> PtyFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn resize<'a>(&'a self, _id: &'a AgentId, _cols: u16, _rows: u16) -> PtyFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn pause(&self, _id: &AgentId, _paused: bool) {}
 }
 
 impl StateSource for FakePty {

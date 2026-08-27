@@ -180,8 +180,8 @@ fn health_stays_open_but_other_routes_do_not() -> anyhow::Result<()> {
 #[test]
 fn serve_refuses_non_loopback_without_provisioned_token() -> anyhow::Result<()> {
     let (mut ctx, handles) = support::test_ctx()?;
-    ctx.bind = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-    ctx.token_provisioned = false;
+    ctx.core.bind = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    ctx.core.token_provisioned = false;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -228,5 +228,71 @@ fn repoint_current_follows_the_latest_run() -> anyhow::Result<()> {
         std::fs::read_link(runs.join("current"))?,
         std::path::PathBuf::from("r-bbbbbbbb")
     );
+    Ok(())
+}
+
+/// A hook token is scoped to its own agent's state route (spec 2026-08-27 §3).
+#[test]
+fn a_hook_token_reports_its_own_state_and_nothing_else() -> anyhow::Result<()> {
+    let (mut ctx, handles) = support::test_ctx()?;
+    let hook = coretempo_core::types::Token::generate();
+    ctx.core.auth = std::sync::Arc::new(support::HookTokens {
+        operator: handles.token.clone(),
+        hooks: vec![(
+            coretempo_core::types::AgentId("builder".into()),
+            hook.clone(),
+        )],
+    });
+    let srv = support::start(ctx, handles)?;
+    // Its own state route, no X-CoreTempo-Agent header: identity comes from the token.
+    let (status, body) = srv.post_json_as(
+        "/v1/agents/builder/state",
+        &serde_json::json!({"state": "working"}),
+        Some(&hook.0),
+    )?;
+    assert_eq!(status, 200, "{body}");
+    // Another agent's state route.
+    let (status, body) = srv.post_json_as(
+        "/v1/agents/planner/state",
+        &serde_json::json!({"state": "working"}),
+        Some(&hook.0),
+    )?;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden_scope");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("POST /v1/agents/builder/state"),
+        "{body}"
+    );
+    // A spoofed header on its own route.
+    let (status, body) = srv.post_json_as_agent(
+        "/v1/agents/builder/state",
+        &serde_json::json!({"state": "working"}),
+        Some(&hook.0),
+        "planner",
+    )?;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "wrong_agent");
+    // The production shape: `tempo state` always sends X-CoreTempo-Agent with
+    // the hook token, and a matching header is accepted.
+    let (status, body) = srv.post_json_as_agent(
+        "/v1/agents/builder/state",
+        &serde_json::json!({"state": "idle"}),
+        Some(&hook.0),
+        "builder",
+    )?;
+    assert_eq!(status, 200, "{body}");
+    // Every other route.
+    for path in [
+        "/v1/agents",
+        "/v1/messages",
+        "/v1/events",
+        "/v1/agents/builder/pty",
+    ] {
+        let (status, body) = srv.get_as(path, Some(&hook.0))?;
+        assert_eq!(status, 403, "{path}: {body}");
+    }
     Ok(())
 }

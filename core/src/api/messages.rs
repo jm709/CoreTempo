@@ -56,7 +56,7 @@ pub(crate) async fn create_message(
 ) -> Result<Response, ApiError> {
     let req: CreateMessageRequest = parse_body(&body)?;
     let wait = parse_wait(params.get("wait").map(String::as_str))?;
-    let from = auth::caller_origin(&ctx, &headers)?;
+    let from = auth::caller_origin(&ctx.core, &headers)?;
     let record = ctx
         .router
         .create_message(from, req.to, req.kind, req.body)
@@ -168,7 +168,7 @@ pub(crate) async fn reply_message(
             req.code
         )));
     }
-    let replier = auth::caller_origin(&ctx, &headers)?;
+    let replier = auth::caller_origin(&ctx.core, &headers)?;
     let record = ctx
         .router
         .reply(replier, &MessageId(id), req.code, req.body)
