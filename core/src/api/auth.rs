@@ -339,7 +339,7 @@ pub fn default_runs_dir() -> Option<PathBuf> {
 ///
 /// # Errors
 /// Propagates filesystem errors from opening, writing, syncing, or chmod'ing the file.
-pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+pub fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)

@@ -1,9 +1,11 @@
 //! `CoreTempo` core library: PTY manager, agent-state tracking, message routing,
 //! event bus, `SQLite` store, and HTTP API. Zero UI dependencies.
 //!
-//! With `default-features = false` only the wire types (`types`, `time`) compile.
+//! With `default-features = false` only the wire types (`types`, `time`) and the
+//! std-only helpers (`export`, `pid`) compile.
 
 pub mod export;
+pub mod pid;
 pub mod time;
 pub mod types;
 
