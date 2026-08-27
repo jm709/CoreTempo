@@ -39,8 +39,10 @@ headless daemon possible, and it is load-bearing — keep it.
 
 Key modules: `core/src/run.rs` (the orchestrator that wires everything),
 `core/src/pty/queue.rs` (the only writer of text into a PTY),
-`core/src/router/` (message lifecycle + reply sinks), `core/src/api/`,
-`core/src/claude_config.rs` (the managed `CLAUDE_CONFIG_DIR` for isolated agents).
+`core/src/pty/roster.rs` (what `PtyManager` knows per agent — it never reads
+a workflow), `core/src/router/` (message lifecycle + reply sinks),
+`core/src/api/`, `core/src/claude_config.rs` (the managed `CLAUDE_CONFIG_DIR`
+for isolated agents).
 
 ## How messaging works
 
