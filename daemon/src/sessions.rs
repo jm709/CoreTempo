@@ -77,11 +77,40 @@ pub async fn main(
     }
 }
 
-/// `api.json` if it names a live pid.
+/// The running daemon's `api.json`: `sessions.lock` held by another process
+/// *and* the pid the file names still alive.
+///
+/// Neither alone is evidence. `api.json` is removed only on the clean-exit
+/// path, so a daemon killed with SIGKILL, killed by the OOM reaper, or crashed leaves it behind
+/// naming a pid the kernel eventually recycles — and `kill(pid, 0)` succeeds on
+/// a zombie too. Signalling on that would SIGTERM an unrelated process of the
+/// operator's. The lock is what says a daemon owns this root.
 fn live_api_file(root: &SessionsRoot) -> Option<SessionsApiFile> {
+    if !lock_is_held(root) {
+        return None;
+    }
     let text = std::fs::read_to_string(root.api_file()).ok()?;
     let file: SessionsApiFile = serde_json::from_str(&text).ok()?;
     pid_alive(file.pid).then_some(file)
+}
+
+/// Whether another process holds `sessions.lock`. A probe that cannot be made
+/// answers "no": both callers then refuse to signal, or fall back to a message
+/// that names no pid, and either is the safe answer.
+fn lock_is_held(root: &SessionsRoot) -> bool {
+    if !root.lock_file().exists() {
+        return false;
+    }
+    // Taking the lock proves nobody else has it; the guard drops at the end of
+    // the arm, releasing it again before any caller acts on the answer.
+    match take_lock(root) {
+        Ok(Some(_lock)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            tracing::debug!(%error, "could not probe sessions.lock");
+            false
+        }
+    }
 }
 
 #[expect(
@@ -130,8 +159,12 @@ fn take_lock(root: &SessionsRoot) -> anyhow::Result<Option<RootLock>> {
     Err(err).context("flock on sessions.lock failed")
 }
 
-/// Names the daemon already holding `root`, so the operator can stop it. Runs
-/// before [`init_logging`] — the lock is what decides which process owns
+/// Names the daemon already holding `root`, so the operator can stop it. It
+/// goes through the same [`live_api_file`] rule `stop` does — a pid is only
+/// reported when the lock backs it up — so the two never disagree about
+/// whether a daemon is there.
+///
+/// Runs before [`init_logging`]: the lock is what decides which process owns
 /// `daemon.log`, so the loser must not write to it.
 #[expect(
     clippy::print_stderr,

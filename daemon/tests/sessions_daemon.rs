@@ -14,8 +14,8 @@
 mod support;
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::Stdio;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use support::{
     sessions_command, sessions_daemon, sessions_daemon_on, sessions_scratch, wait_for_child_exit,
@@ -121,6 +121,49 @@ fn sessions_stop_sends_sigterm_and_reports_no_daemon_afterwards() -> anyhow::Res
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    Ok(())
+}
+
+/// `api.json` outlives a daemon killed with SIGKILL, reaped by the OOM killer,
+/// or crashed — and the kernel recycles pids, so a live pid in that file is not
+/// evidence a daemon is running. `sessions.lock` is: `stop` must probe it and
+/// refuse rather than SIGTERM whatever now holds the number.
+#[test]
+fn stop_never_signals_an_unrelated_process_named_by_a_stale_api_json() -> anyhow::Result<()> {
+    let scratch = sessions_scratch("stalestop");
+    let root = scratch.root.join("sessions");
+    std::fs::create_dir_all(&root)?;
+    // Alive, ours, and emphatically not a session daemon. Nothing holds the
+    // lock — no daemon ever started against this root.
+    let mut bystander = Command::new("sleep").arg("60").spawn()?;
+    std::fs::write(
+        root.join("api.json"),
+        format!(r#"{{"port":1,"token":"00","pid":{}}}"#, bystander.id()),
+    )?;
+
+    let out = sessions_command(
+        &scratch,
+        &["sessions", "--root", &root.display().to_string(), "stop"],
+    )
+    .output()?;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no session daemon running"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Proving a non-event, so it needs a window: a SIGTERM sent before `stop`
+    // exited would land and be reapable well inside this one.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        assert!(
+            bystander.try_wait()?.is_none(),
+            "stop signalled an unrelated process"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    bystander.kill()?;
+    bystander.wait()?;
     Ok(())
 }
 
