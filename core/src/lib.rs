@@ -35,6 +35,9 @@ pub mod run;
 pub mod schema;
 
 #[cfg(feature = "server")]
+pub mod sessions;
+
+#[cfg(feature = "server")]
 pub mod store;
 
 #[cfg(feature = "server")]
