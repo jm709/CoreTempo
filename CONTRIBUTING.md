@@ -2,10 +2,11 @@
 
 ## How this repo works
 
-The public repo is a snapshot mirror of a private working repo: each commit
-on `main` is one sync. Issues and pull requests are welcome here — a merged
-PR is applied upstream and lands in the next sync commit rather than as your
-original commit.
+This is the development repo: features and fixes land here as pull requests
+against `main`, and your merged commits are the history. Commits before
+2026-08-27 are snapshots of an earlier private repo; issue and PR numbers
+cited in older specs and in `CLAUDE.md` refer to that repo's tracker, not
+this one's.
 
 ## Getting set up
 
