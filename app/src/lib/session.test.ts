@@ -9,7 +9,7 @@ vi.mock("./ipc", () => ({
   toCmdError: (e: unknown) => e,
 }));
 
-vi.mock("./trustDialog", () => ({ confirmTrust: vi.fn(async () => true) }));
+vi.mock("./dialogs", () => ({ confirmTrust: vi.fn(async () => true) }));
 
 vi.mock("./term/manager", () => ({
   ensureTerminal: vi.fn(async () => {}),
@@ -26,7 +26,7 @@ import { boot, startRun } from "./session";
 import { resetRun, runState } from "./state/run.svelte";
 import { uiState } from "./state/ui.svelte";
 import { ensureTerminal } from "./term/manager";
-import { confirmTrust } from "./trustDialog";
+import { confirmTrust } from "./dialogs";
 
 const midRunSnapshot: Snapshot = {
   run: {

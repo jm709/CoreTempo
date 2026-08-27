@@ -38,6 +38,15 @@ export function toggleRunCenter(): void {
   uiState.runCenter = uiState.runCenter === "graph" ? "terminals" : "graph";
 }
 
+/// Leave the open workflow file and return to the open/new card. Only
+/// meaningful while stopped: an active run adopted its file at start. The
+/// caller confirms discarding unsaved edits first; this just drops them.
+export function closeWorkflow(): void {
+  uiState.editorPath = null;
+  uiState.editorDirty = false;
+  uiState.runCenter = "graph";
+}
+
 export function openAgentTerminal(agent: string): void {
   uiState.runCenter = "terminals";
   focusTerminal(agent);

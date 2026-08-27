@@ -16,3 +16,13 @@ export function confirmTrust(roots: string[]): Promise<boolean> {
     },
   );
 }
+
+/// Closing a workflow unmounts its editor, and with it any unsaved edits.
+export function confirmDiscard(path: string): Promise<boolean> {
+  return ask(`${path} has unsaved changes. Close it anyway?`, {
+    title: "Discard unsaved changes?",
+    kind: "warning",
+    okLabel: "Discard and close",
+    cancelLabel: "Keep editing",
+  });
+}
