@@ -146,14 +146,28 @@ pub(crate) fn write_agent_config_dirs(
             continue;
         }
         let dir = config_dir_path(runs_dir, run_id, id);
-        write_one(&dir, &cfg.skills).map_err(|IoAt { path, source }| ClaudeConfigError::Io {
-            agent: id.clone(),
-            path,
-            source,
-        })?;
+        write_config_dir(&dir, id, &cfg.skills)?;
         dirs.insert(id.clone(), dir);
     }
     Ok(dirs)
+}
+
+/// Seeds one managed dir for `agent` (0700; `.claude.json`, `settings.json`,
+/// `skills/` links). Idempotent except for the skill links, which must not
+/// already exist. Used per run agent and per `isolated_config` session.
+///
+/// # Errors
+/// [`ClaudeConfigError::Io`] naming the agent and the entry that failed.
+pub(crate) fn write_config_dir(
+    dir: &Path,
+    agent: &AgentId,
+    skills: &[PathBuf],
+) -> Result<(), ClaudeConfigError> {
+    write_one(dir, skills).map_err(|IoAt { path, source }| ClaudeConfigError::Io {
+        agent: agent.clone(),
+        path,
+        source,
+    })
 }
 
 /// An IO failure with the entry it happened on, so the error names the
@@ -187,6 +201,9 @@ fn write_one(dir: &Path, skills: &[PathBuf]) -> Result<(), IoAt> {
                 continue;
             };
             let link = skills_dir.join(name);
+            if link.exists() {
+                continue;
+            }
             symlink(skill, &link).map_err(at(&link))?;
         }
     }
@@ -250,6 +267,8 @@ mod tests {
 
         let wf = workflow(vec![("iso", isolated(vec![skill.clone()]))]);
         let dirs = write_agent_config_dirs(t.path(), &RunId("r1".into()), &wf).expect("writes");
+        write_agent_config_dirs(t.path(), &RunId("r1".into()), &wf)
+            .expect("a rewrite is idempotent — the skill link already exists");
 
         let dir = t.path().join("r1").join("claude-config-iso");
         assert_eq!(dirs[&AgentId("iso".into())], dir);

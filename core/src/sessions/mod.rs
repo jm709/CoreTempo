@@ -3,6 +3,7 @@
 //! worktree, owned by the `coretempod sessions` daemon. Nothing here is a
 //! workflow: no frozen prompt, no router, no auto-`/clear`.
 
+pub mod files;
 pub mod store;
 pub mod trust;
 pub mod worktree;
