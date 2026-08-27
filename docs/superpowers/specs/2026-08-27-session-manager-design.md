@@ -212,10 +212,11 @@ code, with the existing suites as the proof of behaviour preservation
    and exports it as `CORETEMPO_TOKEN`. `Strict(..)` and a `Some` system
    prompt reproduce today's argv byte for byte; `Inherit` passes neither
    `--strict-mcp-config` nor `--mcp-config`; `None` omits
-   `--append-system-prompt`. `resume` adds `--resume <id>` to the next
-   spawn only: `spawn` consumes it (clears the field), so a stale id can
-   never ride along on a later respawn; the daemon sets it fresh before
-   every resume.
+   `--append-system-prompt`. `resume` adds `--resume <id>` to the next spawn
+   that succeeds: `spawn` clears the field only after `open_pty` returns, so
+   a refused or failed spawn keeps it armed and a stale id never rides along
+   on a later respawn; the daemon sets it fresh before every resume
+   (amendment 46).
 2. **Dynamic roster.** Handle construction becomes `fn new_handle(&self, id,
    &RosterEntry)`. `add_agent(id, entry) -> Result<(), PtyError>` (error
    `AgentExists`), `set_resume(id, Option<String>)`, `remove_agent(id)`

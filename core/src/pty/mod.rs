@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -18,7 +19,6 @@ use crate::pty::ring::{RING_CAPACITY, ReplayRing, coalesce};
 use crate::pty::spawn::{SpawnInputs, spawn_spec, to_command};
 use crate::time::Timestamp;
 use crate::types::agent::{AgentExit, AgentState};
-use crate::types::config::{AgentConfig, FrozenWorkflow};
 use crate::types::event::{EventPayload, LifecyclePhase};
 use crate::types::id::{AgentId, Token};
 
@@ -26,7 +26,10 @@ pub mod detector;
 pub(crate) mod hooks;
 pub(crate) mod queue;
 pub(crate) mod ring;
+mod roster;
 pub(crate) mod spawn;
+
+pub use roster::{McpPolicy, PtyRoster, RosterEntry};
 
 /// Monotonic byte offset in an agent's output stream. Survives restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -40,28 +43,16 @@ pub struct PtyChunk {
     pub bytes: Vec<u8>,
 }
 
-/// Injected into every agent PTY at spawn.
+/// Process-wide values injected into every agent PTY. Per-agent files live on
+/// each [`RosterEntry`] (amendment 46).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEnv {
     pub port: u16,
     pub token: Token,
     /// Prepended to PATH so agents can exec `tempo`.
     pub tempo_bin_dir: PathBuf,
-    /// Per-agent generated settings (turn-boundary hooks, the dialog hooks
-    /// `PermissionRequest`/`PostToolBatch`, the Bash allowlist, and the
-    /// `allow` rules), passed as `--settings`. Missing entry leaves that
-    /// agent's settings alone.
-    pub settings_paths: BTreeMap<AgentId, PathBuf>,
-    /// Per-agent resolved MCP servers (`agent-mcp-<id>.json`), passed as
-    /// `--mcp-config`. Missing entry = no servers; `--strict-mcp-config` is
-    /// always passed, so nothing on the machine leaks in (spec 2026-08-17 §2).
-    pub mcp_paths: BTreeMap<AgentId, PathBuf>,
-    /// Per-agent managed Claude config dirs (`claude-config-<id>`), exported
-    /// as `CLAUDE_CONFIG_DIR` for `isolated_config` agents (spec 2026-08-24
-    /// §4). Missing entry = inherit the operator's `~/.claude`, as before.
-    pub config_dirs: BTreeMap<AgentId, PathBuf>,
     /// The operator's credential store, exported as
-    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` to the agents in `config_dirs` so an
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` to agents that have a `config_dir` so an
     /// isolated session reads and refreshes the same `.credentials.json` as
     /// the operator (never a copy or symlink — see `claude_config`). `None`
     /// when the daemon knows no home; the var is then left alone.
@@ -98,7 +89,7 @@ pub enum InjectError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
-    #[error("unknown agent '{0}'; the roster is frozen in tempo.toml")]
+    #[error("unknown agent '{0}'; not in the roster")]
     UnknownAgent(AgentId),
     #[error("agent '{0}' has exited; restart it first")]
     AgentExited(AgentId),
@@ -106,6 +97,8 @@ pub enum PtyError {
     Spawn { agent: AgentId, reason: String },
     #[error("pty i/o for agent '{agent}' failed: {reason}")]
     Io { agent: AgentId, reason: String },
+    #[error("agent '{0}' already exists in the roster")]
+    AgentExists(AgentId),
 }
 
 /// Implemented by `PtyManager`; the ONLY write path the router uses.
@@ -271,6 +264,9 @@ enum UnblockOutcome {
 }
 
 struct AgentHandle {
+    /// The spawn inputs for this agent; `resume` is consumed by the next
+    /// spawn that succeeds.
+    entry: RosterEntry,
     raw_tx: watch::Sender<AgentState>,
     debounced_rx: watch::Receiver<AgentState>,
     /// Session epoch; bumping it fails queued/in-flight injections.
@@ -297,8 +293,16 @@ struct AgentHandle {
     size: portable_pty::PtySize,
 }
 
+/// Per-agent lifecycle calls — `spawn`, `restart`, `stop`, `remove_agent` —
+/// must be serialized by the caller for one agent (a workflow run does so by
+/// construction; the session daemon holds a per-session lock). Racing them is
+/// unsupported: `stop` awaiting `reap` while another task `spawn`s the same
+/// agent lets the old reaper record its exit over the new session, and
+/// `remove_agent` between `spawn`'s two lock sections drops the fresh child
+/// without killing it.
 pub struct PtyManager {
-    workflow: Arc<FrozenWorkflow>,
+    /// The roster's debounce, kept for agents added after construction.
+    idle_debounce: Duration,
     bus: EventBus,
     env: AgentEnv,
     program: String,
@@ -416,77 +420,87 @@ fn default_pty_size() -> portable_pty::PtySize {
     }
 }
 
+/// One agent's channels, ring, queue worker and write pump, before any spawn.
+/// Shared by construction and, once it lands, [`PtyManager::add_agent`].
+fn new_handle(
+    id: &AgentId,
+    entry: RosterEntry,
+    idle_debounce: Duration,
+    clear_gate: &Arc<OnceLock<Weak<dyn ClearGate>>>,
+) -> AgentHandle {
+    let (raw_tx, raw_rx) = watch::channel(AgentState::Starting);
+    let debounced_rx = spawn_debouncer(raw_rx, idle_debounce);
+    let (epoch_tx, epoch_rx) = watch::channel(0_u64);
+    let (blocked_tx, blocked_rx) = watch::channel(None);
+    let hub = Arc::new(Mutex::new(OutputHub {
+        ring: ReplayRing::new(RING_CAPACITY),
+        subscribers: Vec::new(),
+    }));
+    let end_cursor = Arc::new(AtomicU64::new(0));
+    let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+    let (write_tx, write_rx) = mpsc::channel(64);
+    let writer_slot: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
+    let queue_depth = Arc::new(AtomicU64::new(0));
+    tokio::spawn(write_pump(write_rx, Arc::clone(&writer_slot), id.clone()));
+    tokio::spawn(
+        QueueWorker {
+            agent: id.clone(),
+            cmds: queue_rx,
+            debounced: debounced_rx.clone(),
+            epoch: epoch_rx,
+            blocked: blocked_rx,
+            writer: write_tx.clone(),
+            end_cursor: Arc::clone(&end_cursor),
+            auto_clear: entry.cfg.auto_clear,
+            clear_gate: Arc::clone(clear_gate),
+            prev: AgentState::Starting,
+            depth: Arc::clone(&queue_depth),
+            served_inject_since_idle: false,
+        }
+        .run(),
+    );
+    AgentHandle {
+        entry,
+        raw_tx,
+        debounced_rx,
+        epoch_tx,
+        hub,
+        end_cursor,
+        queue_tx,
+        queue_depth,
+        write_tx,
+        writer_slot,
+        pause: Arc::new(PauseFlag::new()),
+        blocked_tx,
+        session: None,
+        exit: None,
+        size: default_pty_size(),
+    }
+}
+
 impl PtyManager {
     /// Must be called inside a tokio runtime (spawns per-agent workers).
     #[must_use]
-    pub fn new(workflow: Arc<FrozenWorkflow>, bus: EventBus, env: AgentEnv) -> Arc<PtyManager> {
-        PtyManager::new_with_program(workflow, bus, env, "claude")
+    pub fn new(roster: PtyRoster, bus: EventBus, env: AgentEnv) -> Arc<PtyManager> {
+        PtyManager::new_with_program(roster, bus, env, "claude")
     }
 
     /// Test seam: substitute the spawned program (e.g. a scripted fake agent).
     #[must_use]
     pub fn new_with_program(
-        workflow: Arc<FrozenWorkflow>,
+        roster: PtyRoster,
         bus: EventBus,
         env: AgentEnv,
         program: &str,
     ) -> Arc<PtyManager> {
         let clear_gate: Arc<OnceLock<Weak<dyn ClearGate>>> = Arc::new(OnceLock::new());
         let mut agents = BTreeMap::new();
-        for (id, cfg) in &workflow.agents {
-            let (raw_tx, raw_rx) = watch::channel(AgentState::Starting);
-            let debounced_rx = spawn_debouncer(raw_rx, workflow.idle_debounce);
-            let (epoch_tx, epoch_rx) = watch::channel(0_u64);
-            let (blocked_tx, blocked_rx) = watch::channel(None);
-            let hub = Arc::new(Mutex::new(OutputHub {
-                ring: ReplayRing::new(RING_CAPACITY),
-                subscribers: Vec::new(),
-            }));
-            let end_cursor = Arc::new(AtomicU64::new(0));
-            let (queue_tx, queue_rx) = mpsc::unbounded_channel();
-            let (write_tx, write_rx) = mpsc::channel(64);
-            let writer_slot: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
-            let queue_depth = Arc::new(AtomicU64::new(0));
-            tokio::spawn(write_pump(write_rx, Arc::clone(&writer_slot), id.clone()));
-            tokio::spawn(
-                QueueWorker {
-                    agent: id.clone(),
-                    cmds: queue_rx,
-                    debounced: debounced_rx.clone(),
-                    epoch: epoch_rx,
-                    blocked: blocked_rx,
-                    writer: write_tx.clone(),
-                    end_cursor: Arc::clone(&end_cursor),
-                    auto_clear: cfg.auto_clear,
-                    clear_gate: Arc::clone(&clear_gate),
-                    prev: AgentState::Starting,
-                    depth: Arc::clone(&queue_depth),
-                    served_inject_since_idle: false,
-                }
-                .run(),
-            );
-            agents.insert(
-                id.clone(),
-                AgentHandle {
-                    raw_tx,
-                    debounced_rx,
-                    epoch_tx,
-                    hub,
-                    end_cursor,
-                    queue_tx,
-                    queue_depth,
-                    write_tx,
-                    writer_slot,
-                    pause: Arc::new(PauseFlag::new()),
-                    blocked_tx,
-                    session: None,
-                    exit: None,
-                    size: default_pty_size(),
-                },
-            );
+        for (id, entry) in roster.agents {
+            let handle = new_handle(&id, entry, roster.idle_debounce, &clear_gate);
+            agents.insert(id, handle);
         }
         Arc::new_cyclic(|me| PtyManager {
-            workflow,
+            idle_debounce: roster.idle_debounce,
             bus,
             env,
             program: program.to_string(),
@@ -522,12 +536,43 @@ impl PtyManager {
         }
     }
 
-    /// Spawns every agent in the frozen roster, in lexicographic order.
+    /// Adds an agent to the roster without spawning it: creates its channels,
+    /// ring, queue worker and write pump. Call [`PtyManager::spawn`] next.
+    /// Must be called inside a tokio runtime (spawns per-agent workers).
+    ///
+    /// # Errors
+    /// [`PtyError::AgentExists`] if the id is already in the roster.
+    pub fn add_agent(&self, id: AgentId, entry: RosterEntry) -> Result<(), PtyError> {
+        let mut agents = lock(&self.agents);
+        if agents.contains_key(&id) {
+            return Err(PtyError::AgentExists(id));
+        }
+        let handle = new_handle(&id, entry, self.idle_debounce, &self.clear_gate);
+        agents.insert(id, handle);
+        Ok(())
+    }
+
+    /// Sets (or clears) the `--resume <claude_session_id>` the next spawn of
+    /// `agent` passes. Consumed by the next spawn that succeeds; a refused or
+    /// failed spawn leaves it armed, and a later respawn never reuses it.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] off-roster.
+    pub fn set_resume(&self, agent: &AgentId, resume: Option<String>) -> Result<(), PtyError> {
+        let mut agents = lock(&self.agents);
+        let handle = agents
+            .get_mut(agent)
+            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+        handle.entry.resume = resume;
+        Ok(())
+    }
+
+    /// Spawns every agent in the roster, in lexicographic order.
     ///
     /// # Errors
     /// Propagates the first [`PtyError`] from [`PtyManager::spawn`].
     pub async fn spawn_all(&self) -> Result<(), PtyError> {
-        let ids: Vec<AgentId> = self.workflow.agents.keys().cloned().collect();
+        let ids: Vec<AgentId> = lock(&self.agents).keys().cloned().collect();
         for id in ids {
             self.spawn(&id).await?;
         }
@@ -546,13 +591,7 @@ impl PtyManager {
         reason = "async signature frozen in contracts §3; awaited by spawn_all/restart"
     )]
     pub async fn spawn(&self, agent: &AgentId) -> Result<(), PtyError> {
-        let cfg = self
-            .workflow
-            .agents
-            .get(agent)
-            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?
-            .clone();
-        let size = {
+        let (entry, size) = {
             let agents = lock(&self.agents);
             let handle = agents
                 .get(agent)
@@ -560,22 +599,25 @@ impl PtyManager {
             if handle.session.is_some() {
                 return Ok(());
             }
-            handle.size
+            // `resume` is for this spawn only; only cleared once this spawn
+            // actually lands a session (below) so a refused or failed attempt
+            // leaves it armed for the next one.
+            (handle.entry.clone(), handle.size)
         };
         if let Some(gate) = self.spawn_gate.get() {
-            gate.before_spawn(agent, &cfg.dir)
+            gate.before_spawn(agent, &entry.cfg.dir)
                 .map_err(|reason| PtyError::Spawn {
                     agent: agent.clone(),
                     reason,
                 })?;
         }
         let OpenedPty {
-            session,
+            mut session,
             mut child,
             exited_tx,
             reader,
             writer,
-        } = self.open_pty(agent, &cfg, size)?;
+        } = self.open_pty(agent, &entry, size)?;
 
         let (raw_bytes_tx, raw_bytes_rx) = mpsc::channel::<Vec<u8>>(64);
         let (flushed_tx, flushed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -586,13 +628,23 @@ impl PtyManager {
         let my_epoch;
         {
             let mut agents = lock(&self.agents);
-            let handle = agents
-                .get_mut(agent)
-                .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+            let Some(handle) = agents.get_mut(agent) else {
+                drop(agents);
+                if let Err(err) = session.killer.kill() {
+                    tracing::warn!(
+                        agent = %agent,
+                        error = %err,
+                        "kill after agent vanished mid-spawn failed"
+                    );
+                }
+                return Err(PtyError::UnknownAgent(agent.clone()));
+            };
             my_epoch = *handle.epoch_tx.borrow();
             *lock(&handle.writer_slot) = Some(writer);
             handle.exit = None;
             handle.session = Some(session);
+            // This spawn landed a session; the resume id (if any) is consumed.
+            handle.entry.resume = None;
             spawn_reader(reader, raw_bytes_tx, Arc::clone(&handle.pause));
             tokio::spawn(pipeline(
                 Arc::clone(&handle.hub),
@@ -630,13 +682,15 @@ impl PtyManager {
         Ok(())
     }
 
-    /// Opens a PTY pair and starts the agent process in it with the frozen spawn
-    /// recipe. The `--append-system-prompt` value is the role prompt plus the
-    /// protocol primer from [`FrozenWorkflow::system_prompt`] (contracts amendment 3).
+    /// Opens a PTY pair and starts the agent process in it with the spawn
+    /// recipe. The `--append-system-prompt` value, when the entry has one, is
+    /// the role prompt plus the protocol primer from
+    /// `FrozenWorkflow::system_prompt` (contracts amendment 3); sessions have
+    /// none (amendment 46).
     fn open_pty(
         &self,
         agent: &AgentId,
-        cfg: &AgentConfig,
+        entry: &RosterEntry,
         size: portable_pty::PtySize,
     ) -> Result<OpenedPty, PtyError> {
         let spawn_err = |e: &dyn std::fmt::Display| PtyError::Spawn {
@@ -647,19 +701,14 @@ impl PtyManager {
             agent: agent.clone(),
             reason: e.to_string(),
         };
-        let system_prompt = self
-            .workflow
-            .system_prompt(agent)
-            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
         let pair = portable_pty::native_pty_system()
             .openpty(size)
             .map_err(|e| spawn_err(&e))?;
         let cmd = to_command(&spawn_spec(&SpawnInputs {
             id: agent,
-            cfg,
+            entry,
             env: &self.env,
             program: &self.program,
-            system_prompt: &system_prompt,
         }));
         let child = pair.slave.spawn_command(cmd).map_err(|e| spawn_err(&e))?;
         drop(pair.slave);
@@ -740,7 +789,7 @@ impl PtyManager {
         );
     }
 
-    /// Kill + respawn from the same frozen config. Fails queued/in-flight
+    /// Kill + respawn from the same roster entry. Fails queued/in-flight
     /// injections with `InjectError::AgentRestarted` (via the epoch bump).
     /// Emits agent.lifecycle restarting → spawned, or restarting → exited when
     /// the respawn is refused.
@@ -780,6 +829,61 @@ impl PtyManager {
             self.mark_exited_after_failed_spawn(agent, &err);
             return Err(err);
         }
+        Ok(())
+    }
+
+    /// Kills one agent's process and waits for it to exit (SIGHUP, then SIGKILL
+    /// after [`EXIT_GRACE`]) — `shutdown` for one handle. Unlike `restart`
+    /// there is no epoch bump: the bump exists to fail queued injections with
+    /// `AgentRestarted`, and here the queue fails them itself on the raw
+    /// `Exited`; because `reap` awaits the reaper thread's oneshot, which it
+    /// sends only after `on_child_exit`, [`PtyManager::exit`] is recorded when
+    /// this returns. The handle, ring and output subscribers survive, so a
+    /// later [`PtyManager::spawn`] continues the same stream (spec 2026-08-27
+    /// §4, amendment 46).
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] off-roster; [`PtyError::AgentExited`] when
+    /// there is no live session to stop.
+    pub async fn stop(&self, agent: &AgentId) -> Result<(), PtyError> {
+        let (session, was_blocked) = {
+            let mut agents = lock(&self.agents);
+            let handle = agents
+                .get_mut(agent)
+                .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+            let Some(session) = handle.session.take() else {
+                return Err(PtyError::AgentExited(agent.clone()));
+            };
+            let _ = handle.raw_tx.send(AgentState::Exited);
+            *lock(&handle.writer_slot) = None;
+            (session, Self::take_blocked(handle))
+        };
+        if was_blocked {
+            self.publish_blocked(agent, false, None);
+        }
+        reap(agent, session, "stop").await;
+        Ok(())
+    }
+
+    /// `stop()` if live, then drop the handle. Output subscribers are closed
+    /// explicitly; the queue worker, write pump and state subscribers end
+    /// when their senders drop with the handle. The id becomes unknown.
+    ///
+    /// Must not race `spawn` on the same agent (see the type-level contract).
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] off-roster.
+    pub async fn remove_agent(&self, agent: &AgentId) -> Result<(), PtyError> {
+        match self.stop(agent).await {
+            Ok(()) | Err(PtyError::AgentExited(_)) => {}
+            Err(err) => return Err(err),
+        }
+        let handle = lock(&self.agents)
+            .remove(agent)
+            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+        lock(&handle.hub).subscribers.clear();
+        drop(handle);
+        tracing::info!(agent = %agent, "removed agent from roster");
         Ok(())
     }
 
@@ -882,7 +986,7 @@ impl PtyManager {
     /// received `start` re-delivers that chunk.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn subscribe_output(
         &self,
         agent: &AgentId,
@@ -906,7 +1010,7 @@ impl PtyManager {
     /// One-shot ring read: (cursor after last byte, bytes from `max(since, start)`).
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn read_ring(
         &self,
         agent: &AgentId,
@@ -934,7 +1038,7 @@ impl PtyManager {
     /// its `PermissionRequest` hook fired and nothing has cleared it yet.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn blocked(&self, agent: &AgentId) -> Result<bool, PtyError> {
         let agents = lock(&self.agents);
         let handle = agents
@@ -946,7 +1050,7 @@ impl PtyManager {
     /// When the current dialog went up and for which tool; `None` when clear.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn blocked_since(&self, agent: &AgentId) -> Result<Option<Blocked>, PtyError> {
         let agents = lock(&self.agents);
         let handle = agents
@@ -987,7 +1091,7 @@ impl PtyManager {
     /// nothing and keeps the original `since`.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn report_blocked(
         &self,
         agent: &AgentId,
@@ -1034,7 +1138,7 @@ impl PtyManager {
     /// is missing.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn report_refused(
         &self,
         agent: &AgentId,
@@ -1072,7 +1176,7 @@ impl PtyManager {
     /// Turn boundaries, restart, exit and shutdown clear regardless.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn report_unblocked(
         &self,
         agent: &AgentId,
@@ -1117,7 +1221,7 @@ impl PtyManager {
     /// Current RAW (undebounced) state.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn state(&self, agent: &AgentId) -> Result<AgentState, PtyError> {
         let agents = lock(&self.agents);
         let handle = agents
@@ -1134,7 +1238,7 @@ impl PtyManager {
     /// is a turn boundary.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn report_state(&self, agent: &AgentId, state: AgentState) -> Result<(), PtyError> {
         let (was_blocked, changed) = {
             let mut agents = lock(&self.agents);
@@ -1175,7 +1279,7 @@ impl PtyManager {
     /// How the last session ended, set only while the agent is `exited`.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn exit(&self, agent: &AgentId) -> Result<Option<AgentExit>, PtyError> {
         let agents = lock(&self.agents);
         let handle = agents
@@ -1187,7 +1291,7 @@ impl PtyManager {
     /// Feeds `agent.state` events; the UI shows this truth undebounced.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn subscribe_state_raw(
         &self,
         agent: &AgentId,
@@ -1203,7 +1307,7 @@ impl PtyManager {
     /// off this signal.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn subscribe_state_debounced(
         &self,
         agent: &AgentId,
@@ -1218,7 +1322,7 @@ impl PtyManager {
     /// Number of injections enqueued for `agent` and not yet delivered or failed.
     ///
     /// # Errors
-    /// [`PtyError::UnknownAgent`] if the agent is not in the frozen roster.
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
     pub fn queue_depth(&self, agent: &AgentId) -> Result<u64, PtyError> {
         let agents = lock(&self.agents);
         let handle = agents

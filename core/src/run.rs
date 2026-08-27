@@ -13,7 +13,9 @@ use crate::api::{ApiContext, ApiServerHandle, PtyManagerSource, ServeError, chec
 use crate::bus::EventBus;
 use crate::locks::{AgentLocks, MemberGuards};
 use crate::pty::hooks::write_agent_settings_files;
-use crate::pty::{AgentEnv, ClearGate, InjectionQueue, PtyError, PtyManager};
+use crate::pty::{
+    AgentEnv, ClearGate, InjectionQueue, McpPolicy, PtyError, PtyManager, PtyRoster, RosterEntry,
+};
 use crate::router::{Router, StateSource};
 use crate::store::{Store, StoreError};
 use crate::time::Timestamp;
@@ -308,6 +310,31 @@ impl Run {
         })
     }
 
+    /// One roster entry per frozen agent: the composed system prompt, strict
+    /// MCP with that agent's file (if it declared servers), its settings file
+    /// and, for `isolated_config` agents, its managed config dir.
+    fn roster(workflow: &FrozenWorkflow, files: &AgentFiles) -> PtyRoster {
+        let mut agents = BTreeMap::new();
+        for (id, cfg) in &workflow.agents {
+            agents.insert(
+                id.clone(),
+                RosterEntry {
+                    system_prompt: workflow.system_prompt(id),
+                    mcp: McpPolicy::Strict(files.mcp_paths.get(id).cloned()),
+                    settings_path: files.settings_paths.get(id).cloned(),
+                    config_dir: files.config_dirs.get(id).cloned(),
+                    token: None,
+                    resume: None,
+                    cfg: cfg.clone(),
+                },
+            );
+        }
+        PtyRoster {
+            agents,
+            idle_debounce: workflow.idle_debounce,
+        }
+    }
+
     /// The two directories every run needs before it can write anything: the
     /// one holding this executable (agents get `tempo` from it on PATH) and
     /// `~/.coretempo/runs`.
@@ -369,28 +396,22 @@ impl Run {
 
         let bus = EventBus::new();
         let (tempo_bin_dir, runs_dir) = Run::setup_dirs()?;
-        let AgentFiles {
-            settings_paths,
-            mcp_paths,
-            config_dirs,
-            credential_store,
-        } = Run::write_agent_files(&runs_dir, &run_id, &tempo_bin_dir, &workflow)?;
-        let mirrors = config_dirs
+        let agent_files = Run::write_agent_files(&runs_dir, &run_id, &tempo_bin_dir, &workflow)?;
+        let mirrors = agent_files
+            .config_dirs
             .iter()
             .map(|(id, dir)| (id.clone(), TrustStore::at(dir.join(".claude.json"))))
             .collect();
         let (listener, port) = Run::bind_api(&server, options).await?;
+        let roster = Run::roster(&workflow, &agent_files);
         let pty = PtyManager::new(
-            Arc::clone(&workflow),
+            roster,
             bus.clone(),
             AgentEnv {
                 port,
                 token: server.token.clone(),
                 tempo_bin_dir,
-                settings_paths,
-                mcp_paths,
-                config_dirs,
-                credential_store,
+                credential_store: agent_files.credential_store,
             },
         );
         let router = Router::new(

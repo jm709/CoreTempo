@@ -363,6 +363,8 @@ pub struct AgentEnv {                 // injected into every agent PTY
     pub port: u16,
     pub token: Token,
     pub tempo_bin_dir: PathBuf,       // prepended to PATH
+    pub credential_store: Option<PathBuf>,
+    // per-agent files: RosterEntry (amendment 46)
 }
 ```
 
@@ -1368,3 +1370,34 @@ frozen alongside the sections above:
     `agentsState.refused: Record<agent, Refusal>` set by the event and
     cleared on resync, rendered as a ⛔ badge (roster and graph node) whose
     title is the refused tool and input plus the allow-rule hint.
+46. **`PtyManager` is built from a `PtyRoster`, not a `FrozenWorkflow`**
+    (spec 2026-08-27 §4). `core/src/pty/roster.rs`: `RosterEntry { cfg:
+    AgentConfig, system_prompt: Option<String>, mcp: McpPolicy,
+    settings_path: Option<PathBuf>, config_dir: Option<PathBuf>, token:
+    Option<Token>, resume: Option<String> }`, `enum McpPolicy {
+    Strict(Option<PathBuf>), Inherit }`, `PtyRoster { agents:
+    BTreeMap<AgentId, RosterEntry>, idle_debounce: Duration }`
+    (`PtyRoster::empty(debounce)`, `RosterEntry::new(cfg)`).
+    `PtyManager::new(roster, bus, env)` / `new_with_program(roster, bus,
+    env, program)`; `AgentEnv` keeps `port`, `token`, `tempo_bin_dir`,
+    `credential_store` — the per-agent maps moved onto the entries. The
+    spawn recipe reads the entry: `--append-system-prompt` only with a
+    `Some` prompt, `--resume <id>` when set (consumed by the next spawn
+    that succeeds — a spawn refused by the gate or failed in `open_pty`
+    leaves it armed), `--settings` when set, `Strict(file)` = today's
+    `--strict-mcp-config` plus optional `--mcp-config`, `Inherit` =
+    neither flag, `CORETEMPO_TOKEN` = the entry's token else the env
+    token, `CLAUDE_CONFIG_DIR` (+ credential store) only with a
+    `config_dir`. `Run` builds one entry per frozen agent so a workflow
+    run's argv and env are unchanged. New: `add_agent(id, entry) ->
+    Result<(), PtyError>` (creates channels/workers, no spawn; must run
+    inside a tokio runtime; `PtyError::AgentExists`),
+    `set_resume(&id, Option<String>)`, `async stop(&id)` (one agent's
+    `shutdown`: SIGHUP → SIGKILL after `EXIT_GRACE`, blocked flag cleared
+    with `blocked: false`, exit recorded before return, handle/ring/
+    subscribers kept; `PtyError::AgentExited` when nothing is live),
+    `async remove_agent(&id)` (stop if live, then closes output
+    subscribers explicitly — `hub.subscribers.clear()` — before dropping
+    the handle: queue worker, write pump and state subscribers all end).
+    `PtyError::UnknownAgent`'s text is now "unknown agent '<id>'; not in
+    the roster". Workflow runs call none of the new methods.
