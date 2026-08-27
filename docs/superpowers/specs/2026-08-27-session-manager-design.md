@@ -71,8 +71,11 @@ the new state and answers accordingly).
 
 - **create**: register the project if new, create the worktree if asked
   (§5), run the trust gate (§3), write the session's files (§4), spawn,
-  inject `prompt` if given. Any failure before spawn leaves no row, no
-  files and no worktree.
+  inject `prompt` if given. **Create is atomic**: a failure anywhere up to
+  and including the spawn (untrusted root, git failure, `claude` missing,
+  PTY open) rolls back the row, the session files and the fresh worktree
+  (nothing has run in it) and returns that error — a session exists only
+  once its process is running.
 - **stop**: `PtyManager::stop(session)` (§4): SIGHUP via portable-pty's
   killer, reap with the existing `EXIT_GRACE` (5 s) then SIGKILL; the
   `blocked` flag is cleared with the usual `blocked: false` event; the row
@@ -84,9 +87,9 @@ the new state and answers accordingly).
   `delete`). Respawn in the same `cwd`. With a `claude_session_id`, the
   respawn passes `--resume <id>`; without one, a fresh spawn — the response
   carries `resumed: false`. If Claude Code rejects the id (transcript gone)
-  it exits within seconds and the session is reported `exited` with the PTY
-  tail in the `agent.lifecycle` event; there is no silent fallback to a
-  fresh start (to verify live — §10). The PTY reopens at the handle's last
+  it exits within seconds and the session is reported `exited` through
+  `agent.lifecycle` (code/signal; the output stays on the PTY stream);
+  there is no silent fallback to a fresh start (to verify live — §10). The PTY reopens at the handle's last
   size within one daemon life and at the 120×40 default after a daemon
   restart; `attach` and the desktop resize on connect, so this self-corrects.
 - **delete**: 409 if live. The row and the session's files go; with
@@ -127,6 +130,21 @@ resolved from `HOME` exactly as `~/.coretempo/runs/` is:
   therefore report its own state and not type into, create, or delete other
   sessions. Workflow runs keep their single-token model; this scoping is
   sessions-only because sessions span every registered project.
+  **Mechanism** (amendment 47): today `check_bearer` compares against the
+  one `ctx.token` and identity comes from the `X-CoreTempo-Agent` header
+  the CLI sends from `CORETEMPO_AGENT_ID` — with several tokens the token
+  must decide identity, or a session could spoof another's `/state` by
+  changing the header. The shared context gets
+  `trait TokenAuth { fn classify(&self, bearer: &str) -> Operator | Hook(AgentId) | Unknown }`;
+  runs implement it as the single operator token, the daemon compares the
+  operator token then every live hook token in constant time. The guard
+  403s `Hook(id)` on any route other than `POST /v1/agents/{id}/state`
+  (message names the one route); `caller_origin` derives `Origin::Agent(id)`
+  from `Hook(id)` and 403s a mismatching `X-CoreTempo-Agent`. A hook token
+  lives as long as its row (resume exports the same one; a late `Stop` hook
+  after stop is dropped by `report_state`'s exited guard as today).
+  `sessions.db` and its `-wal`/`-shm` are created 0600 — it holds bearer
+  tokens, which the message store never did.
 - Runs in the foreground. Supervision (systemd, tmux, `setsid`) is the
   operator's; the desktop (Spec B) spawns it detached when `api.json` is
   absent or its pid is dead, then polls `/v1/health`.
@@ -137,16 +155,21 @@ resolved from `HOME` exactly as `~/.coretempo/runs/` is:
   a linked worktree is its own toplevel (`trust.rs`:
   `trust_root_of_a_worktree_is_the_worktree_dir`), so a fresh worktree is
   always an untrusted root. Rule: the `TrustGate` runs before every spawn
-  and resume with one derived grant — when `create` makes a worktree and the
-  **project root** is trusted, the daemon writes the trust key for the new
-  worktree path (the operator consented to that repository; CoreTempo made
-  the directory). Any other untrusted root (an untrusted project, a
-  session without a worktree in an untrusted repo, a worktree whose project
-  lost trust before resume) fails with the roots and both fixes exactly as
-  `Run::start_with` prints them; `trust_agent_dirs` from
-  `~/.coretempo/config.toml` applies. Trust is never granted silently
-  beyond that one derived case, which the spec states here and the log
-  records.
+  and resume with one derived rule for worktree sessions, applied at
+  **every** spawn (create and each resume): if the **project root** is
+  trusted, the daemon (re)writes the trust key for the worktree path — the
+  operator consented to that repository, CoreTempo made the directory, and
+  a live Claude flush can revert the worktree key at any time; if the
+  project root is not trusted, the spawn fails. In `create` the project
+  root is checked **before** `git worktree add`, so an untrusted project
+  never leaves a worktree behind. Any other untrusted root (a session
+  without a worktree in an untrusted repo) fails with the roots and both
+  fixes exactly as `Run::start_with` prints them; `trust_agent_dirs` from
+  `~/.coretempo/config.toml` applies. `TrustGate`'s isolated-config
+  mirrors are fixed at construction, so the daemon has its own `SpawnGate`
+  (`SessionTrustGate`) holding a mirror registry keyed by session id.
+  Trust is never granted silently beyond the derived worktree case, which
+  the spec states here and the log records on every grant.
 
 ## 4. `PtyManager` decoupling
 
@@ -166,12 +189,15 @@ code, with the existing suites as the proof of behaviour preservation
    pub struct RosterEntry {
        pub cfg: AgentConfig,
        pub system_prompt: Option<String>,  // None = no --append-system-prompt
-       pub mcp: McpPolicy,                 // Strict(path) | Inherit
+       pub mcp: McpPolicy,
        pub settings_path: Option<PathBuf>,
        pub config_dir: Option<PathBuf>,
+       pub token: Option<Token>,           // None = the AgentEnv token (runs)
        pub resume: Option<String>,         // --resume <claude_session_id>
    }
-   pub enum McpPolicy { Strict(PathBuf), Inherit }
+   // Strict = today's argv: --strict-mcp-config always, --mcp-config only
+   // for agents that have a file. Inherit passes neither flag.
+   pub enum McpPolicy { Strict(Option<PathBuf>), Inherit }
    pub struct PtyRoster {
        pub agents: BTreeMap<AgentId, RosterEntry>,
        pub idle_debounce: Duration,
@@ -179,28 +205,35 @@ code, with the existing suites as the proof of behaviour preservation
    pub fn new(roster: PtyRoster, bus: EventBus, env: AgentEnv) -> Arc<PtyManager>
    ```
    `Run` builds the roster from its frozen workflow (`system_prompt =
-   Some(workflow.system_prompt(id))`, `mcp = Strict(agent-mcp file)`,
-   `resume = None`). The per-agent maps leave `AgentEnv`, which keeps
-   `port`, `token`, `tempo_bin_dir`, `credential_store`. `Strict` and a
-   `Some` system prompt reproduce today's argv byte for byte; `Inherit`
-   passes neither `--strict-mcp-config` nor `--mcp-config`; `None` omits
-   `--append-system-prompt`; `resume` adds `--resume <id>` to the next spawn
-   only (never the first spawn after create).
+   Some(workflow.system_prompt(id))`, `mcp = Strict(mcp_paths.get(id))`,
+   `token = None`, `resume = None`). The per-agent maps leave `AgentEnv`,
+   which keeps `port`, `token`, `tempo_bin_dir`, `credential_store`;
+   `SpawnInputs` gains the resolved token (`entry.token` else `env.token`)
+   and exports it as `CORETEMPO_TOKEN`. `Strict(..)` and a `Some` system
+   prompt reproduce today's argv byte for byte; `Inherit` passes neither
+   `--strict-mcp-config` nor `--mcp-config`; `None` omits
+   `--append-system-prompt`. `resume` adds `--resume <id>` to the next
+   spawn only: `spawn` consumes it (clears the field), so a stale id can
+   never ride along on a later respawn; the daemon sets it fresh before
+   every resume.
 2. **Dynamic roster.** Handle construction becomes `fn new_handle(&self, id,
    &RosterEntry)`. `add_agent(id, entry) -> Result<(), PtyError>` (error
    `AgentExists`), `set_resume(id, Option<String>)`, `remove_agent(id)`
    (stops it if live, drops the handle, closes its channels so subscribers
    end). Workflow runs call none of these.
-3. **Per-agent stop.** `stop(agent)` — `shutdown` for one handle: no epoch
-   bump (so the reaper thread still records the exit — `restart` bumps the
-   epoch precisely to suppress that), `session.take()`, raw state
-   `Exited`, `take_blocked` with its `blocked: false` event, await `reap`.
-   The handle, ring and subscribers survive; `spawn` on it later is the
-   resume path. Listed in amendment 46.
+3. **Per-agent stop.** `stop(agent)` — `shutdown` for one handle:
+   `session.take()`, raw state `Exited`, `take_blocked` with its
+   `blocked: false` event, await `reap`. No epoch bump: `restart` bumps the
+   epoch to fail queued and in-flight injections with `AgentRestarted`, and
+   suppressing the stale exit record is a side effect of that; under `stop`
+   the queue fails its injections itself on the debounced `Exited`, and
+   because `reap` awaits the `exited` oneshot the reaper sends only after
+   `on_child_exit`, the exit is recorded before `stop` returns. The handle,
+   ring and subscribers survive; `spawn` on it later is the resume path.
+   Listed in amendment 46.
 
-The session daemon owns one `PtyManager` with an empty roster and the
-`token` in its `AgentEnv` replaced per entry by the session's hook token
-(`RosterEntry.token: Token`, `None` in runs = the env token). Each
+The session daemon owns one `PtyManager` with an empty roster; every
+entry carries the session's hook token in `RosterEntry.token`. Each
 session's `AgentConfig` is synthesised: `dir = cwd`, `model`,
 `permission_mode`, `auto_clear = false`, `prompt = ""`, no edges, tools,
 allow or mcp; `system_prompt = None`, `mcp = Inherit`. `idle_debounce` is
@@ -297,7 +330,7 @@ Operator token unless noted.
 | `POST /v1/sessions/{id}/pty/resize { cols, rows }` | resize |
 | `POST /v1/sessions/{id}/pty/pause { paused }` | backpressure flag |
 | `POST /v1/agents/{id}/state` | the hook target, mounted from the run API through the `Roster` trait; body gains optional `claude_session_id`. Hook token of that id, or the operator token |
-| `GET /v1/events?agent=` | SSE, the `Event` envelope. The `PtyManager`'s own events are emitted as they are today with `agent` = session id: `agent.state`, `agent.lifecycle` (spawned / exited with code, signal and the PTY tail), `agent.blocked`, `agent.permission_refused`. Added: `session.created`, `session.stopped`, `session.resumed`, `session.deleted`, `project.registered`, `project.forgotten`. No duplicated `session.*` copies of `agent.*` |
+| `GET /v1/events?agent=` | SSE, the `Event` envelope. The `PtyManager`'s own events are emitted as they are today with `agent` = session id: `agent.state`, `agent.lifecycle` (spawned / exited with code and signal — no tail; the ring holds it), `agent.blocked`, `agent.permission_refused`. Added: `session.created`, `session.stopped`, `session.resumed`, `session.deleted` (each carries `agent: <session id>`, so the `?agent=` filter passes them to `attach`) and `project.registered`, `project.forgotten` (always pass the filter, like `run.started`). No duplicated `session.*` copies of `agent.*` |
 
 The three PTY commands that today exist only as Tauri commands (`write`,
 `resize`, `pause`) move into `core::api` as handlers both the run API and
@@ -342,7 +375,7 @@ Every failure names the fix:
 - stop/resume/delete in the wrong state → the state and the valid action.
 
 Nothing is swallowed. An unexpected exit publishes `agent.lifecycle` with
-code/signal and keeps the ring tail readable until `delete`.
+code/signal; the ring keeps the last output readable until `delete`.
 
 ## 9. Storage
 
@@ -361,9 +394,9 @@ CREATE TABLE sessions (
   created_at TEXT NOT NULL, stopped_at TEXT);
 ```
 
-`last_state ∈ { stopped, exited }` once the row has left live (on first
-create it is `stopped` until the spawn succeeds, then overwritten on the
-next transition); the live `state` comes from the `PtyManager`. `SessionStore`
+`last_state ∈ { stopped, exited }`; it is written on the first transition
+out of live (create is atomic, so a row never exists before its spawn) and
+the live `state` comes from the `PtyManager`. `SessionStore`
 follows the `Store` conventions (`spawn_blocking` open, WAL, `user_version`).
 
 ## 10. Testing
@@ -392,10 +425,12 @@ TDD throughout; the scripted fake agent for everything but one live check.
   delete; daemon shutdown marks rows `exited` with `stopped_at` and a
   reopen shows them; non-git project fails create with git's stderr, no
   row, no files.
-- `core/src/trust.rs`: `trust_root(worktree) == worktree` (exists); new:
-  create-with-worktree under a trusted project root spawns without the
-  dialog and the derived grant is written; under an untrusted root create
-  fails naming both.
+- `core/src/trust.rs`: `trust_root(worktree) == worktree` already exists
+  and stays. In `core/tests/sessions.rs`: create-with-worktree under a
+  trusted project root spawns and the derived grant is written (and
+  re-written on resume after the key is reverted); under an untrusted
+  project root create fails naming both fixes and leaves no worktree;
+  spawn failure (fake agent missing) rolls back row, files and worktree.
 - `daemon/tests/sessions_api.rs`: boot on a temp home; every route;
   `api.json` mode 0600, contents, removal on exit; stale-pid overwrite;
   second-instance refusal with pid/port; SSE event order for a full
@@ -424,12 +459,13 @@ runs.
 
 ## 12. Contracts amendments
 
-- **46** — `PtyRoster`, `RosterEntry`, `McpPolicy`, `PtyManager::new(roster,
+- **46** — `PtyRoster`, `RosterEntry` (incl. `token`), `McpPolicy`, `PtyManager::new(roster,
   …)`, `add_agent`, `set_resume`, `stop`, `remove_agent`,
   `PtyError::AgentExists`; `AgentEnv` loses its per-agent maps.
 - **47** — session and project types, `SessionsApiFile`, `SessionsHealth`,
   the `/v1/sessions` and `/v1/projects` routes, the PTY write/resize/pause
-  routes, the `Roster` trait and `ApiContext` split, the `session.*` /
-  `project.*` events, `claude_session_id` on the state report, hook-token
-  scope, the `tempo`/`coretempod` dispatch restructure.
+  routes, the `Roster` and `TokenAuth` traits and the `ApiContext` split,
+  the `session.*` / `project.*` events and their filter rule,
+  `claude_session_id` on the state report, hook-token scope and lifetime,
+  `SessionTrustGate`, the `tempo`/`coretempod` dispatch restructure.
 - **48** — `tempo session` commands and exit statuses.
