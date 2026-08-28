@@ -76,41 +76,37 @@ impl SessionTrustGate {
     }
 
     /// The derived rule: operator consent for the repository, then the key
-    /// and the MCP approvals written for the worktree.
+    /// and the MCP approvals written for the worktree — in one read and at
+    /// most one write of the operator's live `~/.claude.json`, and none at
+    /// all once the entry already says this.
     fn derive(&self, agent: &AgentId, trust: &SessionTrust, worktree: &Path) -> Result<(), String> {
         preflight(&self.store, [trust.project_root.as_path()], self.policy)
             .map_err(|e| e.to_string())?;
         let wt_root = trust_root(worktree);
-        self.store
-            .grant(std::slice::from_ref(&wt_root))
-            .map_err(|e| e.to_string())?;
-        let approvals = self
+        let wrote = self
             .store
-            .project_keys(&trust.project_root, &MCP_APPROVAL_KEYS)
-            .map_err(|e| e.to_string())?;
-        self.store
-            .set_project_keys(&wt_root, approvals)
-            .map_err(|e| e.to_string())?;
-        tracing::info!(
-            agent = %agent,
-            worktree = %wt_root.display(),
-            project = %trust.project_root.display(),
-            "granted derived trust for a session worktree (the project root is trusted)"
-        );
+            .derive_project(&trust.project_root, &wt_root, &MCP_APPROVAL_KEYS)
+            .map_err(|e| format!("derived worktree trust: {e}"))?;
+        if wrote {
+            tracing::info!(
+                agent = %agent,
+                worktree = %wt_root.display(),
+                project = %trust.project_root.display(),
+                "granted derived trust for a session worktree (the project root is trusted)"
+            );
+        }
         Ok(())
     }
 
     fn mirror(&self, mirror: &TrustStore, root: &Path) -> Result<(), String> {
-        mirror
-            .grant(&[root.to_path_buf()])
-            .map_err(|e| format!("cannot mirror trust into the managed config dir: {e}"))?;
         let approvals = self
             .store
             .project_keys(root, &MCP_APPROVAL_KEYS)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("mirror: {e}"))?;
         mirror
-            .set_project_keys(root, approvals)
-            .map_err(|e| format!("cannot mirror MCP approvals into the managed config dir: {e}"))
+            .grant_with_keys(root, &approvals)
+            .map(|_| ())
+            .map_err(|e| format!("cannot mirror trust into the managed config dir: {e}"))
     }
 }
 
@@ -168,16 +164,14 @@ mod tests {
 
     fn operator(t: &tempfile::TempDir, trusted: &Path) -> TrustStore {
         let store = TrustStore::at(t.path().join("claude.json"));
-        store.grant(&[trusted.to_path_buf()]).expect("grant");
         store
-            .set_project_keys(
+            .grant_with_keys(
                 trusted,
                 json!({"enabledMcpjsonServers": ["mailbox"]})
                     .as_object()
-                    .cloned()
                     .expect("obj"),
             )
-            .expect("approvals");
+            .expect("trust and approvals");
         store
     }
 
@@ -215,6 +209,69 @@ mod tests {
         assert_eq!(
             read(&store)["projects"][wt.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
             true
+        );
+    }
+
+    /// The operator's `~/.claude.json` is their primary Claude Code state
+    /// file and a live session flushes it on its own cadence: every write we
+    /// make is a window in which one of those flushes is lost. A spawn that
+    /// changes nothing must not write at all.
+    #[test]
+    fn a_second_spawn_that_changes_nothing_does_not_rewrite_the_operator_store() {
+        use std::os::unix::fs::MetadataExt;
+
+        let t = tmp();
+        let (repo, wt) = repo_and_worktree(&t);
+        let store = operator(&t, &repo);
+        let gate = SessionTrustGate::new(store.clone(), TrustPolicy { grant: false });
+        let id = AgentId("s-1".into());
+        gate.register(
+            id.clone(),
+            SessionTrust {
+                project_root: repo.clone(),
+                derived_worktree: Some(wt.clone()),
+                mirror: None,
+            },
+        );
+        gate.before_spawn(&id, &wt).expect("derived grant");
+        let before = std::fs::metadata(&store.path).expect("stat");
+        let bytes = std::fs::read(&store.path).expect("read");
+        gate.before_spawn(&id, &wt).expect("second spawn");
+        let after = std::fs::metadata(&store.path).expect("stat");
+        // The write is a rename over the path, so a new inode is the tell.
+        assert_eq!(before.ino(), after.ino(), "the store was rewritten");
+        assert_eq!(before.mtime(), after.mtime(), "the store was rewritten");
+        assert_eq!(bytes, std::fs::read(&store.path).expect("read"), "content");
+    }
+
+    #[test]
+    fn a_changed_root_approval_reaches_the_worktree_on_the_next_spawn() {
+        let t = tmp();
+        let (repo, wt) = repo_and_worktree(&t);
+        let store = operator(&t, &repo);
+        let gate = SessionTrustGate::new(store.clone(), TrustPolicy { grant: false });
+        let id = AgentId("s-1".into());
+        gate.register(
+            id.clone(),
+            SessionTrust {
+                project_root: repo.clone(),
+                derived_worktree: Some(wt.clone()),
+                mirror: None,
+            },
+        );
+        gate.before_spawn(&id, &wt).expect("derived grant");
+        store
+            .grant_with_keys(
+                &repo,
+                json!({"enabledMcpjsonServers": ["mailbox", "context7"]})
+                    .as_object()
+                    .expect("obj"),
+            )
+            .expect("operator approved another server");
+        gate.before_spawn(&id, &wt).expect("second spawn");
+        assert_eq!(
+            read(&store)["projects"][wt.to_string_lossy().as_ref()]["enabledMcpjsonServers"],
+            json!(["mailbox", "context7"])
         );
     }
 

@@ -184,7 +184,7 @@ fn approve_mcp_for(repo: &Path) -> bool {
         "enabledMcpjsonServers".to_string(),
         serde_json::json!([MCP_SERVER]),
     );
-    store.set_project_keys(repo, values).is_ok()
+    store.grant_with_keys(repo, &values).is_ok()
 }
 
 // --- the live daemon --------------------------------------------------------

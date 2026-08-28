@@ -1440,7 +1440,10 @@ frozen alongside the sections above:
     session — mounted at `/v1/agents` on runs and `/v1/sessions` on the
     daemon. `serve_app(listener, app, bind, token_provisioned)`.
     `PtyManager::agent_ids()`, `is_live(&id)`; a mid-spawn `UnknownAgent`
-    reaps the orphan. `TrustStore::project_keys` / `set_project_keys`.
+    reaps the orphan. `TrustStore::project_keys` / `grant_with_keys`
+    / `derive_project` (grant + keys in one read-modify-rename;
+    `-> bool`, false when the entry already said that and nothing
+    was written).
     `core/src/pid.rs`: `pid_alive(pid) -> bool`, an unconditional module
     — `libc` is no longer an optional dependency of `core` — shared by
     `coretempod sessions stop` and `tempo session` discovery (pid 0 is
