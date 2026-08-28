@@ -557,3 +557,17 @@ async fn a_delete_that_fails_partway_can_be_retried() {
     ));
     h.mgr.shutdown().await;
 }
+
+/// `begin_shutdown` alone must already refuse: the daemon arms it before the
+/// HTTP server winds down, and a create that slipped past would be dropped
+/// mid-spawn with a `claude` no handle owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_after_begin_shutdown_is_refused() {
+    let h = harness("begin-shutdown").await;
+    let project = h.project().await;
+    h.mgr.begin_shutdown();
+    let err = h.mgr.create(plain_req(&project)).await.unwrap_err();
+    assert!(matches!(err, SessionError::ShuttingDown), "{err}");
+    assert!(h.mgr.list().await.unwrap().is_empty(), "rolled back");
+    h.mgr.shutdown().await;
+}

@@ -1458,7 +1458,9 @@ frozen alongside the sections above:
     remove_session_files}`, `SessionManager::boot(SessionManagerInputs)`
     with `register_project`, `list_projects`, `forget_project`, `create`,
     `get`, `list`, `stop`, `resume`, `delete(id, remove_worktree, force)`,
-    `record_claude_session_id`, `counts`, `shutdown`; `SessionError`
+    `record_claude_session_id`, `counts`, `begin_shutdown` (arms the
+    `stopping` flag alone; the daemon calls it before the API winds
+    down), `shutdown`; `SessionError`
     (`unknown_session` 404, `unknown_project` 404, `project_exists` 409,
     `project_in_use` 409, `not_a_git_repo` 422, `cwd_outside_project` 422,
     `cwd_missing` 422, `wrong_state` 409, `worktree_missing` 409,
@@ -1466,7 +1468,10 @@ frozen alongside the sections above:
     project root), `git_failed` 422, `spawn_failed` 500, `shutting_down` 503
     for a create/resume that reaches the manager after shutdown began).
     `stop` on a session whose child left first records `exited` rather
-    than failing. Known gap: the derived `projects[<worktree>]` entries a
+    than failing; `delete_branch_if_unmoved` on a branch that no longer
+    exists is `Ok(false)` (`branch_kept: false`), not `git_failed`;
+    `SessionStore::open` refuses a `user_version` above 1
+    (`SessionStoreError::Schema`). Known gap: the derived `projects[<worktree>]` entries a
     worktree session writes into the operator's `.claude.json` are not
     removed on delete or on a rolled-back create. `POST
     /v1/agents/{id}/state` with the operator token still requires

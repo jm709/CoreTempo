@@ -239,3 +239,21 @@ fn an_unwritable_path_is_an_io_error_naming_it() {
         "{err}"
     );
 }
+
+#[test]
+fn the_schema_version_is_stamped_and_a_newer_file_is_refused() {
+    let path = db_path("version");
+    drop(SessionStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1, "stamped on open");
+    conn.pragma_update(None, "user_version", 7_i64).unwrap();
+    drop(conn);
+    let err = SessionStore::open(&path).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("schema version 7"), "{text}");
+    assert!(text.contains("understands 1"), "{text}");
+    assert!(text.contains(&path.display().to_string()), "{text}");
+}

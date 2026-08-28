@@ -2,7 +2,8 @@
 //! event bus, `SQLite` store, and HTTP API. Zero UI dependencies.
 //!
 //! With `default-features = false` only the wire types (`types`, `time`) and the
-//! std-only helpers (`export`, `pid`) compile.
+//! dependency-light helpers (`export`, and `pid`, which is `libc` over std)
+//! compile.
 
 pub mod export;
 pub mod pid;

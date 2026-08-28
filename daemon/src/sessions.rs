@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -178,16 +179,22 @@ fn refuse_locked(root: &SessionsRoot) {
             file.pid, file.port
         ),
         None => eprintln!(
-            "{} is locked by another process; stop it with 'coretempod sessions stop'",
-            root.lock_file().display()
+            "{lock} is locked by another process, but no live daemon is named by {api} \
+             — 'coretempod sessions stop' has nothing to stop. Find the holder with \
+             `fuser {lock}` or `lsof {lock}` and stop it.",
+            lock = root.lock_file().display(),
+            api = root.api_file().display()
         ),
     }
 }
 
 fn init_logging(root: &SessionsRoot) -> anyhow::Result<()> {
+    // 0600 like `api.json`, `sessions.db` and the session dirs: git stderr and
+    // repository paths land here.
     let log = File::options()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(root.log_file())
         .with_context(|| format!("cannot open {}", root.log_file().display()))?;
     let filter = std::env::var("RUST_LOG").ok();
@@ -304,9 +311,13 @@ async fn run(
 
     interrupt.wait().await?;
     tracing::info!("interrupt received; stopping every session");
-    // API first (its abort is bounded to 500 ms), then the sessions: a create
-    // that is still mid-flight when the manager stops is refused by its
-    // `stopping` flag under the session lock, never orphaned.
+    // Arm `stopping` before the API winds down: `api.shutdown()` aborts the
+    // accept loop after a 500 ms grace and drops whatever handlers are still
+    // running, so a `create` dropped inside `pty.spawn` would leave a `claude`
+    // no handle owns and `pty.shutdown()` never reaps. With the flag already
+    // set, anything arriving in that window refuses 503 instead of starting.
+    // The window only closes for requests that have not reached the spawn yet.
+    sessions.begin_shutdown();
     api.shutdown().await;
     sessions.shutdown().await;
     if let Err(error) = std::fs::remove_file(root.api_file()) {

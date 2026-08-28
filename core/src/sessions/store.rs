@@ -24,6 +24,12 @@ pub enum SessionStoreError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "{} is schema version {found}; this coretempod understands {SCHEMA_VERSION} — \
+         upgrade coretempod or move the file",
+        path.display()
+    )]
+    Schema { path: PathBuf, found: i64 },
 }
 
 #[expect(
@@ -147,6 +153,7 @@ impl SessionStore {
     ///
     /// # Errors
     /// [`SessionStoreError::Io`] when the file cannot be created,
+    /// [`SessionStoreError::Schema`] for a file a newer `coretempod` wrote,
     /// [`SessionStoreError::Sqlite`] for anything SQLite refuses.
     pub fn open(path: &Path) -> Result<SessionStore, SessionStoreError> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -168,10 +175,19 @@ impl SessionStore {
             .map_err(sql_err)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(sql_err)?;
-        conn.execute_batch(SCHEMA).map_err(sql_err)?;
+        // Read the version before the schema batch: a file a newer coretempod
+        // wrote is refused untouched. Later versions add their migrations as
+        // an `if version < N { ALTER … }` ladder here, before the bump.
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(sql_err)?;
+        if version > SCHEMA_VERSION {
+            return Err(SessionStoreError::Schema {
+                path: path.to_path_buf(),
+                found: version,
+            });
+        }
+        conn.execute_batch(SCHEMA).map_err(sql_err)?;
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(sql_err)?;

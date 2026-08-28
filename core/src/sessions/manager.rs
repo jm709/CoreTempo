@@ -889,9 +889,18 @@ impl SessionManager {
     /// reaped here) or refuses `ShuttingDown` after it — never a spawn that
     /// lands between the reap and the exit (`PtyManager::spawn` has two lock
     /// sections; `pty.shutdown` alone could fall between them).
-    pub async fn shutdown(&self) {
+    /// Arms the `stopping` flag without doing anything else, so a `create` or
+    /// `resume` arriving while the HTTP server is winding down refuses
+    /// `ShuttingDown` at once rather than being dropped mid-spawn with its
+    /// child unowned. [`SessionManager::shutdown`] sets it too and still does
+    /// the whole job; calling this first only narrows that window.
+    pub fn begin_shutdown(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
         let locks: Vec<SessionLock> = self
             .pty
             .agent_ids()

@@ -39,7 +39,10 @@ fn api_json_is_private_names_the_pid_and_goes_away_on_a_clean_stop() -> anyhow::
     assert_eq!(status, 200);
     assert_eq!(health["ok"], true);
     assert!(d.root().join("sessions.lock").exists());
-    assert!(d.root().join("daemon.log").exists());
+    let log = d.root().join("daemon.log");
+    assert!(log.exists());
+    let log_mode = std::fs::metadata(&log)?.permissions().mode() & 0o777;
+    assert_eq!(log_mode, 0o600, "git stderr and repo paths land in the log");
 
     // SIGTERM: clean exit, api.json removed, rows marked, lock released.
     let repo = d.scratch.repo.clone();
