@@ -1,6 +1,7 @@
 mod client;
 mod connect;
 mod export;
+mod session;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,6 +69,8 @@ enum Cmd {
         #[arg(long)]
         flow: Option<String>,
     },
+    /// Manage Claude Code sessions in the sessions daemon (spec 2026-08-27 §7)
+    Session(session::SessionArgs),
 }
 
 /// `tempo state <working|idle|blocked|unblocked|refused>`; clap accepts the
@@ -116,12 +119,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// The active run's API client. Resolved per command, not once up front:
+/// `tempo session` reaches the sessions daemon through its own `api.json` and
+/// must work with no run at all.
+fn run_client() -> anyhow::Result<Client> {
+    Ok(Client::new(&connect::resolve()?))
+}
+
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let conn = connect::resolve()?;
-    let client = Client::new(&conn);
     match cli.cmd {
-        Cmd::Agents => cmd_agents(&client),
-        Cmd::Send { agent, message } => cmd_send(&client, &agent, &message),
+        Cmd::Session(args) => session::run(args),
+        Cmd::Agents => cmd_agents(&run_client()?),
+        Cmd::Send { agent, message } => cmd_send(&run_client()?, &agent, &message),
         Cmd::Reply {
             id,
             code,
@@ -144,18 +153,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     )
                 }
             };
-            cmd_reply(&client, &id, code, &body)
+            cmd_reply(&run_client()?, &id, code, &body)
         }
-        Cmd::Status { id, wait } => cmd_status(&client, &id, wait),
-        Cmd::State { state } => cmd_state(&client, state),
-        Cmd::Done { agent } => cmd_done(&client, &agent),
-        Cmd::Export { dir, flow } => export::cmd_export(&client, &dir, flow.as_deref()),
+        Cmd::Status { id, wait } => cmd_status(&run_client()?, &id, wait),
+        Cmd::State { state } => cmd_state(&run_client()?, state),
+        Cmd::Done { agent } => cmd_done(&run_client()?, &agent),
+        Cmd::Export { dir, flow } => export::cmd_export(&run_client()?, &dir, flow.as_deref()),
         Cmd::Ask {
             agent,
             message,
             wait,
             no_wait,
-        } => cmd_ask(&client, &agent, &message, wait, no_wait),
+        } => cmd_ask(&run_client()?, &agent, &message, wait, no_wait),
     }
 }
 
@@ -222,7 +231,7 @@ fn cmd_state(client: &Client, state: StateArg) -> anyhow::Result<ExitCode> {
     if state == ReportedState::Refused {
         return Ok(refuse_permission(client, agent, payload));
     }
-    let body = match state {
+    let mut body = match state {
         // A subagent's dialog fires the parent's PermissionRequest hook, and a
         // sibling helper agent fires PostToolBatch for tools it did not run, so
         // both reports carry the hook payload's agent_id to scope the clear.
@@ -238,6 +247,9 @@ fn cmd_state(client: &Client, state: StateArg) -> anyhow::Result<ExitCode> {
         ReportedState::Working | ReportedState::Idle => json!({"state": state}),
         ReportedState::Refused => unreachable!("handled above"),
     };
+    // Every hook payload carries the Claude Code session id; the sessions
+    // daemon stores the latest one for `--resume` (spec 2026-08-27 §4).
+    body["claude_session_id"] = json!(hook_field(payload, "session_id"));
     client.post(&format!("/agents/{agent}/state"), &body)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -269,6 +281,7 @@ fn refuse_permission(client: &Client, agent: &str, payload: Option<&str>) -> Exi
         "tool": tool,
         "input": hook_input_summary(payload),
         "agent_id": hook_field(payload, "agent_id"),
+        "claude_session_id": hook_field(payload, "session_id"),
     });
     if let Err(error) = client.post(&format!("/agents/{agent}/state"), &body) {
         eprintln!("tempo: could not report the refusal to CoreTempo: {error}");

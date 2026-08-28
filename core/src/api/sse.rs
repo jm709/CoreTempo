@@ -1,11 +1,13 @@
-//! SSE endpoints (contract §6): `/v1/events` control-plane stream with ~1024-event replay
-//! ring, filters, and per-consumer `bus.reset`; Task 8 adds `/v1/agents/{id}/pty`.
+//! SSE endpoints (contract §6): the `/v1/events` control-plane stream with a
+//! ~1024-event replay ring, filters, and per-consumer `bus.reset`. The PTY
+//! stream lives in [`crate::api::pty`] and shares this module's pump and
+//! resume parsing.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -14,9 +16,9 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::api::{ApiContext, ApiError, unknown_agent};
+use crate::api::{ApiCore, ApiError};
 use crate::bus::EventBus;
-use crate::pty::{Cursor, PtyChunk};
+use crate::pty::PtyChunk;
 use crate::time::Timestamp;
 use crate::types::AgentId;
 use crate::types::event::{Event, EventPayload};
@@ -38,6 +40,12 @@ pub(crate) fn event_type(payload: &EventPayload) -> &'static str {
         EventPayload::ReplyRejected { .. } => "reply.rejected",
         EventPayload::BusReset {} => "bus.reset",
         EventPayload::WorkflowCompleted { .. } => "workflow.completed",
+        EventPayload::SessionCreated { .. } => "session.created",
+        EventPayload::SessionStopped { .. } => "session.stopped",
+        EventPayload::SessionResumed { .. } => "session.resumed",
+        EventPayload::SessionDeleted { .. } => "session.deleted",
+        EventPayload::ProjectRegistered { .. } => "project.registered",
+        EventPayload::ProjectForgotten { .. } => "project.forgotten",
     }
 }
 
@@ -65,7 +73,9 @@ impl EventFilterSpec {
         let always = match &event.payload {
             EventPayload::RunStarted { .. }
             | EventPayload::BusReset {}
-            | EventPayload::WorkflowCompleted { .. } => true,
+            | EventPayload::WorkflowCompleted { .. }
+            | EventPayload::ProjectRegistered { .. }
+            | EventPayload::ProjectForgotten { .. } => true,
             EventPayload::AgentStateChanged { .. }
             | EventPayload::AgentLifecycle { .. }
             | EventPayload::AgentNudged { .. }
@@ -74,7 +84,11 @@ impl EventFilterSpec {
             | EventPayload::AgentPermissionRefused { .. }
             | EventPayload::MessageCreated { .. }
             | EventPayload::MessageStatusChanged { .. }
-            | EventPayload::ReplyRejected { .. } => false,
+            | EventPayload::ReplyRejected { .. }
+            | EventPayload::SessionCreated { .. }
+            | EventPayload::SessionStopped { .. }
+            | EventPayload::SessionResumed { .. }
+            | EventPayload::SessionDeleted { .. } => false,
         };
         if always {
             return true;
@@ -103,7 +117,11 @@ impl EventFilterSpec {
             | EventPayload::AgentStalled { agent }
             | EventPayload::AgentBlocked { agent, .. }
             | EventPayload::AgentPermissionRefused { agent, .. }
-            | EventPayload::ReplyRejected { agent, .. } => agent == want,
+            | EventPayload::ReplyRejected { agent, .. }
+            | EventPayload::SessionCreated { agent }
+            | EventPayload::SessionStopped { agent }
+            | EventPayload::SessionResumed { agent, .. }
+            | EventPayload::SessionDeleted { agent } => agent == want,
             EventPayload::MessageCreated { message }
             | EventPayload::MessageStatusChanged { message } => {
                 if message.to == *want {
@@ -116,7 +134,9 @@ impl EventFilterSpec {
             }
             EventPayload::RunStarted { .. }
             | EventPayload::BusReset {}
-            | EventPayload::WorkflowCompleted { .. } => true,
+            | EventPayload::WorkflowCompleted { .. }
+            | EventPayload::ProjectRegistered { .. }
+            | EventPayload::ProjectForgotten { .. } => true,
         }
     }
 }
@@ -232,7 +252,7 @@ pub(crate) fn sse_response(rx: mpsc::Receiver<SseEvent>) -> Response {
 }
 
 pub(crate) async fn events(
-    State(ctx): State<ApiContext>,
+    State(core): State<ApiCore>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -241,13 +261,13 @@ pub(crate) async fn events(
         params.get("types").map(String::as_str),
         params.get("agent").map(String::as_str),
     );
-    let live = ctx.bus.subscribe(); // subscribe BEFORE replay: no gap at the seam
+    let live = core.bus.subscribe(); // subscribe BEFORE replay: no gap at the seam
     let replay = match since {
         None => Some(Vec::new()),
-        Some(s) => ctx.bus.replay_since(s),
+        Some(s) => core.bus.replay_since(s),
     };
     let (tx, rx) = mpsc::channel(64);
-    tokio::spawn(pump_events(ctx.bus.clone(), live, replay, filter, tx));
+    tokio::spawn(pump_events(core.bus.clone(), live, replay, filter, tx));
     Ok(sse_response(rx))
 }
 
@@ -288,7 +308,7 @@ struct PtyEventData {
 /// `id:` is where the next one does (`start + len`), because `Last-Event-ID`
 /// says "I have everything up to here" — mirroring `seq` would replay this
 /// chunk on every resume.
-async fn pump_pty(mut rx: mpsc::Receiver<PtyChunk>, tx: mpsc::Sender<SseEvent>) {
+pub(crate) async fn pump_pty(mut rx: mpsc::Receiver<PtyChunk>, tx: mpsc::Sender<SseEvent>) {
     while let Some(chunk) = rx.recv().await {
         let resume_at = chunk.start.0 + chunk.bytes.len() as u64;
         let data = PtyEventData {
@@ -306,30 +326,6 @@ async fn pump_pty(mut rx: mpsc::Receiver<PtyChunk>, tx: mpsc::Sender<SseEvent>) 
             return; // client hung up
         }
     }
-}
-
-/// `GET /v1/agents/{id}/pty`: base64 raw-chunk SSE with ring-buffer replay via byte
-/// cursors. Clients detect aged-out data by `first seq > since`; no reset event here.
-/// `Last-Event-ID` and `?since=` take the same value — the cursor to resume at — so
-/// either resumes byte-exactly (contract amendment 40).
-pub(crate) async fn agent_pty(
-    State(ctx): State<ApiContext>,
-    Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let id = AgentId(id);
-    if !ctx.workflow.agents.contains_key(&id) {
-        return Err(unknown_agent(&ctx.workflow, &id));
-    }
-    let since = resume_point(&headers, &params)?.map(Cursor);
-    let chunks = ctx
-        .pty
-        .subscribe_output(&id, since)
-        .map_err(ApiError::internal)?;
-    let (tx, rx) = mpsc::channel(64);
-    tokio::spawn(pump_pty(chunks, tx));
-    Ok(sse_response(rx))
 }
 
 #[cfg(test)]
@@ -408,6 +404,33 @@ mod tests {
     #[test]
     fn event_type_strings_are_the_wire_names() {
         assert_eq!(event_type(&EventPayload::BusReset {}), "bus.reset");
+    }
+
+    #[test]
+    fn session_events_take_the_agent_filter_and_project_events_always_pass() {
+        let f = EventFilterSpec::parse(None, Some("s-1"));
+        assert!(f.matches(&ev(EventPayload::SessionCreated {
+            agent: AgentId("s-1".to_string())
+        })));
+        assert!(!f.matches(&ev(EventPayload::SessionStopped {
+            agent: AgentId("s-2".to_string())
+        })));
+        assert!(f.matches(&ev(EventPayload::ProjectForgotten {
+            project: crate::types::id::ProjectId("p-1".to_string())
+        })));
+        assert_eq!(
+            event_type(&EventPayload::SessionResumed {
+                agent: AgentId("s-1".to_string()),
+                resumed: false
+            }),
+            "session.resumed"
+        );
+        assert_eq!(
+            event_type(&EventPayload::ProjectRegistered {
+                project: crate::types::id::ProjectId("p-1".to_string())
+            }),
+            "project.registered"
+        );
     }
 
     #[test]

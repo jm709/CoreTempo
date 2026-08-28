@@ -13,27 +13,56 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 
-use crate::api::{ApiContext, ApiError};
+use crate::api::{ApiCore, ApiError, Caller};
 use crate::types::message::Origin;
 use crate::types::{AgentId, ApiFile, RunId, Token};
 
-pub(crate) async fn guard(State(ctx): State<ApiContext>, req: Request, next: Next) -> Response {
-    match check(&ctx, &req) {
+pub(crate) async fn guard(State(core): State<ApiCore>, req: Request, next: Next) -> Response {
+    match check(&core, &req) {
         Ok(()) => next.run(req).await,
         Err(error) => error.into_response(),
     }
 }
 
-fn check(ctx: &ApiContext, req: &Request) -> Result<(), ApiError> {
-    check_host(ctx, req)?;
-    if req.uri().path() == "/v1/health" {
+fn check(core: &ApiCore, req: &Request) -> Result<(), ApiError> {
+    check_host(core, req)?;
+    let path = req.uri().path();
+    if path == "/v1/health" {
         return Ok(());
     }
-    check_bearer(ctx, req)?;
-    if !is_trigger_post(req.uri().path()) {
+    match core.auth.classify(bearer_of(req.headers())) {
+        Caller::Operator => {}
+        Caller::Hook(id) => require_hook_scope(&id, req.method(), path)?,
+        Caller::Unknown => return Err(unauthorized(core.auth.hint())),
+    }
+    if !is_trigger_post(path) && !is_raw_pty_post(path) {
         check_content_type(req)?;
     }
     Ok(())
+}
+
+/// A hook token authorises exactly its own agent's state route (spec
+/// 2026-08-27 §3): a tool a session's Claude runs can report state and
+/// nothing else.
+fn require_hook_scope(id: &AgentId, method: &Method, path: &str) -> Result<(), ApiError> {
+    let own = format!("/v1/agents/{}/state", id.0);
+    if method == Method::POST && path == own {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "forbidden_scope",
+        format!(
+            "this bearer token is agent '{}'s hook token; it authorises only POST {own} — \
+             anything else needs the operator token",
+            id.0
+        ),
+    ))
+}
+
+/// `POST …/pty` carries raw terminal bytes, not JSON.
+fn is_raw_pty_post(path: &str) -> bool {
+    path.ends_with("/pty")
 }
 
 /// The trigger routes. A webhook caller posts whatever its sender emits, and the
@@ -45,16 +74,16 @@ fn is_trigger_post(path: &str) -> bool {
     path == "/v1/trigger" || (path.starts_with("/v1/flows/") && path.ends_with("/trigger"))
 }
 
-fn check_host(ctx: &ApiContext, req: &Request) -> Result<(), ApiError> {
+fn check_host(core: &ApiCore, req: &Request) -> Result<(), ApiError> {
     let raw = req
         .headers()
         .get(HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    require_host(raw, ctx.bind)
+    require_host(raw, core.bind)
 }
 
-/// The `Host` guard as a check, for servers with no [`ApiContext`] (serve mode's
+/// The `Host` guard as a check, for servers with no [`ApiCore`] (serve mode's
 /// trigger listener). One message, one rule, both servers.
 ///
 /// # Errors
@@ -76,7 +105,7 @@ pub fn require_host(raw: &str, bind: IpAddr) -> Result<(), ApiError> {
 /// Whether a `Host` header may reach a server bound to `bind`: loopback names and
 /// the bind address itself, nothing else. Blocks DNS-rebinding and cross-origin
 /// browser requests. Public because the trigger server authenticates its own
-/// requests, without an [`ApiContext`].
+/// requests, without an [`ApiCore`].
 #[must_use]
 pub fn host_ok(raw: &str, bind: IpAddr) -> bool {
     let host = strip_port(raw);
@@ -97,15 +126,26 @@ fn strip_port(raw: &str) -> &str {
     raw.split(':').next().unwrap_or(raw)
 }
 
-/// Constant-time `Authorization: Bearer <token>` check, usable without an
-/// [`ApiContext`] (the trigger server has a token but no API context).
-pub(crate) fn bearer_ok(token: &Token, headers: &HeaderMap) -> bool {
-    let provided = headers
+/// The bearer value of `Authorization: Bearer <token>`, or `""`.
+fn bearer_of(headers: &HeaderMap) -> &str {
+    headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    provided.as_bytes().ct_eq(token.0.as_bytes()).into()
+        .unwrap_or("")
+}
+
+/// Constant-time token comparison; the run's `OperatorToken` and the sessions
+/// daemon's token table both use it.
+#[must_use]
+pub fn token_matches(token: &Token, bearer: &str) -> bool {
+    bearer.as_bytes().ct_eq(token.0.as_bytes()).into()
+}
+
+/// Constant-time `Authorization: Bearer <token>` check, usable without an
+/// [`ApiCore`] (the trigger server has a token but no API context).
+pub(crate) fn bearer_ok(token: &Token, headers: &HeaderMap) -> bool {
+    token_matches(token, bearer_of(headers))
 }
 
 /// Where a 401'd caller can find the token this server wants (#57).
@@ -119,6 +159,8 @@ pub enum TokenHint {
     Run,
     /// A headless `coretempod serve` daemon.
     Serve,
+    /// The sessions daemon, whose token lives in its own `api.json`.
+    Sessions,
 }
 
 impl TokenHint {
@@ -133,15 +175,26 @@ impl TokenHint {
                  CORETEMPO_TOKEN, --token-file/CORETEMPO_TOKEN_FILE, or [server] \
                  token_file provisioned"
             }
+            TokenHint::Sessions => {
+                "using the token in ~/.coretempo/sessions/api.json (written by \
+                 `coretempod sessions` while it runs)"
+            }
         }
     }
 }
 
-fn check_bearer(ctx: &ApiContext, req: &Request) -> Result<(), ApiError> {
-    require_bearer(&ctx.token, req.headers(), TokenHint::Run)
+fn unauthorized(hint: TokenHint) -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        format!(
+            "missing or invalid bearer token; send 'Authorization: Bearer <token>' {}",
+            hint.advice()
+        ),
+    )
 }
 
-/// The bearer guard as a check, for servers with no [`ApiContext`]. `hint`
+/// The bearer guard as a check, for servers with no [`ApiCore`]. `hint`
 /// picks which token the refusal points the caller at.
 ///
 /// # Errors
@@ -150,14 +203,7 @@ pub fn require_bearer(token: &Token, headers: &HeaderMap, hint: TokenHint) -> Re
     if bearer_ok(token, headers) {
         return Ok(());
     }
-    Err(ApiError::new(
-        StatusCode::UNAUTHORIZED,
-        "unauthorized",
-        format!(
-            "missing or invalid bearer token; send 'Authorization: Bearer <token>' {}",
-            hint.advice()
-        ),
-    ))
+    Err(unauthorized(hint))
 }
 
 fn check_content_type(req: &Request) -> Result<(), ApiError> {
@@ -229,11 +275,43 @@ fn request_id() -> String {
     format!("{:08x}", rand::rng().random::<u32>())
 }
 
-/// Server-derived message origin (never trusted from the body): `X-CoreTempo-Agent` header
-/// → `Origin::Agent` (must be a roster member), absent → `Origin::Http(<8-hex req id>)`.
-pub(crate) fn caller_origin(ctx: &ApiContext, headers: &HeaderMap) -> Result<Origin, ApiError> {
-    let Some(value) = headers.get("x-coretempo-agent") else {
+/// Server-derived message origin (never trusted from the body). A hook token
+/// decides identity by itself: `X-CoreTempo-Agent` may repeat it, never
+/// change it. With the operator token the header names a roster member, and
+/// no header means an anonymous HTTP caller.
+pub(crate) fn caller_origin(core: &ApiCore, headers: &HeaderMap) -> Result<Origin, ApiError> {
+    let claimed = claimed_agent(headers)?;
+    if let Caller::Hook(id) = core.auth.classify(bearer_of(headers)) {
+        return match claimed {
+            Some(other) if other != id => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "wrong_agent",
+                format!(
+                    "this hook token belongs to agent '{}' but X-CoreTempo-Agent says '{}'; \
+                     drop the header or set it to '{}'",
+                    id.0, other.0, id.0
+                ),
+            )),
+            _ => Ok(Origin::Agent(id)),
+        };
+    }
+    let Some(id) = claimed else {
         return Ok(Origin::Http(request_id()));
+    };
+    if !core.roster.contains(&id) {
+        return Err(ApiError::invalid(format!(
+            "X-CoreTempo-Agent '{}' is not in the roster; roster: {}",
+            id.0,
+            crate::api::roster_list(core.roster.as_ref())
+        )));
+    }
+    Ok(Origin::Agent(id))
+}
+
+/// The validated `X-CoreTempo-Agent` header, if present.
+fn claimed_agent(headers: &HeaderMap) -> Result<Option<AgentId>, ApiError> {
+    let Some(value) = headers.get("x-coretempo-agent") else {
+        return Ok(None);
     };
     let raw = value.to_str().map_err(|_| {
         ApiError::invalid("X-CoreTempo-Agent header must be visible ASCII".to_string())
@@ -244,14 +322,7 @@ pub(crate) fn caller_origin(ctx: &ApiContext, headers: &HeaderMap) -> Result<Ori
              (pattern ^[a-z0-9][a-z0-9_-]{{0,31}}$)"
         )));
     }
-    let id = AgentId(raw.to_string());
-    if !ctx.workflow.agents.contains_key(&id) {
-        return Err(ApiError::invalid(format!(
-            "X-CoreTempo-Agent '{raw}' is not in the roster; roster: {}",
-            crate::api::roster_list(&ctx.workflow)
-        )));
-    }
-    Ok(Origin::Agent(id))
+    Ok(Some(AgentId(raw.to_string())))
 }
 
 /// Default runs directory: `~/.coretempo/runs`.
@@ -268,7 +339,7 @@ pub fn default_runs_dir() -> Option<PathBuf> {
 ///
 /// # Errors
 /// Propagates filesystem errors from opening, writing, syncing, or chmod'ing the file.
-pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+pub fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -384,6 +455,32 @@ mod tests {
         assert!(!no_body_declared(&with(TRANSFER_ENCODING, "chunked")));
         // A length nobody can parse is not a promise of an empty body.
         assert!(!no_body_declared(&with(CONTENT_LENGTH, "nonsense")));
+    }
+
+    #[test]
+    fn a_hook_token_authorises_only_its_own_state_post() {
+        use crate::api::auth::require_hook_scope;
+        use crate::types::AgentId;
+        use axum::http::Method;
+
+        let id = AgentId("builder".to_string());
+        assert!(
+            require_hook_scope(&id, &Method::POST, "/v1/agents/builder/state").is_ok(),
+            "its own state route must pass"
+        );
+        for (method, path) in [
+            (Method::POST, "/v1/agents/planner/state"),
+            (Method::GET, "/v1/agents/builder/state"),
+            (Method::POST, "/v1/messages"),
+        ] {
+            let error = require_hook_scope(&id, &method, path).expect_err("must be refused");
+            assert_eq!(error.code, "forbidden_scope", "{method} {path}");
+            assert!(
+                error.message.contains("POST /v1/agents/builder/state"),
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[test]

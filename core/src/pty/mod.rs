@@ -630,13 +630,7 @@ impl PtyManager {
             let mut agents = lock(&self.agents);
             let Some(handle) = agents.get_mut(agent) else {
                 drop(agents);
-                if let Err(err) = session.killer.kill() {
-                    tracing::warn!(
-                        agent = %agent,
-                        error = %err,
-                        "kill after agent vanished mid-spawn failed"
-                    );
-                }
+                Self::abandon_mid_spawn(agent, &mut session, child);
                 return Err(PtyError::UnknownAgent(agent.clone()));
             };
             my_epoch = *handle.epoch_tx.borrow();
@@ -680,6 +674,31 @@ impl PtyManager {
         });
         tracing::info!(agent = %agent, "spawned agent pty");
         Ok(())
+    }
+
+    /// The agent was removed from the roster while its process was starting.
+    /// Kill it and reap it here: the exit-watching thread `spawn` starts is
+    /// never reached on this path, and an unreaped child stays a zombie until
+    /// the daemon exits. The `exited_tx` oneshot goes with the child; nobody
+    /// awaits it.
+    fn abandon_mid_spawn(
+        agent: &AgentId,
+        session: &mut Session,
+        mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    ) {
+        if let Err(err) = session.killer.kill() {
+            tracing::warn!(
+                agent = %agent,
+                error = %err,
+                "kill after agent vanished mid-spawn failed"
+            );
+        }
+        let reap_agent = agent.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = child.wait() {
+                tracing::debug!(agent = %reap_agent, error = %err, "mid-spawn reap failed");
+            }
+        });
     }
 
     /// Opens a PTY pair and starts the agent process in it with the spawn
@@ -1329,6 +1348,27 @@ impl PtyManager {
             .get(agent)
             .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
         Ok(handle.queue_depth.load(Ordering::SeqCst))
+    }
+
+    /// Every id in the roster, live or not, in id order. The sessions
+    /// daemon's `Roster` (amendment 47) is this set.
+    #[must_use]
+    pub fn agent_ids(&self) -> Vec<AgentId> {
+        lock(&self.agents).keys().cloned().collect()
+    }
+
+    /// Whether the agent has a running process right now. `false` for an
+    /// added-but-unspawned agent and after `stop`/exit — the raw state alone
+    /// cannot tell those apart from `Starting`.
+    ///
+    /// # Errors
+    /// [`PtyError::UnknownAgent`] if the agent is not in the roster.
+    pub fn is_live(&self, agent: &AgentId) -> Result<bool, PtyError> {
+        let agents = lock(&self.agents);
+        let handle = agents
+            .get(agent)
+            .ok_or_else(|| PtyError::UnknownAgent(agent.clone()))?;
+        Ok(handle.session.is_some())
     }
 }
 

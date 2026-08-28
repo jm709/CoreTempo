@@ -8,7 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::api::{ApiContext, ApiError, auth, unknown_agent};
+use crate::api::{ApiContext, ApiCore, ApiError, auth, unknown_agent};
 use crate::types::agent::{AgentDetail, AgentInfo, AgentState};
 use crate::types::config::AgentConfig;
 use crate::types::message::Origin;
@@ -21,18 +21,18 @@ fn roster_agent<'a>(ctx: &'a ApiContext, id: &AgentId) -> Result<&'a AgentConfig
     ctx.workflow
         .agents
         .get(id)
-        .ok_or_else(|| unknown_agent(&ctx.workflow, id))
+        .ok_or_else(|| unknown_agent(ctx.workflow.as_ref(), id))
 }
 
 fn agent_info(ctx: &ApiContext, id: &AgentId) -> Result<AgentInfo, ApiError> {
-    let state = ctx.pty.state(id).map_err(ApiError::internal)?;
-    let exit = ctx.pty.exit(id).map_err(ApiError::internal)?;
+    let state = ctx.core.pty.state(id).map_err(ApiError::internal)?;
+    let exit = ctx.core.pty.exit(id).map_err(ApiError::internal)?;
     Ok(AgentInfo {
         id: id.clone(),
         state,
         pending_asks: ctx.router.pending_asks(id),
         exit,
-        blocked: ctx.pty.blocked(id).map_err(ApiError::internal)?,
+        blocked: ctx.core.pty.blocked(id).map_err(ApiError::internal)?,
     })
 }
 
@@ -53,7 +53,7 @@ pub(crate) async fn get_agent(
     let id = AgentId(id);
     let config = roster_agent(&ctx, &id)?.clone();
     let info = agent_info(&ctx, &id)?;
-    let pty_cursor = ctx.pty.end_cursor(&id).map_err(ApiError::internal)?.0;
+    let pty_cursor = ctx.core.pty.end_cursor(&id).map_err(ApiError::internal)?.0;
     Ok(Json(AgentDetail {
         info,
         dir: config.dir.display().to_string(),
@@ -75,7 +75,7 @@ pub(crate) async fn get_agent(
 /// → unblocked). Only the agent itself may report: the identity in
 /// `X-CoreTempo-Agent` must equal `{id}`, mirroring the reply handler's replier rule.
 pub(crate) async fn report_state(
-    State(ctx): State<ApiContext>,
+    State(core): State<ApiCore>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -85,13 +85,16 @@ pub(crate) async fn report_state(
             "malformed state body: {error}; expected \
              {{\"state\":\"working\"|\"idle\"|\"blocked\"|\"unblocked\"|\"refused\"}} \
              (optional \"tool\" with blocked or refused, optional \"input\" with \
-             refused, optional \"agent_id\" with either of blocked and unblocked) — an \
-             agent's hooks report only those"
+             refused, optional \"agent_id\" with either of blocked and unblocked, \
+             optional \"claude_session_id\" with any state) — an agent's hooks report \
+             only those"
         ))
     })?;
     let id = AgentId(id);
-    roster_agent(&ctx, &id)?;
-    let caller = auth::caller_origin(&ctx, &headers)?;
+    if !core.roster.contains(&id) {
+        return Err(unknown_agent(core.roster.as_ref(), &id));
+    }
+    let caller = auth::caller_origin(&core, &headers)?;
     if caller != Origin::Agent(id.clone()) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -105,22 +108,28 @@ pub(crate) async fn report_state(
     }
     // A hook with no tool_name/agent_id sends "" rather than omitting the field.
     let hook_agent = trimmed_capped(req.agent_id, 64);
+    // Before the state is published: `PtySource::state` is the raw channel, so
+    // a poller sees `idle` the instant this handler lands, and a `stop`/`resume`
+    // right after that poll must already find the session id.
+    if let Some(session_id) = trimmed_capped(req.claude_session_id, 128) {
+        core.roster.on_claude_session_id(&id, session_id).await;
+    }
     match req.state {
-        ReportedState::Working => ctx.pty.report_state(&id, AgentState::Working),
-        ReportedState::Idle => ctx.pty.report_state(&id, AgentState::Idle),
+        ReportedState::Working => core.pty.report_state(&id, AgentState::Working),
+        ReportedState::Idle => core.pty.report_state(&id, AgentState::Idle),
         ReportedState::Blocked => {
-            ctx.pty
+            core.pty
                 .report_blocked(&id, trimmed_capped(req.tool, 128), hook_agent)
         }
-        ReportedState::Unblocked => ctx.pty.report_unblocked(&id, hook_agent),
-        ReportedState::Refused => ctx.pty.report_refused(
+        ReportedState::Unblocked => core.pty.report_unblocked(&id, hook_agent),
+        ReportedState::Refused => core.pty.report_refused(
             &id,
             trimmed_capped(req.tool, 128),
             trimmed_capped(req.input, 200),
         ),
     }
     .map_err(ApiError::internal)?;
-    let state = ctx.pty.state(&id).map_err(ApiError::internal)?;
+    let state = core.pty.state(&id).map_err(ApiError::internal)?;
     Ok(Json(AgentStateResponse { agent: id, state }).into_response())
 }
 
@@ -143,7 +152,7 @@ pub(crate) async fn loop_done(
 ) -> Result<Response, ApiError> {
     let target = AgentId(id);
     roster_agent(&ctx, &target)?;
-    let caller = auth::caller_origin(&ctx, &headers)?;
+    let caller = auth::caller_origin(&ctx.core, &headers)?;
     let Origin::Agent(owner) = caller else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -174,7 +183,7 @@ pub(crate) async fn restart_agent(
     // Fail in-flight/queued messages to the agent and suppress stale reply injection
     // before the respawn kicks off (contract §4).
     ctx.router.on_agent_restarted(&id).await;
-    ctx.pty.begin_restart(id.clone());
+    ctx.core.pty.begin_restart(id.clone());
     let body = RestartResponse {
         agent: id,
         state: AgentState::Restarting,

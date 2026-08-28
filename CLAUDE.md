@@ -17,7 +17,7 @@ and agent-dialogs (2026-08-17) are the ones the gotchas below cite.
 ./dev              # desktop app (vite :1420 + Rust core in one process)
 ./dev headless     # coretempod against ./tempo.toml
 ./dev check        # every gate: cargo test/clippy/fmt, svelte-check, oxlint, vitest, client tsc/oxlint/vitest
-./dev live         # the real-claude round trip (#3): needs a logged-in claude, spends tokens
+./dev live         # the real-claude legs (run + sessions): needs a logged-in claude, spends tokens
 ```
 
 Copy `tempo.example.toml` to `tempo.toml` to get a workflow to run. The desktop
@@ -28,10 +28,10 @@ points its native webview at vite; a release build bundles the assets instead.
 
 | Crate | What it owns |
 |---|---|
-| `core` | Everything. PTY manager, message router, SQLite store, axum `/v1` API, event bus, workflow load/freeze. Zero UI dependencies. |
+| `core` | Everything. PTY manager, message router, SQLite store, axum `/v1` API, event bus, workflow load/freeze, session manager (`core/src/sessions/`). Zero UI dependencies. |
 | `app` | Tauri 2 shell (`app/src-tauri`) + Svelte 5 webview (`app/src`). |
 | `cli` | The `tempo` binary agents call from their Bash tool. |
-| `daemon` | `coretempod`, the headless runner. Thin `main` over `core`. |
+| `daemon` | `coretempod`, the headless runner and the sessions daemon. Thin `main` over `core`. |
 | `clients/js` | `@coretempo/client`, the typed npm client for webhook triggers (issue #17). Standalone pnpm package; zero runtime deps. |
 
 `core` never depends on anything UI-related; that boundary is what makes the
@@ -47,9 +47,13 @@ for isolated agents).
 ## How messaging works
 
 - `ask` expects a reply; `send` does not. Agents call `tempo ask|send|reply`.
-- The server injects the message into the target's PTY as typed text. It is the
-  **only** writer to any PTY, and per-agent injections are serialized through one
-  queue — that serialization is the correctness story.
+- The server injects the message into the target's PTY as typed text. The queue
+  is the **only** *injecting* writer, and per-agent injections are serialized
+  through one queue — that serialization is the correctness story. The one way
+  around it is `POST /v1/agents/{id}/pty` (raw bytes, run token), which the
+  desktop terminal and `tempo session attach` type through; every workflow agent
+  holds the run token, so an agent can reach a sibling's PTY that way (spec
+  2026-08-27 §6 mandates the route; §11 defers scoping the run token).
 - For an agent-origin `ask`, the reply is injected back into the asker's PTY. For
   a UI or HTTP origin it resolves that caller instead. Everything is logged to
   SQLite regardless.
@@ -126,6 +130,35 @@ for isolated agents).
   `Router::create_message` does not, and it is not persisted on the
   `MessageRecord`.
 
+## Sessions (spec 2026-08-27)
+
+`coretempod sessions` runs the session manager: independent Claude Code
+sessions across registered projects, each optionally in its own worktree
+under `~/.coretempo/worktrees/<project-id>/<slug>` on `session/<slug>`.
+Sessions are not workflow agents — no prompt, no router, no auto-`/clear`,
+`on_permission_prompt = wait`, `McpPolicy::Inherit`. `tempo session
+new|list|show|stop|resume|rm|attach|projects` drives it and finds the daemon
+through `~/.coretempo/sessions/api.json` only (never `CORETEMPO_*`).
+`core/src/sessions/` owns it; every lifecycle call runs under that
+session's `tokio::Mutex`. Each session has its own hook token that
+authorises exactly `POST /v1/agents/{id}/state` (`TokenAuth`, amendment 47).
+Trust for a worktree is derived from the project root on every spawn, and the
+root's MCP approvals (`enabledMcpjsonServers` …) are copied with it — one read
+of the operator's `~/.claude.json` and a write only when the entry differs,
+since Claude Code rewrites that file on its own cadence and every write of ours
+is a window in which one of its flushes is lost. Those derived
+`projects[<worktree>]` entries are never removed: `~/.claude.json` accumulates
+one per deleted worktree session. Harmless, and prunable by hand.
+
+`McpPolicy::Inherit` is the one startup dialog sessions do not prevent: with no
+`--strict-mcp-config`, a session sees every server in scope — `~/.mcp.json`
+included — so one the operator has never approved for the project root raises
+"New MCP server found", and the session sits in `starting` with no
+`SessionStart` hook until a human answers it through `tempo session attach`.
+`permission_mode = "bypassPermissions"` skips that dialog (verified live on
+2.1.247). Copying the root's approvals is what keeps a *derived worktree* from
+re-asking about servers already approved for the repository.
+
 ## Agent state comes from hooks, not the screen
 
 CoreTempo writes one `agent-settings-<agent_id>.json` per agent and passes
@@ -191,8 +224,9 @@ strict drain-then-clear.
     spawn and restart; a refused restart leaves the agent `Exited` with the
     reason in the log and nothing auto-recovers it. Trust is never granted
     silently.
-  - **"New MCP server found"** — every agent spawns with `--strict-mcp-config`,
-    so it sees only the servers its `mcp = [...]` names. Names resolve at load
+  - **"New MCP server found"** — every *workflow* agent spawns with
+    `--strict-mcp-config` (sessions do not — see Sessions), so it sees only
+    the servers its `mcp = [...]` names. Names resolve at load
     against `~/.claude.json` `mcpServers`, then its `projects["<dir>"]`, then
     `~/.mcp.json`, then `<dir>/.mcp.json` (first match wins — CoreTempo's
     precedence, not Claude Code's), are written to `agent-mcp-<agent_id>.json`
@@ -304,9 +338,17 @@ strict drain-then-clear.
 Unit and integration tests use a scripted fake agent, which cannot catch PTY
 timing or TUI behaviour — the gotchas above all escaped it. When touching the
 spawn recipe, injection, or state reporting, run `./dev live`: it builds the
-workspace and runs `daemon/tests/live_claude.rs` (`#[ignore]`d in CI) against
-the real `claude` on PATH — hooks report idle, an ask round-trips, auto-`/clear`
-is typed, a second ask survives it. Two Haiku turns; it trusts
-`~/.coretempo/live-test/agent` once and reuses it. For anything it does not
+workspace and runs two `#[ignore]`d files against the real `claude` on PATH.
+`daemon/tests/live_claude.rs` is the run leg — hooks report idle, an ask
+round-trips, auto-`/clear` is typed, a second ask survives it; it trusts
+`~/.coretempo/live-test/agent` once and reuses it.
+`daemon/tests/live_sessions.rs` is the sessions leg — a worktree session
+answers, is stopped and resumed, and still remembers (so `--resume` reopened
+the conversation the `SessionStart` hook identified), while a
+`claude_session_id` Claude Code does not know makes the resumed process exit
+instead of starting fresh; it also reads back the MCP approvals the derived
+worktree grant copied. It trusts `~/.coretempo/live-test/repo` once, and its
+root, db and worktrees are per-run scratch, so the operator's own sessions
+daemon is untouched. Four Haiku turns between them. For anything they do not
 cover, write a workflow, `coretempod run` it, and check a round trip with
 `tempo ask <agent> "..."`. Real agents cost tokens; keep prompts trivial.

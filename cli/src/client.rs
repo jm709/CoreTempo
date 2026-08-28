@@ -54,6 +54,21 @@ impl Client {
         }
     }
 
+    /// A client with no global timeout: `attach` holds SSE streams open for as
+    /// long as the terminal is attached.
+    pub fn new_untimed(conn: &Connection) -> Client {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(None)
+            .build();
+        Client {
+            agent: ureq::Agent::new_with_config(config),
+            base: format!("http://127.0.0.1:{}/v1", conn.port),
+            token: conn.token.clone(),
+            agent_id: conn.agent_id.clone(),
+        }
+    }
+
     pub fn get(&self, path: &str) -> Result<serde_json::Value, ApiCallError> {
         let res = self
             .agent
@@ -82,12 +97,59 @@ impl Client {
         Client::read(res)
     }
 
+    pub fn delete(&self, path: &str) -> Result<serde_json::Value, ApiCallError> {
+        let res = self
+            .agent
+            .delete(format!("{}{path}", self.base))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .call()
+            .map_err(|e| ApiCallError::Transport(e.to_string()))?;
+        Client::read(res)
+    }
+
+    /// Raw bytes to a PTY write route; the server answers 204.
+    pub fn post_raw(&self, path: &str, bytes: &[u8]) -> Result<(), ApiCallError> {
+        let res = self
+            .agent
+            .post(format!("{}{path}", self.base))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/octet-stream")
+            .send(bytes)
+            .map_err(|e| ApiCallError::Transport(e.to_string()))?;
+        Client::read(res).map(|_| ())
+    }
+
+    /// An SSE stream's body, read line by line by the caller.
+    pub fn stream(&self, path: &str) -> Result<Box<dyn std::io::Read + Send>, ApiCallError> {
+        let res = self
+            .agent
+            .get(format!("{}{path}", self.base))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .call()
+            .map_err(|e| ApiCallError::Transport(e.to_string()))?;
+        let status = res.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(Client::read(res)
+                .err()
+                .unwrap_or_else(|| ApiCallError::Transport(format!("HTTP {status}"))));
+        }
+        Ok(Box::new(res.into_body().into_reader()))
+    }
+
+    /// A 204 (the delete and PTY-write routes) carries no body; every other
+    /// response is JSON.
     fn read(mut res: ureq::http::Response<ureq::Body>) -> Result<serde_json::Value, ApiCallError> {
         let status = res.status().as_u16();
-        let value: serde_json::Value = res
+        let text = res
             .body_mut()
-            .read_json()
+            .read_to_string()
             .map_err(|e| ApiCallError::Transport(format!("bad response body: {e}")))?;
+        let value: serde_json::Value = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text)
+                .map_err(|e| ApiCallError::Transport(format!("bad response body: {e}")))?
+        };
         if (200..300).contains(&status) {
             return Ok(value);
         }

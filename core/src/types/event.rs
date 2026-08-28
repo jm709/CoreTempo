@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::time::Timestamp;
 use crate::types::agent::{AgentExit, AgentState};
-use crate::types::id::{AgentId, MessageId, RunId};
+use crate::types::id::{AgentId, MessageId, ProjectId, RunId};
 use crate::types::message::MessageRecord;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +112,23 @@ pub enum EventPayload {
         reason: Option<String>,
         reason_code: Option<String>,
     },
+
+    /// Session-manager lifecycle (spec 2026-08-27 §6). Each carries the
+    /// session id as `agent`, so `?agent=` filters pass them to `attach`.
+    #[serde(rename = "session.created")]
+    SessionCreated { agent: AgentId },
+    #[serde(rename = "session.stopped")]
+    SessionStopped { agent: AgentId },
+    /// `resumed` is whether the respawn passed `--resume <claude_session_id>`.
+    #[serde(rename = "session.resumed")]
+    SessionResumed { agent: AgentId, resumed: bool },
+    #[serde(rename = "session.deleted")]
+    SessionDeleted { agent: AgentId },
+    /// Project registry changes; always pass every filter, like `run.started`.
+    #[serde(rename = "project.registered")]
+    ProjectRegistered { project: ProjectId },
+    #[serde(rename = "project.forgotten")]
+    ProjectForgotten { project: ProjectId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,5 +396,64 @@ mod tests {
         assert_eq!(json["reason_code"], "agent_exited");
         let back: Event = serde_json::from_value(json).unwrap();
         assert_eq!(back, failed);
+    }
+
+    #[test]
+    fn session_and_project_wire_forms() {
+        let ev = Event {
+            seq: 30,
+            ts: Timestamp("2026-08-27T10:00:00Z".into()),
+            payload: EventPayload::SessionResumed {
+                agent: AgentId("s-1f2e3d4c".into()),
+                resumed: true,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::json!({
+                "seq": 30, "ts": "2026-08-27T10:00:00Z", "type": "session.resumed",
+                "agent": "s-1f2e3d4c", "resumed": true
+            })
+        );
+        let project = Event {
+            seq: 31,
+            ts: Timestamp("2026-08-27T10:00:01Z".into()),
+            payload: EventPayload::ProjectRegistered {
+                project: crate::types::id::ProjectId("p-0a1b2c3d".into()),
+            },
+        };
+        let json = serde_json::to_value(&project).unwrap();
+        assert_eq!(json["type"], "project.registered");
+        assert_eq!(json["project"], "p-0a1b2c3d");
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back, project);
+        for (payload, name) in [
+            (
+                EventPayload::SessionCreated {
+                    agent: AgentId("s-1".into()),
+                },
+                "session.created",
+            ),
+            (
+                EventPayload::SessionStopped {
+                    agent: AgentId("s-1".into()),
+                },
+                "session.stopped",
+            ),
+            (
+                EventPayload::SessionDeleted {
+                    agent: AgentId("s-1".into()),
+                },
+                "session.deleted",
+            ),
+            (
+                EventPayload::ProjectForgotten {
+                    project: crate::types::id::ProjectId("p-1".into()),
+                },
+                "project.forgotten",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&payload).unwrap()["type"], name);
+        }
     }
 }

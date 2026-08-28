@@ -184,31 +184,137 @@ impl TrustStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut doc = self.read()?;
-        let Value::Object(top) = &mut doc else {
-            return Err(TrustError::Shape {
-                path: self.path.clone(),
-            });
+        for root in roots {
+            let entry = Self::project_entry(&mut doc, root, &self.path)?;
+            entry.insert(TRUST_KEY.to_string(), Value::Bool(true));
+        }
+        self.write_atomic(&doc)
+    }
+
+    /// The listed keys of `projects[<root>]`, those present. Empty when the
+    /// entry or every key is absent.
+    ///
+    /// # Errors
+    /// [`TrustError::Io`] / [`TrustError::Json`].
+    pub fn project_keys(
+        &self,
+        root: &Path,
+        keys: &[&str],
+    ) -> Result<Map<String, Value>, TrustError> {
+        Ok(Self::keys_of(&self.read()?, root, keys))
+    }
+
+    /// Trusts `root` and sets `values` on `projects[<root>]` in one
+    /// read-modify-rename, preserving everything else; the same atomic 0600
+    /// write as [`TrustStore::grant`]. Returns whether it wrote — the file is
+    /// left untouched when it already says exactly this.
+    ///
+    /// # Errors
+    /// [`TrustError::Io`] / [`TrustError::Json`] / [`TrustError::Shape`].
+    pub fn grant_with_keys(
+        &self,
+        root: &Path,
+        values: &Map<String, Value>,
+    ) -> Result<bool, TrustError> {
+        let _serialized = GRANT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut doc = self.read()?;
+        self.apply_project(&mut doc, root, values)
+    }
+
+    /// Trusts `to` and copies `keys` from `projects[<from>]` onto
+    /// `projects[<to>]` — source and target read together, so the whole
+    /// derivation is one read and at most one rename. Returns whether it
+    /// wrote.
+    ///
+    /// This is what keeps a session spawn off the operator's live
+    /// `~/.claude.json`: Claude Code rewrites that file on its own cadence
+    /// (project history, costs, MCP approvals), and every read→rename of ours
+    /// is a window in which one of its flushes is lost.
+    ///
+    /// # Errors
+    /// [`TrustError::Io`] / [`TrustError::Json`] / [`TrustError::Shape`].
+    pub fn derive_project(
+        &self,
+        from: &Path,
+        to: &Path,
+        keys: &[&str],
+    ) -> Result<bool, TrustError> {
+        let _serialized = GRANT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut doc = self.read()?;
+        let values = Self::keys_of(&doc, from, keys);
+        self.apply_project(&mut doc, to, &values)
+    }
+
+    /// The `keys` present on `projects[<root>]` of an already-read document.
+    fn keys_of(doc: &Value, root: &Path, keys: &[&str]) -> Map<String, Value> {
+        let mut out = Map::new();
+        let Some(entry) = doc
+            .get("projects")
+            .and_then(|p| p.get(root.to_string_lossy().as_ref()))
+        else {
+            return out;
+        };
+        for key in keys {
+            if let Some(value) = entry.get(*key) {
+                out.insert((*key).to_string(), value.clone());
+            }
+        }
+        out
+    }
+
+    /// Writes the trust key and `values` onto `projects[<root>]` of `doc`,
+    /// renaming the result into place only when that changes something.
+    fn apply_project(
+        &self,
+        doc: &mut Value,
+        root: &Path,
+        values: &Map<String, Value>,
+    ) -> Result<bool, TrustError> {
+        let entry = Self::project_entry(doc, root, &self.path)?;
+        let mut changed = entry.get(TRUST_KEY).and_then(Value::as_bool) != Some(true);
+        entry.insert(TRUST_KEY.to_string(), Value::Bool(true));
+        for (key, value) in values {
+            if entry.get(key) != Some(value) {
+                changed = true;
+                entry.insert(key.clone(), value.clone());
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+        self.write_atomic(doc)?;
+        Ok(true)
+    }
+
+    /// `projects[<root>]` as a mutable object, created on demand.
+    fn project_entry<'a>(
+        doc: &'a mut Value,
+        root: &Path,
+        path: &Path,
+    ) -> Result<&'a mut Map<String, Value>, TrustError> {
+        let shape = || TrustError::Shape {
+            path: path.to_path_buf(),
+        };
+        let Value::Object(top) = doc else {
+            return Err(shape());
         };
         let projects = top
             .entry("projects")
             .or_insert_with(|| Value::Object(Map::new()));
         let Value::Object(projects) = projects else {
-            return Err(TrustError::Shape {
-                path: self.path.clone(),
-            });
+            return Err(shape());
         };
-        for root in roots {
-            let entry = projects
-                .entry(root.to_string_lossy().into_owned())
-                .or_insert_with(|| Value::Object(Map::new()));
-            let Value::Object(entry) = entry else {
-                return Err(TrustError::Shape {
-                    path: self.path.clone(),
-                });
-            };
-            entry.insert(TRUST_KEY.to_string(), Value::Bool(true));
-        }
-        self.write_atomic(&doc)
+        let entry = projects
+            .entry(root.to_string_lossy().into_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(entry) = entry else {
+            return Err(shape());
+        };
+        Ok(entry)
     }
 
     fn write_atomic(&self, doc: &Value) -> Result<(), TrustError> {
@@ -773,5 +879,110 @@ mod tests {
         let gate = TrustGate::new(operator, TrustPolicy { grant: false }, BTreeMap::new());
         gate.before_spawn(&AgentId("plain".into()), &dir)
             .expect("spawn allowed");
+    }
+
+    #[test]
+    fn project_keys_copy_between_roots_and_skip_absent_ones() {
+        let t = tmp();
+        let store = store_with(&t, Path::new("/home/u/trusted"));
+        assert!(
+            store
+                .grant_with_keys(
+                    Path::new("/home/u/trusted"),
+                    json!({
+                        "enabledMcpjsonServers": ["mailbox"],
+                        "enableAllProjectMcpServers": false
+                    })
+                    .as_object()
+                    .expect("object"),
+                )
+                .expect("writes")
+        );
+        let keys = store
+            .project_keys(
+                Path::new("/home/u/trusted"),
+                &[
+                    "enabledMcpjsonServers",
+                    "disabledMcpjsonServers",
+                    "enableAllProjectMcpServers",
+                ],
+            )
+            .expect("reads");
+        assert_eq!(keys.len(), 2, "absent keys are skipped: {keys:?}");
+        assert_eq!(keys["enabledMcpjsonServers"], json!(["mailbox"]));
+        assert!(
+            store
+                .derive_project(
+                    Path::new("/home/u/trusted"),
+                    Path::new("/w/wt"),
+                    &[
+                        "enabledMcpjsonServers",
+                        "disabledMcpjsonServers",
+                        "enableAllProjectMcpServers",
+                    ],
+                )
+                .expect("derives into a new entry")
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store.path).expect("read"))
+                .expect("json");
+        assert_eq!(
+            doc["projects"]["/w/wt"]["enabledMcpjsonServers"],
+            json!(["mailbox"])
+        );
+        assert_eq!(doc["projects"]["/w/wt"]["hasTrustDialogAccepted"], true);
+        assert_eq!(
+            doc["projects"]["/home/u/trusted"]["allowedTools"][0],
+            "Bash(tempo:*)"
+        );
+        assert!(
+            store
+                .project_keys(Path::new("/nowhere"), &["x"])
+                .expect("reads")
+                .is_empty()
+        );
+    }
+
+    /// The write is what races a live Claude Code flush, so an unchanged
+    /// entry must not produce one.
+    #[test]
+    fn granting_what_is_already_there_writes_nothing() {
+        let t = tmp();
+        let store = store_with(&t, Path::new("/home/u/trusted"));
+        let values = json!({"enabledMcpjsonServers": ["mailbox"]})
+            .as_object()
+            .cloned()
+            .expect("object");
+        assert!(
+            store
+                .grant_with_keys(Path::new("/home/u/trusted"), &values)
+                .expect("first write")
+        );
+        assert!(
+            !store
+                .grant_with_keys(Path::new("/home/u/trusted"), &values)
+                .expect("second call")
+        );
+        assert!(
+            !store
+                .derive_project(
+                    Path::new("/home/u/trusted"),
+                    Path::new("/home/u/trusted"),
+                    &["enabledMcpjsonServers"],
+                )
+                .expect("deriving onto itself")
+        );
+        // Empty values still grant: the mirror of a root with no approvals
+        // needs the trust key and nothing else.
+        assert!(
+            store
+                .grant_with_keys(Path::new("/w/fresh"), &serde_json::Map::new())
+                .expect("grants a new entry")
+        );
+        assert!(
+            !store
+                .grant_with_keys(Path::new("/w/fresh"), &serde_json::Map::new())
+                .expect("already trusted")
+        );
     }
 }

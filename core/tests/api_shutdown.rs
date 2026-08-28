@@ -45,7 +45,7 @@ async fn attach_sse(
 #[test]
 fn shutdown_is_bounded_with_an_sse_client_attached() -> anyhow::Result<()> {
     let (ctx, handles) = support::test_ctx()?;
-    let token = ctx.token.0.clone();
+    let token = handles.token.0.clone();
     let bus = handles.bus.clone();
     let rt = handles.rt.clone();
     rt.block_on(async move {
@@ -84,7 +84,7 @@ fn ordinary_requests_still_complete_and_shutdown_releases_the_port() -> anyhow::
     // The bound must not disturb non-streaming traffic, and once shutdown
     // returns the listener really is gone.
     let (ctx, handles) = support::test_ctx()?;
-    let token = ctx.token.0.clone();
+    let token = handles.token.0.clone();
     let rt = handles.rt.clone();
     rt.block_on(async move {
         let server = serve(ctx).await?;

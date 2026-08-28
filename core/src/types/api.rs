@@ -61,6 +61,11 @@ pub struct ReportStateRequest {
     /// amendment).
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// The `session_id` of the hook payload, forwarded by `tempo state` from
+    /// every hook. A `SessionStart` payload's id is the one the sessions
+    /// daemon stores for `--resume` (latest wins); the run API ignores it.
+    #[serde(default)]
+    pub claude_session_id: Option<String>,
 }
 
 /// `POST /v1/agents/{id}/state` response: the state now on the raw state channel.
@@ -357,6 +362,18 @@ mod tests {
         let idle: ReportStateRequest =
             serde_json::from_value(serde_json::json!({"state": "idle"})).expect("parse");
         assert_eq!(idle.state, ReportedState::Idle);
+    }
+
+    #[test]
+    fn report_state_request_carries_an_optional_claude_session_id() {
+        let with: ReportStateRequest = serde_json::from_value(serde_json::json!({
+            "state": "idle", "claude_session_id": "0f9c1b2a-…"
+        }))
+        .expect("parse");
+        assert_eq!(with.claude_session_id.as_deref(), Some("0f9c1b2a-…"));
+        let without: ReportStateRequest =
+            serde_json::from_value(serde_json::json!({"state": "idle"})).expect("parse");
+        assert_eq!(without.claude_session_id, None);
     }
 
     #[test]

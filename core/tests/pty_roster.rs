@@ -374,3 +374,29 @@ async fn remove_agent_works_on_a_stopped_agent_too() {
         PtyError::UnknownAgent(_)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_ids_and_liveness_follow_the_roster() {
+    let dir = fresh_dir();
+    let (mgr, _bus) = empty_manager(&dir);
+    assert!(mgr.agent_ids().is_empty());
+    let b = AgentId("s-b".into());
+    let a = AgentId("s-a".into());
+    mgr.add_agent(b.clone(), entry(&dir)).unwrap();
+    mgr.add_agent(a.clone(), entry(&dir)).unwrap();
+    assert_eq!(mgr.agent_ids(), vec![a.clone(), b.clone()], "sorted");
+    assert!(!mgr.is_live(&a).unwrap(), "added, not spawned");
+    mgr.spawn(&a).await.unwrap();
+    assert!(mgr.is_live(&a).unwrap());
+    mgr.stop(&a).await.unwrap();
+    assert!(
+        !mgr.is_live(&a).unwrap(),
+        "stopped: handle kept, no session"
+    );
+    assert!(matches!(
+        mgr.is_live(&AgentId("nope".into())).unwrap_err(),
+        PtyError::UnknownAgent(_)
+    ));
+    mgr.remove_agent(&b).await.unwrap();
+    assert_eq!(mgr.agent_ids(), vec![a]);
+}

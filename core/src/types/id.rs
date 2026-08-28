@@ -1,7 +1,7 @@
 //! Id newtypes. Formats (frozen): agent ids and flow names match
 //! `^[a-z0-9][a-z0-9_-]{0,31}$`; message ids are `m-` + 16 lowercase hex;
-//! run ids `r-` + 8 lowercase hex; tokens are 64 lowercase hex chars (32
-//! random bytes).
+//! run ids `r-` + 8 lowercase hex; project ids `p-` + 8 lowercase hex; tokens
+//! are 64 lowercase hex chars (32 random bytes).
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,17 @@ pub struct RunId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Token(pub String);
+
+/// `p-` + 8 lowercase hex: a registered project root (spec 2026-08-27 §2).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(pub String);
+
+impl std::fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -77,7 +88,7 @@ impl std::fmt::Display for RunId {
 }
 
 #[cfg(feature = "server")]
-fn random_hex(byte_count: usize) -> String {
+pub(crate) fn random_hex(byte_count: usize) -> String {
     use rand::Rng;
     use std::fmt::Write;
 
@@ -117,9 +128,18 @@ impl Token {
     }
 }
 
+#[cfg(feature = "server")]
+impl ProjectId {
+    /// `p-` + 8 lowercase hex from 4 random bytes.
+    #[must_use]
+    pub fn generate() -> ProjectId {
+        ProjectId(format!("p-{}", random_hex(4)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::types::id::{AgentId, FlowName, MessageId, RunId, Token};
+    use crate::types::id::{AgentId, FlowName, MessageId, ProjectId, RunId, Token};
 
     #[test]
     fn agent_id_validation() {
@@ -165,5 +185,9 @@ mod tests {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
         assert_ne!(Token::generate().0, t, "tokens must be random");
+
+        let p = ProjectId::generate().0;
+        assert_eq!(p.len(), 10);
+        assert!(p.starts_with("p-"));
     }
 }

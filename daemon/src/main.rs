@@ -1,10 +1,11 @@
 //! `coretempod`: the headless `CoreTempo` workflow daemon (contracts §7.3).
 
 mod serve;
+mod sessions;
 mod signal;
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
@@ -13,7 +14,9 @@ use coretempo_core::router::FlowKickoff;
 use coretempo_core::run::{Run, RunOptions};
 use coretempo_core::trigger::{Completion, startup_id, watch_completion, watcher_deadline};
 use coretempo_core::trust::TrustPolicy;
-use coretempo_core::types::config::{FrozenWorkflow, ResolvedServer, ServerOverrides, TriggerType};
+use coretempo_core::types::config::{
+    FrozenWorkflow, ResolvedServer, ServerOverrides, TriggerType, WorkflowFile,
+};
 use coretempo_core::types::message::Origin;
 use coretempo_core::types::{AgentId, FlowName, MessageKind};
 use coretempo_core::user_config::UserConfig;
@@ -79,30 +82,25 @@ enum Cmd {
         #[command(flatten)]
         flags: ServerFlags,
     },
+    /// Run the session manager daemon (spec 2026-08-27 §3) in the foreground,
+    /// or `stop` the one whose api.json is under --root.
+    Sessions(sessions::SessionsArgs),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Run,
-    Serve,
+/// A workflow file loaded, its server settings resolved, its trust policy
+/// decided, and tracing initialised from `[server] log` — what `run` and
+/// `serve` both need before they can start. `sessions` needs none of it, so it
+/// happens inside their arms rather than before the match.
+struct RunInputs {
+    file: WorkflowFile,
+    frozen: FrozenWorkflow,
+    server: ResolvedServer,
+    trust: TrustPolicy,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<ExitCode> {
-    let Cli { cmd } = Cli::parse();
-    // Before anything a supervisor can observe (#66): once the API answers, a
-    // signal must be caught, not take the process down on the default disposition.
-    let interrupt = signal::Interrupt::install()?;
-    let (mode, config, flow, flags) = match cmd {
-        Cmd::Run {
-            config,
-            flow,
-            flags,
-        } => (Mode::Run, config, flow, flags),
-        Cmd::Serve { config, flags } => (Mode::Serve, config, None, flags),
-    };
+fn load_run_inputs(config: &Path, flags: ServerFlags) -> anyhow::Result<RunInputs> {
     let env = ServerOverrides::from_env().context("invalid CORETEMPO_* environment variable")?;
-    let (file, frozen) = load_workflow(&config)
+    let (file, frozen) = load_workflow(config)
         .with_context(|| format!("failed to load workflow '{}'", config.display()))?;
     let server =
         resolve_server(flags.into(), env, &file).context("cannot resolve server settings")?;
@@ -113,15 +111,45 @@ async fn main() -> anyhow::Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&server.log).unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
-    match mode {
-        Mode::Run => {
+    Ok(RunInputs {
+        file,
+        frozen,
+        server,
+        trust,
+    })
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<ExitCode> {
+    let Cli { cmd } = Cli::parse();
+    // Before anything a supervisor can observe (#66): once the API answers, a
+    // signal must be caught, not take the process down on the default disposition.
+    let interrupt = signal::Interrupt::install()?;
+    match cmd {
+        Cmd::Run {
+            config,
+            flow,
+            flags,
+        } => {
+            let RunInputs {
+                frozen,
+                server,
+                trust,
+                ..
+            } = load_run_inputs(&config, flags)?;
             let (frozen, kickoff) = match &flow {
                 None => (frozen, None),
                 Some(name) => select_flow(&frozen, name)?,
             };
             run_until_interrupt(frozen, server, kickoff, trust, interrupt).await
         }
-        Mode::Serve => {
+        Cmd::Serve { config, flags } => {
+            let RunInputs {
+                file,
+                frozen,
+                server,
+                trust,
+            } = load_run_inputs(&config, flags)?;
             serve::serve(serve::ServeInputs {
                 config,
                 file,
@@ -133,6 +161,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             .await?;
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Sessions(args) => sessions::main(args, interrupt).await,
     }
 }
 

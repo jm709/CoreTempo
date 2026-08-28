@@ -1,5 +1,7 @@
-//! Shared `coretempod serve` harness: a scratch home with a scripted fake
-//! `claude` on PATH, a daemon child, and an HTTP client for its public port.
+//! Shared daemon harnesses: a scratch home with a scripted fake `claude` on
+//! PATH, a daemon child, and an HTTP client for its port. [`Serving`] runs
+//! `coretempod serve` against a tempo.toml; [`SessionsDaemon`] runs
+//! `coretempod sessions` against a scratch root and a throwaway git repo.
 #![expect(
     dead_code,
     reason = "each integration-test crate uses a subset of this harness"
@@ -497,4 +499,316 @@ fn poll_exit(child: &mut Child, within: Duration) -> Option<std::process::ExitSt
         std::thread::sleep(Duration::from_millis(100));
     }
     None
+}
+
+// --- `coretempod sessions` harness (spec 2026-08-27 §3) ---------------------
+
+/// The sessions-daemon fake `claude`: reports `idle` with a session id
+/// through its hook token (no `X-CoreTempo-Agent` — the token is the
+/// identity), then echoes; `quit` exits 3.
+pub(crate) const FAKE_SESSION_AGENT: &str = r#"#!/bin/bash
+post() {
+  exec 3<>"/dev/tcp/127.0.0.1/$CORETEMPO_PORT" || return 1
+  printf 'POST %s HTTP/1.1\r\nHost: 127.0.0.1\r\n' "$1" >&3
+  printf 'Authorization: Bearer %s\r\n' "$CORETEMPO_TOKEN" >&3
+  printf 'Content-Type: application/json\r\nContent-Length: %d\r\n' "${#2}" >&3
+  printf 'Connection: close\r\n\r\n%s' "$2" >&3
+  timeout 5 cat <&3 >/dev/null
+  exec 3>&-
+}
+start="{\"state\":\"idle\",\"claude_session_id\":\"${FAKE_SESSION_ID:-fake-sid}\"}"
+post "/v1/agents/$CORETEMPO_AGENT_ID/state" "$start"
+printf 'booted\n'
+while IFS= read -r line; do
+  case "$line" in
+    quit) printf 'bye\n'; exit 3 ;;
+    *) post "/v1/agents/$CORETEMPO_AGENT_ID/state" '{"state":"working"}'
+       printf 'got:%s\n' "$line"
+       post "/v1/agents/$CORETEMPO_AGENT_ID/state" '{"state":"idle"}' ;;
+  esac
+done
+"#;
+
+#[derive(Clone)]
+pub(crate) struct SessionsScratch {
+    pub(crate) root: PathBuf,
+    pub(crate) home: PathBuf,
+    pub(crate) repo: PathBuf,
+    pub(crate) bin: PathBuf,
+}
+
+/// Runs `git` in `dir` with an identity of its own, so the developer's
+/// `user.email`, `init.defaultBranch` and signing config cannot reach it.
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A scratch HOME (trust granted through config.toml, an empty `.claude.json`
+/// the daemon may write), a git repo with one commit, and the fake `claude`
+/// on PATH.
+pub(crate) fn sessions_scratch(name: &str) -> SessionsScratch {
+    let root =
+        std::env::temp_dir().join(format!("coretempo-sessions-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(home.join(".coretempo")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        home.join(".coretempo/config.toml"),
+        "trust_agent_dirs = true\n",
+    )
+    .unwrap();
+    // The daemon grants Claude Code trust for the repo root by writing this
+    // file; an empty object is the shape `TrustStore` updates in place.
+    std::fs::write(home.join(".claude.json"), "{}\n").unwrap();
+
+    let fake = bin.join("claude");
+    std::fs::write(&fake, FAKE_SESSION_AGENT).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README"), "hi\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    // The manager canonicalizes what it registers; so does the test, or the
+    // project path it asserts on never matches.
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    SessionsScratch {
+        root,
+        home,
+        repo,
+        bin,
+    }
+}
+
+pub(crate) struct SessionsDaemon {
+    pub(crate) child: Child,
+    pub(crate) scratch: SessionsScratch,
+    pub(crate) api: coretempo_core::types::SessionsApiFile,
+}
+
+impl Drop for SessionsDaemon {
+    fn drop(&mut self) {
+        // A daemon the test already waited out has been reaped; signalling its
+        // pid again could reach whatever the kernel handed the number to next.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // Interrupt rather than kill: the daemon owns PTY children, and SIGKILL
+        // would orphan them.
+        let _ = Command::new("kill")
+            .arg("-INT")
+            .arg(self.child.id().to_string())
+            .stderr(Stdio::null())
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_)) | Err(_)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `coretempod <args…>` with the scratch HOME and PATH, and every variable a
+/// developer's shell (or the `CoreTempo` session they are running in) could use
+/// to redirect trust, config or the hook target stripped.
+pub(crate) fn sessions_command(scratch: &SessionsScratch, args: &[&str]) -> Command {
+    let mut cmd = Command::new(DAEMON);
+    let path = std::env::var("PATH").unwrap_or_default();
+    cmd.args(args)
+        .env("HOME", &scratch.home)
+        .env("PATH", format!("{}:{path}", scratch.bin.display()))
+        .env("RUST_LOG", "info")
+        .env_remove("CORETEMPO_CONFIG")
+        .env_remove("CORETEMPO_TOKEN")
+        .env_remove("CORETEMPO_TOKEN_FILE")
+        .env_remove("CORETEMPO_PORT")
+        .env_remove("CORETEMPO_AGENT_ID")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+    cmd
+}
+
+/// `api.json` under `dir`, but only once it parses *and* names `pid`: a stale
+/// file from a dead daemon, or the truncated window `write_private_file` opens
+/// while it writes, must never be mistaken for this daemon's.
+fn read_api_file(dir: &Path, pid: u32) -> Option<coretempo_core::types::SessionsApiFile> {
+    let text = std::fs::read_to_string(dir.join("api.json")).ok()?;
+    let file: coretempo_core::types::SessionsApiFile = serde_json::from_str(&text).ok()?;
+    (file.pid == pid).then_some(file)
+}
+
+/// Starts `coretempod sessions --root <scratch>/sessions --port 0` on a fresh
+/// scratch and waits until it is healthy.
+pub(crate) fn sessions_daemon(name: &str) -> SessionsDaemon {
+    sessions_daemon_on(sessions_scratch(name))
+}
+
+/// [`sessions_daemon`] on an already-built scratch — a second daemon over a
+/// root the first one has left behind.
+pub(crate) fn sessions_daemon_on(scratch: SessionsScratch) -> SessionsDaemon {
+    let root = scratch.root.join("sessions");
+    let child = sessions_command(
+        &scratch,
+        &[
+            "sessions",
+            "--root",
+            &root.display().to_string(),
+            "--port",
+            "0",
+        ],
+    )
+    .stdout(Stdio::from(log_file(&scratch.root, "out.log")))
+    .stderr(Stdio::from(log_file(&scratch.root, "err.log")))
+    .spawn()
+    .unwrap();
+    // The child is owned from here on, so every panic below still stops it.
+    let mut daemon = SessionsDaemon {
+        child,
+        scratch,
+        api: coretempo_core::types::SessionsApiFile {
+            port: 0,
+            token: coretempo_core::types::Token(String::new()),
+            pid: 0,
+        },
+    };
+    let pid = daemon.child.id();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(file) = read_api_file(&root, pid) {
+            daemon.api = file;
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sessions daemon never wrote its api.json; logs:\n{}",
+            daemon.logs()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok((200, body)) = daemon.get("/v1/health") {
+            assert_eq!(body["ok"], true, "health: {body}");
+            return daemon;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sessions daemon never became healthy; logs:\n{}",
+            daemon.logs()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+impl SessionsDaemon {
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.api.port)
+    }
+
+    /// `<scratch root>/sessions` — the `--root` the daemon was started on.
+    pub(crate) fn root(&self) -> PathBuf {
+        self.scratch.root.join("sessions")
+    }
+
+    /// A copy of the scratch, so a second daemon can be started over the same
+    /// root: `SessionsDaemon` has a `Drop`, so the field cannot be moved out.
+    pub(crate) fn scratch_clone(&self) -> SessionsScratch {
+        self.scratch.clone()
+    }
+
+    /// Everything the daemon wrote: its stdout, its stderr, and `daemon.log`.
+    pub(crate) fn logs(&self) -> String {
+        let read = |path: PathBuf| std::fs::read_to_string(path).unwrap_or_default();
+        format!(
+            "{}{}{}",
+            read(self.scratch.root.join("out.log")),
+            read(self.scratch.root.join("err.log")),
+            read(self.root().join("daemon.log")),
+        )
+    }
+
+    pub(crate) fn get(&self, path: &str) -> anyhow::Result<(u16, serde_json::Value)> {
+        self.get_as(path, Some(&self.api.token.0))
+    }
+
+    /// GET with an explicit bearer token, or none at all.
+    pub(crate) fn get_as(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        let mut req = agent().get(self.url(path));
+        if let Some(token) = token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let mut res = req.call()?;
+        let status = res.status().as_u16();
+        Ok((status, json_of(res.body_mut().read_to_string()?)))
+    }
+
+    /// GET with a `Host` the daemon should not answer to.
+    pub(crate) fn get_with_host(
+        &self,
+        path: &str,
+        host: &str,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        let mut res = agent()
+            .get(self.url(path))
+            .header("Authorization", format!("Bearer {}", self.api.token.0))
+            .header("Host", host)
+            .call()?;
+        let status = res.status().as_u16();
+        Ok((status, json_of(res.body_mut().read_to_string()?)))
+    }
+
+    pub(crate) fn post(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        let mut res = agent()
+            .post(self.url(path))
+            .header("Authorization", format!("Bearer {}", self.api.token.0))
+            .send_json(body)?;
+        let status = res.status().as_u16();
+        Ok((status, json_of(res.body_mut().read_to_string()?)))
+    }
+}
+
+pub(crate) fn wait_for_exit_of(
+    daemon: &mut SessionsDaemon,
+    within: Duration,
+) -> std::process::ExitStatus {
+    let Some(status) = poll_exit(&mut daemon.child, within) else {
+        panic!(
+            "the sessions daemon did not exit within {within:?}; logs:\n{}",
+            daemon.logs()
+        );
+    };
+    status
 }
