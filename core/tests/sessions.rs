@@ -6,6 +6,7 @@
 
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -528,5 +529,31 @@ async fn tokens_classify_the_operator_and_each_sessions_hook_token() {
     );
     h.mgr.delete(&b, false, false).await.unwrap();
     assert_eq!(h.mgr.classify(&token_b.0), Caller::Unknown);
+    h.mgr.shutdown().await;
+}
+
+/// `delete` must not give up the row's handle until the persistent state it
+/// owns is gone: a failure after detaching would leave an undeletable row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_that_fails_partway_can_be_retried() {
+    let h = harness("retry-delete").await;
+    let project = h.project().await;
+    let view = h.mgr.create(plain_req(&project)).await.unwrap();
+    h.wait_argv(1).await;
+    h.mgr.stop(&view.id).await.unwrap();
+    // Read-only sessions root: `remove_session_files` cannot unlink `<id>/`.
+    let sessions = h.root.join("sessions");
+    let restore = std::fs::metadata(&sessions).unwrap().permissions();
+    let mut locked = restore.clone();
+    locked.set_mode(0o500);
+    std::fs::set_permissions(&sessions, locked).unwrap();
+    let err = h.mgr.delete(&view.id, false, false).await.unwrap_err();
+    assert!(matches!(err, SessionError::Io { .. }), "{err}");
+    std::fs::set_permissions(&sessions, restore).unwrap();
+    h.mgr.delete(&view.id, false, false).await.unwrap();
+    assert!(matches!(
+        h.mgr.get(&view.id).await.unwrap_err(),
+        SessionError::UnknownSession { .. }
+    ));
     h.mgr.shutdown().await;
 }

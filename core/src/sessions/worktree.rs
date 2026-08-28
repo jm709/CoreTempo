@@ -158,7 +158,10 @@ pub async fn status(cwd: &Path) -> Status {
         .await
         .ok()
         .filter(|b| !b.is_empty());
-    let changed_files = git_ok(cwd, &["status", "--porcelain"])
+    // `--no-optional-locks` keeps this off `.git/index.lock`: `cwd` is a live
+    // checkout — the operator's own repo for a plain session — and `list`
+    // polls it, so a plain `git status` would race their `git add/commit`.
+    let changed_files = git_ok(cwd, &["--no-optional-locks", "status", "--porcelain"])
         .await
         .ok()
         .map(|s| u64::try_from(s.lines().filter(|l| !l.is_empty()).count()).unwrap_or(u64::MAX));
@@ -229,13 +232,31 @@ pub async fn prune(root: &Path) -> Result<(), GitError> {
 /// `git branch -D <branch>` only when `branch` is an ancestor of `base` —
 /// i.e. it has no commits of its own. Returns whether it was deleted.
 ///
+/// A branch that is already gone (the operator deleted it by hand) is not a
+/// failure: nothing was deleted here, and `merge-base` on a name git cannot
+/// resolve exits 128, which would otherwise strand the session's row behind
+/// an already-removed worktree.
+///
 /// # Errors
-/// [`GitError`] when git itself fails (a missing branch counts as failure).
+/// [`GitError`] when git itself fails.
 pub async fn delete_branch_if_unmoved(
     root: &Path,
     branch: &str,
     base: &str,
 ) -> Result<bool, GitError> {
+    let exists = git(
+        root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await?;
+    if !exists.status.success() {
+        return Ok(false);
+    }
     let out = git(root, &["merge-base", "--is-ancestor", branch, base]).await?;
     match out.status.code() {
         Some(0) => {

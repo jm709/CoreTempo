@@ -191,3 +191,20 @@ async fn an_unmoved_branch_is_deleted_and_a_missing_worktree_is_pruned() {
     );
     assert_eq!(git(&repo, &["branch", "--list", &created.branch]), "");
 }
+
+/// The operator deleted the branch by hand between `session new` and
+/// `session rm`. Deleting the session must still work: the branch is gone,
+/// which is what `branch_kept: false` means.
+#[tokio::test]
+async fn a_branch_that_no_longer_exists_is_not_a_git_failure() {
+    let (repo, worktrees) = repo("gone-branch");
+    let created = worktree::create(&repo, &worktrees, &pid()).await.unwrap();
+    worktree::remove(&repo, &created.path, false).await.unwrap();
+    git(&repo, &["branch", "-D", &created.branch]);
+    assert!(
+        !worktree::delete_branch_if_unmoved(&repo, &created.branch, &created.base)
+            .await
+            .unwrap(),
+        "a missing branch reads as 'not deleted here', not a git failure"
+    );
+}

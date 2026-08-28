@@ -320,6 +320,22 @@ impl SessionManager {
         }
     }
 
+    /// `PtyManager::is_live`, with the off-roster case read as "no such
+    /// session". A row can outlive its handle (a rollback that could not
+    /// delete the row); `SessionError::Spawn`'s "cannot spawn claude: unknown
+    /// agent" would be a 500 that names the wrong problem on a `stop`,
+    /// `resume` or `delete`.
+    fn live(&self, id: &AgentId) -> Result<bool, SessionError> {
+        match self.pty.is_live(id) {
+            Ok(live) => Ok(live),
+            Err(PtyError::UnknownAgent(_)) => Err(SessionError::UnknownSession {
+                id: id.clone(),
+                roster: self.pty.agent_ids(),
+            }),
+            Err(other) => Err(SessionError::Spawn(other)),
+        }
+    }
+
     /// # Errors
     /// [`SessionError::UnknownSession`], [`SessionError::Store`].
     pub async fn get(&self, id: &AgentId) -> Result<SessionView, SessionError> {
@@ -706,7 +722,7 @@ impl SessionManager {
         let _held = session_lock.lock().await;
         let row = self.row(id).await?;
         let project = self.project(&row.project).await?;
-        if !self.pty.is_live(id)? {
+        if !self.live(id)? {
             return Err(self
                 .wrong_state(&row, &project, "stop", "resume or delete")
                 .await);
@@ -736,7 +752,7 @@ impl SessionManager {
         let _held = session_lock.lock().await;
         let row = self.row(id).await?;
         let project = self.project(&row.project).await?;
-        if self.pty.is_live(id)? {
+        if self.live(id)? {
             return Err(self.wrong_state(&row, &project, "resume", "stop").await);
         }
         if let Some(wt) = &row.worktree
@@ -787,7 +803,7 @@ impl SessionManager {
         let _held = session_lock.lock().await;
         let row = self.row(id).await?;
         let project = self.project(&row.project).await?;
-        if self.pty.is_live(id)? {
+        if self.live(id)? {
             return Err(self.wrong_state(&row, &project, "delete", "stop").await);
         }
         let mut branch_kept = false;
@@ -800,12 +816,14 @@ impl SessionManager {
             branch_kept =
                 !worktree::delete_branch_if_unmoved(&project.path, &wt.branch, &wt.base).await?;
         }
-        self.detach(id).await;
+        // Persistent state first, the handle last: anything here can fail,
+        // and a row that has already lost its handle cannot be deleted again.
         remove_session_files(&self.root.dir, id).map_err(|source| SessionError::Io {
             path: self.root.dir.join(&id.0),
             source,
         })?;
         self.store.delete_session(id).await?;
+        self.detach(id).await;
         self.bus
             .publish(EventPayload::SessionDeleted { agent: id.clone() });
         Ok(DeleteSessionResponse { branch_kept })
@@ -833,8 +851,13 @@ impl SessionManager {
         if self.pty.is_live(id).unwrap_or(false) {
             return; // resumed already
         }
-        let Ok(Some(row)) = self.store.get_session(id).await else {
-            return;
+        let row = match self.store.get_session(id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return, // deleted under us
+            Err(error) => {
+                tracing::error!(session = %id, %error, "could not read the row to record an exit");
+                return;
+            }
         };
         if row.stopped_at.is_some() {
             return; // stop() marked it
