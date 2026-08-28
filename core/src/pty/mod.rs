@@ -630,27 +630,7 @@ impl PtyManager {
             let mut agents = lock(&self.agents);
             let Some(handle) = agents.get_mut(agent) else {
                 drop(agents);
-                if let Err(err) = session.killer.kill() {
-                    tracing::warn!(
-                        agent = %agent,
-                        error = %err,
-                        "kill after agent vanished mid-spawn failed"
-                    );
-                }
-                // Nothing will `wait` this child otherwise: the reaper thread
-                // below is never started on this path, and an unreaped child
-                // is a zombie until the daemon exits. `exited_tx` is dropped
-                // with it; nobody awaits that oneshot here.
-                let reap_agent = agent.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = child.wait() {
-                        tracing::debug!(
-                            agent = %reap_agent,
-                            error = %err,
-                            "mid-spawn reap failed"
-                        );
-                    }
-                });
+                Self::abandon_mid_spawn(agent, &mut session, child);
                 return Err(PtyError::UnknownAgent(agent.clone()));
             };
             my_epoch = *handle.epoch_tx.borrow();
@@ -694,6 +674,31 @@ impl PtyManager {
         });
         tracing::info!(agent = %agent, "spawned agent pty");
         Ok(())
+    }
+
+    /// The agent was removed from the roster while its process was starting.
+    /// Kill it and reap it here: the exit-watching thread `spawn` starts is
+    /// never reached on this path, and an unreaped child stays a zombie until
+    /// the daemon exits. The `exited_tx` oneshot goes with the child; nobody
+    /// awaits it.
+    fn abandon_mid_spawn(
+        agent: &AgentId,
+        session: &mut Session,
+        mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    ) {
+        if let Err(err) = session.killer.kill() {
+            tracing::warn!(
+                agent = %agent,
+                error = %err,
+                "kill after agent vanished mid-spawn failed"
+            );
+        }
+        let reap_agent = agent.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = child.wait() {
+                tracing::debug!(agent = %reap_agent, error = %err, "mid-spawn reap failed");
+            }
+        });
     }
 
     /// Opens a PTY pair and starts the agent process in it with the spawn
