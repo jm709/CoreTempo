@@ -7,7 +7,7 @@
 use std::io::{BufReader, IsTerminal, Read, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coretempo_core::types::{SessionState, SessionView};
 
@@ -17,6 +17,8 @@ use crate::session::sse::SseReader;
 
 const DETACH: u8 = 0x1d;
 const SIZE_POLL: Duration = Duration::from_millis(500);
+/// How long `Exited` waits for output still in flight behind it.
+const EXIT_DRAIN: Duration = Duration::from_millis(100);
 
 /// Everything the four reader threads can tell the main loop.
 enum Msg {
@@ -146,11 +148,33 @@ fn attached(client: &Client, id: &str) -> anyhow::Result<Outcome> {
                 }
             }
             Ok(Msg::Detach) => return Ok(Outcome::Detached),
-            Ok(Msg::Exited(how)) => return Ok(Outcome::Exited(how)),
+            Ok(Msg::Exited(how)) => {
+                drain_output(&rx, &mut stdout)?;
+                return Ok(Outcome::Exited(how));
+            }
             Ok(Msg::Transport(error)) => anyhow::bail!("lost the sessions daemon: {error}"),
             Err(_) => anyhow::bail!("lost the sessions daemon: every stream ended"),
         }
     }
+}
+
+/// The session's last screen bytes, which the PTY reader may still be putting
+/// on the channel behind the event watcher's `Exited` — two threads, no
+/// ordering between them. Bounded: an attachment that has already ended must
+/// not hang on a stream that never goes quiet.
+fn drain_output(rx: &mpsc::Receiver<Msg>, stdout: &mut impl Write) -> std::io::Result<()> {
+    let deadline = Instant::now() + EXIT_DRAIN;
+    while let Some(budget) = deadline.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(budget) {
+            Ok(Msg::Output(bytes)) => {
+                stdout.write_all(&bytes)?;
+                stdout.flush()?;
+            }
+            Ok(_) => {}
+            Err(_) => return Ok(()),
+        }
+    }
+    Ok(())
 }
 
 /// The PTY SSE stream: `pty` events carry base64 chunks; anything else on that
@@ -192,7 +216,21 @@ fn spawn_event_watcher(client: &Client, id: &str, tx: mpsc::Sender<Msg>) -> anyh
     let body = client.stream(&format!("/events?agent={id}"))?;
     std::thread::spawn(move || {
         let mut reader = SseReader::new(BufReader::new(body));
-        while let Ok(Some(event)) = reader.next_event() {
+        loop {
+            // EOF and a read error are reported like the PTY reader's: losing
+            // this stream means losing the only notice of the session exiting,
+            // so it must not end the thread quietly.
+            let event = match reader.next_event() {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    let _ = tx.send(Msg::Transport("the event stream closed".to_string()));
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx.send(Msg::Transport(error.to_string()));
+                    return;
+                }
+            };
             if event.event.as_deref() != Some("agent.lifecycle") {
                 continue;
             }
@@ -260,4 +298,49 @@ fn spawn_size_poller(tx: mpsc::Sender<Msg>) {
             std::thread::sleep(SIZE_POLL);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use crate::session::attach::{EXIT_DRAIN, Msg, drain_output};
+
+    /// Everything queued behind the exit reaches the terminal, and nothing
+    /// else does.
+    #[test]
+    fn the_drain_writes_queued_output_and_skips_the_rest() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Output(b"half a ".to_vec())).expect("send");
+        tx.send(Msg::Resize(80, 24)).expect("send");
+        tx.send(Msg::Output(b"screen".to_vec())).expect("send");
+        tx.send(Msg::Transport("the pty stream closed".into()))
+            .expect("send");
+        drop(tx);
+        let mut sink: Vec<u8> = Vec::new();
+        drain_output(&rx, &mut sink).expect("drain");
+        assert_eq!(sink, b"half a screen");
+    }
+
+    /// A stream that never goes quiet must not hold the terminal: the drain
+    /// gives up on its own deadline.
+    #[test]
+    fn the_drain_is_bounded_even_while_output_keeps_coming() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while tx.send(Msg::Output(b"x".to_vec())).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let started = Instant::now();
+        let mut sink: Vec<u8> = Vec::new();
+        drain_output(&rx, &mut sink).expect("drain");
+        assert!(
+            started.elapsed() < EXIT_DRAIN * 4,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!sink.is_empty());
+    }
 }

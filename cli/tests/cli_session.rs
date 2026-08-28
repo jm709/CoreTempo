@@ -250,3 +250,59 @@ fn projects_lists_and_forgets() -> anyhow::Result<()> {
     assert_eq!(srv.requests()[1].path, "/v1/projects/p-1");
     Ok(())
 }
+
+/// A repository registered inside another registered one: the cwd belongs to
+/// the innermost project, whatever order `GET /v1/projects` returns them in.
+#[test]
+fn a_nested_project_wins_over_the_enclosing_one() -> anyhow::Result<()> {
+    let base = std::env::temp_dir().join(format!("tempo-session-nested-{}", std::process::id()));
+    let inner = base.join("outer/inner");
+    std::fs::create_dir_all(inner.join("pkg"))?;
+    let outer = std::fs::canonicalize(base.join("outer"))?;
+    let inner = std::fs::canonicalize(&inner)?;
+    // Outer first, so a `find` would take it.
+    let projects = format!(
+        r#"[{{"id":"p-outer","path":"{}","name":"outer","created_at":"2026-08-27T10:00:00Z"}},
+            {{"id":"p-inner","path":"{}","name":"inner","created_at":"2026-08-27T10:00:00Z"}}]"#,
+        outer.display(),
+        inner.display()
+    );
+    let srv = serve(vec![
+        (200, projects),
+        (201, session_json("s-3", "starting", Some("main"), false)),
+    ])?;
+    let root = root_with_api(srv.port)?;
+    let arg = inner.join("pkg").display().to_string();
+    let out = tempo_session(&root, &["new", arg.as_str()])?;
+    assert_eq!(exit_code(&out), 0, "stderr: {}", stderr(&out));
+    let reqs = srv.requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "the project was already registered; paths: {:?}",
+        reqs.iter().map(|r| r.path.clone()).collect::<Vec<_>>()
+    );
+    let created: serde_json::Value = serde_json::from_str(&reqs[1].body)?;
+    assert_eq!(created["project"], "p-inner");
+    Ok(())
+}
+
+/// The daemon was alive when `api.json` was read and gone by the time the
+/// request went out: the run API's "is a run active?" is the wrong advice.
+#[test]
+fn a_daemon_that_stops_mid_command_names_itself_and_its_api_file() -> anyhow::Result<()> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    let root = root_with_api(port)?;
+    let out = tempo_session(&root, &["list"])?;
+    assert_eq!(exit_code(&out), 3);
+    let err = stderr(&out);
+    assert!(err.contains("sessions daemon"), "{err}");
+    assert!(
+        err.contains(&root.join("api.json").display().to_string()),
+        "{err}"
+    );
+    assert!(!err.contains("is a run active?"), "{err}");
+    Ok(())
+}

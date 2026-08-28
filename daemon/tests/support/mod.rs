@@ -521,7 +521,7 @@ post "/v1/agents/$CORETEMPO_AGENT_ID/state" "$start"
 printf 'booted\n'
 while IFS= read -r line; do
   case "$line" in
-    quit) exit 3 ;;
+    quit) printf 'bye\n'; exit 3 ;;
     *) post "/v1/agents/$CORETEMPO_AGENT_ID/state" '{"state":"working"}'
        printf 'got:%s\n' "$line"
        post "/v1/agents/$CORETEMPO_AGENT_ID/state" '{"state":"idle"}' ;;

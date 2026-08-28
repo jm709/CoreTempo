@@ -18,7 +18,7 @@ use coretempo_core::types::{
 };
 use serde_json::json;
 
-use crate::client::Client;
+use crate::client::{ApiCallError, Client};
 use crate::connect::Connection;
 
 #[derive(Args)]
@@ -82,11 +82,28 @@ enum ProjectsCmd {
 }
 
 pub fn run(args: SessionArgs) -> anyhow::Result<ExitCode> {
-    let conn = discover(&api_file(args.root.as_deref())?)?;
-    match args.cmd {
+    let api_file = api_file(args.root.as_deref())?;
+    let conn = discover(&api_file)?;
+    let outcome = match args.cmd {
         SessionCmd::Attach { id } => attach::run(&Client::new_untimed(&conn), &id),
         cmd => run_command(&Client::new(&conn), cmd),
-    }
+    };
+    outcome.map_err(|error| name_the_daemon(error, &api_file))
+}
+
+/// [`ApiCallError`]'s transport text is a run's ("is a run active?"); these
+/// commands never talk to a run, so say which daemon went away and where the
+/// address came from. The daemon was alive when `discover` read the pid, so
+/// this is a stop mid-command, not a missing one.
+fn name_the_daemon(error: anyhow::Error, api_file: &Path) -> anyhow::Error {
+    let Some(ApiCallError::Transport(message)) = error.downcast_ref::<ApiCallError>() else {
+        return error;
+    };
+    anyhow::anyhow!(
+        "cannot reach the sessions daemon named by {}: {message}; it has stopped \
+         since this command started — start it again with 'coretempod sessions'",
+        api_file.display()
+    )
 }
 
 fn api_file(root: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -218,9 +235,13 @@ fn ensure_project(client: &Client, path: &Path) -> anyhow::Result<ProjectView> {
     let canonical = std::fs::canonicalize(path)
         .with_context(|| format!("cannot resolve project path {}", path.display()))?;
     let projects: Vec<ProjectView> = serde_json::from_value(client.get("/projects")?)?;
+    // Longest prefix, not the first: a repository nested inside another
+    // registered one (`/w/outer` and `/w/outer/inner`) must resolve to the
+    // inner project, whatever order the daemon lists them in.
     if let Some(existing) = projects
         .into_iter()
-        .find(|p| canonical.starts_with(&p.path))
+        .filter(|p| canonical.starts_with(&p.path))
+        .max_by_key(|p| p.path.len())
     {
         return Ok(existing);
     }

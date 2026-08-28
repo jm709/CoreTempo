@@ -209,6 +209,15 @@ fn new_list_attach_detach_stop_resume_rm() -> anyhow::Result<()> {
     let mut err = String::new();
     session.stderr.read_to_string(&mut err)?;
     assert_eq!(status.code(), Some(1), "exit while attached is 1: {err}");
+    // The agent's last line comes over the PTY stream while the exit comes
+    // over the event stream: attach must drain the one before honouring the
+    // other, or the operator never sees why the session ended.
+    let mut last = String::new();
+    session.stdout.read_to_string(&mut last)?;
+    assert!(
+        last.contains("bye"),
+        "last output before the exit: {last:?}"
+    );
     assert!(
         err.contains(&id) && err.contains("exited (code 3)"),
         "the message names the exit: {err}"
