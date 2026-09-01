@@ -74,8 +74,12 @@ the new state and answers accordingly).
   inject `prompt` if given. **Create is atomic**: a failure anywhere up to
   and including the spawn (untrusted root, git failure, `claude` missing,
   PTY open) rolls back the row, the session files and the fresh worktree
-  (nothing has run in it) and returns that error — a session exists only
-  once its process is running.
+  (nothing has run in it) and returns that error. The row itself is
+  inserted just before the spawn — the `SessionStart` hook can fire before
+  the spawn call returns and needs a row to land on — so a session is
+  briefly listable (reading `exited`) before its process runs. Atomicity
+  means a failed create leaves nothing behind, not that the row appears
+  last.
 - **stop**: `PtyManager::stop(session)` (§4): SIGHUP via portable-pty's
   killer, reap with the existing `EXIT_GRACE` (5 s) then SIGKILL; the
   `blocked` flag is cleared with the usual `blocked: false` event; the row
