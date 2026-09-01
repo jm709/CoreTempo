@@ -4,8 +4,8 @@ import { sessionTerm } from "../term/instances";
 import type { SessionView } from "../types";
 
 /// Sessions run long and are read back by hand; the run-mode figure is per-workflow
-/// (`RunInfo.scrollback`), sessions have no such knob. Shared with sessionsWire's
-/// re-ensure after a reconnect so both open the same buffer.
+/// (`RunInfo.scrollback`), and sessions have no such knob. Every open in this file
+/// uses it, so a reopen after a reconnect gets the same buffer as the first open.
 export const SESSION_SCROLLBACK = 5000;
 
 /// The overlay text for a session with no live process, or null while it has one.

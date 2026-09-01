@@ -18,6 +18,9 @@ import type { SessionEvent, SessionsConnState } from "./types";
 const POLL_MS = 5000;
 
 let started = false;
+let statusOff: (() => void) | null = null;
+let eventOff: (() => void) | null = null;
+let poller: ReturnType<typeof setInterval> | null = null;
 let lastConn: SessionsConnState = "idle";
 let refetchQueued = false;
 
@@ -39,13 +42,19 @@ export async function enterSessionsMode(): Promise<void> {
   if (started) return;
   started = true;
   try {
-    await onSessionsStatus(handleStatus);
-    await onSessionEvent(onEvent);
-    setInterval(() => {
+    // Each piece is claimed by its own handle, so a retry after a failure part-way
+    // through resumes where it stopped instead of registering a second listener.
+    statusOff ??= await onSessionsStatus(handleStatus);
+    eventOff ??= await onSessionEvent(onEvent);
+    poller ??= setInterval(() => {
       void poll();
     }, POLL_MS);
     await onStatus(await sessionsStatus());
   } catch (error) {
+    // Nothing is committed on a failure: keeping `started` set would brick sessions
+    // mode for the life of the app — no listeners, no poll, and every later switch
+    // into the mode returning early.
+    started = false;
     report("connect", error);
   }
 }

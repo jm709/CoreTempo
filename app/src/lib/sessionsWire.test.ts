@@ -107,6 +107,34 @@ describe("enterSessionsMode", () => {
     expect(h.ipc.sessionsStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("retries registration after a first entry that failed to register", async () => {
+    // Leaving `started` set on a failed registration bricks sessions mode for the
+    // life of the app: no listeners, no poll, and every later switch returns early.
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.ipc.onSessionsStatus.mockRejectedValueOnce(new Error("listen failed"));
+
+    await wire.enterSessionsMode();
+    expect(h.ipc.onSessionEvent).not.toHaveBeenCalled();
+    expect(h.ipc.sessionsStatus).not.toHaveBeenCalled();
+
+    await wire.enterSessionsMode();
+    expect(h.ipc.onSessionsStatus).toHaveBeenCalledTimes(2);
+    expect(h.ipc.onSessionEvent).toHaveBeenCalledTimes(1);
+    expect(h.ipc.sessionsStatus).toHaveBeenCalledTimes(1);
+    quiet.mockRestore();
+  });
+
+  it("registers each listener once across a retry", async () => {
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.ipc.sessionsStatus.mockRejectedValueOnce(new Error("daemon spawn failed"));
+    await wire.enterSessionsMode();
+    await wire.enterSessionsMode();
+    expect(h.ipc.onSessionsStatus).toHaveBeenCalledTimes(1);
+    expect(h.ipc.onSessionEvent).toHaveBeenCalledTimes(1);
+    expect(h.ipc.sessionsStatus).toHaveBeenCalledTimes(2); // the connect is retried
+    quiet.mockRestore();
+  });
+
   it("applies the status the command reports", async () => {
     h.ipc.sessionsStatus.mockResolvedValue({ state: "starting", health: null });
     await wire.enterSessionsMode();

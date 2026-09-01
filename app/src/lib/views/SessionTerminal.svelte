@@ -1,6 +1,7 @@
 <script lang="ts">
   import { sessionResume, toCmdError } from "../ipcSessions";
   import { sessionsState } from "../state/sessions.svelte";
+  import { resumeDisabled } from "./railHelpers";
   import { bannerFor, retryStream, syncSelection } from "./sessionTerminalHelpers";
 
   let pane = $state<HTMLElement | null>(null);
@@ -71,10 +72,13 @@
     <div class="empty label">select a session</div>
   {/if}
   {#if selected !== null && banner !== null}
+    {@const disabledReason = resumeDisabled(selected)}
     <div class="banner mono">
       <span>[{banner}]</span>
       <button
         class="action"
+        disabled={disabledReason !== null}
+        title={disabledReason ?? undefined}
         onclick={() => {
           resume(selected.id);
         }}

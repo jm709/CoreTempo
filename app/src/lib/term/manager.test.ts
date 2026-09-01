@@ -226,6 +226,43 @@ describe("terminal manager", () => {
     expect(opened).toHaveLength(1);
   });
 
+  test("one pane showing two sessions in turn holds only the current wrapper", async () => {
+    // The sessions center gives every session the SAME pane element. A wrapper left
+    // behind by the session being suspended stays a full-height block child, and the
+    // arriving terminal renders below the fold.
+    const h = harness();
+    const term = manager(h.transport);
+    const pane = fakeEl();
+    await term.ensure("s-1", null, 5_000);
+    term.attach("s-1", asEl(pane));
+    const first = pane.children[0];
+    term.suspend("s-1");
+    await term.ensure("s-2", null, 5_000);
+    term.attach("s-2", asEl(pane));
+
+    expect(pane.children).toHaveLength(1);
+    expect(pane.children[0]).not.toBe(first);
+    expect(opened).toHaveLength(2); // one open per terminal, each in its own wrapper
+  });
+
+  test("a session returning to the pane is re-shown without a second open", async () => {
+    const h = harness();
+    const term = manager(h.transport);
+    const pane = fakeEl();
+    await term.ensure("s-1", null, 5_000);
+    term.attach("s-1", asEl(pane));
+    const first = pane.children[0];
+    term.suspend("s-1");
+    await term.ensure("s-2", null, 5_000);
+    term.attach("s-2", asEl(pane));
+    term.suspend("s-2");
+    await term.resumeStream("s-1");
+    term.attach("s-1", asEl(pane));
+
+    expect(pane.children).toEqual([first]); // the same wrapper, screen intact
+    expect(opened).toHaveLength(2);
+  });
+
   test("the fit on attach reaches the PTY regardless of attach order", async () => {
     // The fit() inside the attach resizes xterm; that resize event must arrive
     // after onResize is registered, or the PTY stays at its 120x40 spawn size

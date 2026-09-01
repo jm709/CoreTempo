@@ -26,7 +26,8 @@ export interface TermTransport {
 export interface TerminalManager {
   ensure(id: string, sinceCursor: number | null, scrollback: number): Promise<void>;
   attach(id: string, el: HTMLElement): void;
-  /// Detach the stream, keep the xterm and its screen.
+  /// Take the terminal off its stream and out of its pane, keeping the xterm and
+  /// its screen. `resumeStream` + `attach` bring it back.
   suspend(id: string): void;
   /// Resubscribe a suspended terminal, replaying what it missed.
   resumeStream(id: string): Promise<void>;
@@ -46,6 +47,10 @@ interface Entry {
   /// terminal has an element, so moving between panes means moving the wrapper.
   wrapper: HTMLElement | null;
   container: HTMLElement | null;
+  /// xterm's open() has run. `container` cannot stand in for this: a suspend takes
+  /// the terminal out of its pane and nulls it, and opening a second time would
+  /// build a second renderer over the same screen.
+  opened: boolean;
   observer: ResizeObserver | null;
   detach: (() => void) | null;
   /// A subscription is live or in flight. Cleared by suspend so a detach fn that
@@ -120,8 +125,8 @@ export function createTerminalManager(transport: TermTransport): TerminalManager
         void transport.pause(id, paused);
       });
       const entry: Entry = {
-        term, fit, webgl: null, gauge, wrapper: null, container: null, observer: null,
-        detach: null, streaming: false,
+        term, fit, webgl: null, gauge, wrapper: null, container: null, opened: false,
+        observer: null, detach: null, streaming: false,
       };
       term.onData((data) => {
         void transport.write(id, ENC.encode(data));
@@ -164,6 +169,14 @@ export function createTerminalManager(transport: TermTransport): TerminalManager
     entry.streaming = false;
     entry.detach?.();
     entry.detach = null;
+    // Out of the pane as well as off the stream. The sessions center hands every
+    // session the same pane element, so a wrapper left behind stays a full-height
+    // block child and pushes the arriving terminal below the fold. The xterm and
+    // its screen live on in the detached wrapper; attach() puts it back.
+    entry.observer?.disconnect();
+    entry.observer = null;
+    entry.wrapper?.remove();
+    entry.container = null;
   }
 
   async function resumeStream(id: string): Promise<void> {
@@ -211,12 +224,12 @@ function disposeEntry(entry: Entry): void {
 
 function openInPane(entry: Entry, el: HTMLElement): void {
   if (entry.container === el) return;
-  const first = entry.container === null;
   entry.container = el;
   entry.wrapper ??= newWrapper();
   el.append(entry.wrapper); // moves it out of the pane it was attached to before
-  if (first) {
+  if (!entry.opened) {
     entry.term.open(entry.wrapper);
+    entry.opened = true;
     enableWebgl(entry);
   }
   entry.observer?.disconnect();
