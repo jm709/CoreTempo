@@ -55,6 +55,10 @@ export async function enterSessionsMode(): Promise<void> {
     // mode for the life of the app — no listeners, no poll, and every later switch
     // into the mode returning early.
     started = false;
+    // Through the reducer so `lastConn` moves with it: the topbar would otherwise
+    // read "starting…" for as long as the operator stays in the mode, and a later
+    // connect would keep terminals whose daemon we never reached.
+    await onStatus({ state: "unreachable" });
     report("connect", error);
   }
 }

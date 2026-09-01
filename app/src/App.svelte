@@ -18,7 +18,7 @@
     uiState,
   } from "./lib/state/ui.svelte";
   import { jumpToAgentTerminal } from "./lib/term/jump";
-  import { workflowTerm } from "./lib/term/instances";
+  import { sessionTerm, workflowTerm } from "./lib/term/instances";
   import { confirmDiscard } from "./lib/dialogs";
   import type { SessionView } from "./lib/types";
   import CreateSessionModal from "./lib/views/CreateSessionModal.svelte";
@@ -97,7 +97,10 @@
       }
       case "release":
         releaseCapture();
+        // Both managers: release is the one binding sessions mode lets through,
+        // and it is the session terminal that holds focus there.
         workflowTerm.blurAll();
+        sessionTerm.blurAll();
         break;
       case "dock-feed":
         uiState.dockTab = "feed";

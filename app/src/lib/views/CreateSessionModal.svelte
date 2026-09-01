@@ -84,7 +84,11 @@
     </label>
     <label class="field">
       <span class="mono key">title</span>
-      <input class="mono" bind:value={form.title} />
+      <input
+        class="mono"
+        bind:value={form.title}
+        placeholder="(first prompt line, else branch/dir)"
+      />
     </label>
     <label class="field">
       <span class="mono key">prompt</span>

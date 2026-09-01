@@ -116,6 +116,9 @@ describe("enterSessionsMode", () => {
     await wire.enterSessionsMode();
     expect(h.ipc.onSessionEvent).not.toHaveBeenCalled();
     expect(h.ipc.sessionsStatus).not.toHaveBeenCalled();
+    // The connection never happened, so the topbar must say so rather than sit on
+    // "starting…" for as long as the operator stays in the mode.
+    expect(store.sessionsState.conn).toBe("unreachable");
 
     await wire.enterSessionsMode();
     expect(h.ipc.onSessionsStatus).toHaveBeenCalledTimes(2);
