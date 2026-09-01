@@ -1,9 +1,12 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { toCmdError } from "./ipc";
 import type {
   CreateSessionRequest, DeleteSessionResponse, ProjectView, ResumeResponse, SessionEvent,
   SessionsConnState, SessionView,
 } from "./types";
+
+export { toCmdError };
 
 export const SESSIONS_STATUS_EVENT = "coretempo:sessions-status";
 export const SESSION_EVENT = "coretempo:session-event";

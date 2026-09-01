@@ -16,9 +16,11 @@
   import { jumpToAgentTerminal } from "./lib/term/jump";
   import { workflowTerm } from "./lib/term/instances";
   import { confirmDiscard } from "./lib/dialogs";
+  import type { SessionView } from "./lib/types";
   import Dock from "./lib/views/Dock.svelte";
   import NoWorkflowCard from "./lib/views/NoWorkflowCard.svelte";
   import Roster from "./lib/views/Roster.svelte";
+  import SessionRail from "./lib/views/SessionRail.svelte";
   import TerminalGrid from "./lib/views/TerminalGrid.svelte";
   import WorkflowEditor from "./lib/views/WorkflowEditor.svelte";
 
@@ -27,6 +29,9 @@
 
   let now = $state(Date.now());
   let runError = $state<string | null>(null);
+  // Task 10 renders the create/delete modals off these; Task 9 only wires the rail.
+  let createFor = $state<string | null>(null);
+  let deleting = $state<SessionView | null>(null);
 
   const showGrid = $derived(runState.phase === "running" || runState.phase === "stopping");
   const gate = $derived(runGate(runState.phase, uiState.editorPath, uiState.editorDirty));
@@ -203,7 +208,14 @@
     {#if uiState.mode === "workflows"}
       <Roster />
     {:else}
-      <div class="label heading">Sessions</div>
+      <SessionRail
+        onCreate={(p) => {
+          createFor = p;
+        }}
+        onDelete={(s) => {
+          deleting = s;
+        }}
+      />
     {/if}
   </aside>
 
@@ -289,7 +301,6 @@
   .view { height: 100%; min-width: 0; min-height: 0; }
   .view.offscreen { display: none; }
   .rail { grid-area: rail; border: none; min-height: 0; }
-  .heading { padding: 0 10px 6px; }
   .center { grid-area: center; min-width: 0; min-height: 0; background: var(--bg); }
   .dock { grid-area: dock; border: none; min-width: 0; min-height: 0; }
   .statusbar {
