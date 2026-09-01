@@ -81,17 +81,33 @@ remove-worktree, and a 422-dirty response re-prompts showing the API's
 porcelain summary verbatim with a force option. `branch_kept: true` in the
 response is reported in the confirm's closing state.
 
-Freshness, two sources: the daemon's `/v1/events` stream (forwarded by the
-shell, §7) applies `session.*`, `project.*`, `agent.state`, `agent.blocked`
-and `agent.lifecycle` instantly; a `GET /v1/sessions` poll every 5 s,
-running while sessions mode is active, refreshes the git-status fields
-(`branch`, `changed_files`, `ahead`, `worktree_status`), which Spec A
-computes on GET and no event ever carries.
+A card whose `worktree_status` is `missing` disables `resume` with a
+tooltip naming `delete` — the client already knows the 409 the API would
+return, so it does not round-trip for it.
+
+Freshness, two sources with a precedence rule: the daemon's `/v1/events`
+stream (forwarded by the shell, §7) applies `session.*`, `project.*`,
+`agent.state`, `agent.blocked` and `agent.lifecycle` instantly and owns
+`state` and `blocked`; a `GET /v1/sessions` poll every 5 s, running while
+sessions mode is active, writes only the git-status fields (`branch`,
+`changed_files`, `ahead`, `worktree_status` — computed on GET, carried by
+no event) and reconciles membership (rows the poll adds or no longer
+returns). The poll never writes `state`/`blocked`, so a response computed
+just before an event arrived cannot regress a card.
+
+If the selected session is deleted — from the UI or externally
+(`session.deleted` from a `tempo session rm`) — the selection clears and
+the center shows the empty state. An external stop is already covered by
+the §5 banner.
 
 ## 4. Creating a session
 
-`+ session` / `+ new session` opens a modal form (the `dialogs.ts`
-patterns):
+`+ session` / `+ new session` opens a modal form. The webview has no
+modal-form precedent — `dialogs.ts` is two native two-button confirms —
+so this is a new in-app modal component, and the §3 delete flow (a
+remove-worktree option, a dirty re-prompt carrying the porcelain summary
+and a force option) uses the same component family, since native `ask()`
+cannot express three-way choices with rich content.
 
 | Field | Behaviour |
 |---|---|
@@ -126,41 +142,83 @@ Enter typed into a mid-redraw prompt can be swallowed, and the operator
 sees and retypes, as in any terminal. A concurrent `tempo session attach`
 types into the same PTY; last writer wins.
 
-Only the selected session holds an open PTY stream. The term manager keeps
-xterm instances and cursors per session id (as it does per agent), so
-switching away detaches the stream and switching back resubscribes at the
-stored cursor — the SSE replay delivers exactly the missed bytes, then
-live. Resize on attach and on container resize.
+Only the selected session holds an open PTY stream, and that takes an
+explicit close: switching away calls `session_unsubscribe_pty`, which
+ends the shell's SSE connection and pump for that session. The workflow
+detach idiom — clearing the Channel's JS handler — is not enough here:
+Tauri's callback map keeps the channel alive, so the shell pump would
+hold one SSE connection per session ever viewed.
+
+**Cursor accounting is the shell's.** Per session, the shell records the
+stream cursor after the last chunk it forwarded.
+`session_subscribe_pty(session, resume)` with `resume: true` resubscribes
+at that stored cursor — the SSE replay delivers exactly the bytes the
+webview missed, then live; `resume: false` (first view of a session, a
+disposed xterm instance, or after a reconnect reset — §6) replays from
+the ring start into a fresh terminal. Resize on attach and on container
+resize.
+
+**Term-manager refactor.** Today's manager is a module-level singleton
+with the workflow IPC hardcoded (its transport functions are direct
+imports, including the backpressure → `pausePty` closure) and a global
+`disposeAllTerminals()` that `stopRun` calls. It becomes a factory taking
+a transport (subscribe/write/resize/pause), instantiated once for
+workflow agents — behaviour unchanged — and once for sessions, each with
+its own entries map, so stopping a workflow run cannot touch session
+terminals. It tracks no cursors today and gains none: that stays in the
+shell, above.
 
 A stopped/exited session still renders its ring tail (the stream never
 ends on exit and spans respawns) under a dim banner naming the state —
-`stopped · resume` / `exited (code N) · resume` — with the banner's
-`resume` wired to the same action as the card's.
+`stopped · resume`, or the exit rendered by the existing `exitLabel`
+(code or signal, amendment 42) — with the banner's `resume` wired to the
+same action as the card's. Rings are in-memory: after a **daemon**
+restart a stopped session's terminal is blank by design (the new daemon
+re-attaches rows to fresh rings), not a replay bug.
 
 ## 6. Daemon lifecycle in the shell
 
 The shell owns the daemon relationship, lazily — first entry into
 sessions mode, never at app boot, so workflow-only usage spawns nothing:
 
-1. Read `~/.coretempo/sessions/api.json`. Present with a live pid →
-   connect.
-2. Otherwise spawn `coretempod sessions` detached (own process group;
-   stdio released — the daemon logs to its own `daemon.log`), then poll
-   `/v1/health` until it answers.
-3. Open `/v1/events` (no filter) and forward every event to the webview
-   (§7).
+1. Read `~/.coretempo/sessions/api.json`. If present, probe
+   `GET /v1/health` with its token (short timeout). An answer → connect.
+   The pid is never consulted: amendment 47 makes the daemon's `flock`
+   the liveness authority and the kernel recycles pids — a health answer
+   is the only proof the shell needs.
+2. No file or no answer → spawn `coretempod sessions` detached (own
+   process group; stdio released — the daemon logs to its own
+   `daemon.log`). A spawn that exits 1 with the second-start refusal is
+   **success** — it lost a race to a live peer.
+3. Poll for a fresh `api.json` — the port is ephemeral (`--port` defaults
+   to 0) and the file is written only after the listener binds — then
+   `/v1/health`, up to ~10 s before giving up as unreachable. Then open
+   `/v1/events` (no filter) and forward every event to the webview (§7).
 
-The sessions topbar shows the state: `starting…`, `connected`, or `daemon
-unreachable — retrying` on a backoff. On stream drop the shell re-reads
-`api.json` (a restarted daemon binds a new port), reconnects, and the
-webview refetches `GET /v1/sessions` to resync anything missed. The
-operator token is read from `api.json` in the shell and never crosses into
-the webview.
+Connection state reaches the webview as shell-emitted transitions on a
+dedicated Tauri event, `coretempo:sessions-status`, carrying
+`{ state: "starting" | "connected" | "unreachable" }`; the sessions
+topbar renders it (`starting…`, `connected`, `daemon unreachable —
+retrying`). On stream drop the shell emits `unreachable` and re-runs the
+sequence from step 1 on a backoff. Every `connected` transition —
+initial or reconnect — is the webview's trigger to refetch
+`GET /v1/sessions` and `GET /v1/projects`; on a **re**connect the shell
+has also reset its stored PTY cursors (a restarted daemon numbers from a
+fresh ring, and the shell does not try to distinguish a blip from a
+restart), so the webview disposes session xterm instances and the
+selected session resubscribes with `resume: false`. The operator token is
+read from `api.json` in the shell and never crosses into the webview.
 
 **Packaging.** The desktop must be able to spawn `coretempod`. In dev,
 `./dev` points the shell at the workspace target binary; a release bundle
 ships `coretempod` as a Tauri sidecar (`externalBin`) — the first second
-binary in the app bundle.
+binary in the app bundle, and the change that flips `bundle.active` on
+(it is `false` today). Two constraints: `externalBin` entries carry
+target-triple-suffixed names; and the shell must **not** spawn through
+`tauri-plugin-shell`'s sidecar API, which tracks children and kills them
+on app exit — exactly wrong for a daemon that outlives the window. It
+resolves the sidecar path and spawns via `std::process::Command` in its
+own process group.
 
 ## 7. Shell proxy surface
 
@@ -178,14 +236,17 @@ through, `CmdError` out) to the daemon API:
 | `project_list` | `GET /v1/projects` |
 | `project_register` | `POST /v1/projects` |
 | `project_forget` | `DELETE /v1/projects/{id}` |
-| `session_subscribe_pty` | `GET /v1/sessions/{id}/pty?since=` → Channel of decoded bytes |
+| `session_subscribe_pty` | `(session, resume)` — `GET /v1/sessions/{id}/pty?since=` → Channel of decoded bytes; `resume` per §5 |
+| `session_unsubscribe_pty` | closes the shell's SSE connection and pump for that session (§5 — the Channel-handler detach idiom cannot) |
 | `session_write_pty` | `POST /v1/sessions/{id}/pty` |
 | `session_resize_pty` | `POST /v1/sessions/{id}/pty/resize` |
 | `session_pause_pty` | `POST /v1/sessions/{id}/pty/pause` |
 
 Daemon events forward on a new Tauri event `coretempo:session-event` —
 not `coretempo:event`, whose payload type is the run bus envelope and
-whose consumers assume run semantics. The shell gains `reqwest`
+whose consumers assume run semantics. Shell-originated connection
+transitions travel on `coretempo:sessions-status` (§6), separate because
+they exist precisely when there is no daemon to emit anything. The shell gains `reqwest`
 (exact-pinned, HTTP + SSE streaming); `ureq` stays where it is — the CLI
 and shell clients are separate by design (blocking vs async), and no
 shared client crate is extracted until a third consumer exists.
@@ -194,9 +255,12 @@ shared client crate is extracted until a third consumer exists.
 
 `state/sessions.svelte.ts`: session rows by id, project list, connection
 state, selected session id, blocked-count derivation for the badge. Fed by
-`coretempo:session-event` and the §3 poll. `types.ts` gains `SessionRow`,
-`ProjectRow`, `SessionsStatus` and the create-request shape, mirroring the
-contracts doc. Selection and mode live in `uiState`.
+`coretempo:session-event`, `coretempo:sessions-status` and the §3 poll.
+`types.ts` gains the contracts doc's wire types under their contracts
+names — `SessionView`, `ProjectView`, `CreateSessionRequest` (amendment
+47; `SessionRow` is core's private store type, and renaming wire shapes
+invites drift) — plus the `coretempo:sessions-status` payload. Selection
+and mode live in `uiState`.
 
 ## 9. Errors
 
@@ -217,9 +281,14 @@ TDD throughout.
   state; create-form request shaping; blocked-badge derivation.
 - **Shell (Rust):** proxy commands against a stub axum server asserting
   route, bearer header, query encoding and error passthrough; the SSE →
-  Channel pump against a scripted stream, including base64 decode and
-  resubscribe-at-cursor; `api.json` discovery (missing, stale pid, live)
-  and the spawn-then-health-poll path with a fake daemon binary.
+  Channel pump against a scripted stream, including base64 decode,
+  resume-at-stored-cursor, `resume: false` from ring start, and
+  unsubscribe actually closing the connection; discovery and spawn — a
+  live daemon answers health and no spawn happens, a stale `api.json`
+  with a dead port spawns, a spawn exiting 1 (second-start refusal) is
+  treated as success, the ephemeral port is learned from the rewritten
+  `api.json`; reconnect resets stored cursors and emits the status
+  transitions in order.
 - **Live (manual, on the PR's checklist):** desktop against a real
   daemon — create with worktree from the UI, watch it boot, type a turn,
   see ⏸ on a permission dialog and answer it in the terminal, stop,
@@ -237,7 +306,9 @@ trust-confirmed retry on create.
 
 ## 12. Contracts amendment
 
-- **49** — the Tauri sessions command surface (§7 table, request/response
-  types mirroring the daemon API), the `coretempo:session-event` Tauri
-  event, `uiState.mode`, and the `coretempod` sidecar packaging
-  requirement.
+- **49** — the Tauri sessions command surface (§7 table including
+  `session_subscribe_pty(session, resume)` and `session_unsubscribe_pty`,
+  request/response types under the contracts wire names), the
+  `coretempo:session-event` and `coretempo:sessions-status` Tauri events,
+  `uiState.mode`, the term-manager factory (§5), and the `coretempod`
+  sidecar packaging requirement (§6).
