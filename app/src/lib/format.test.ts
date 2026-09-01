@@ -13,6 +13,10 @@ describe("status glyphs (spec §9.3, exact characters)", () => {
     expect(STATE_GLYPHS.restarting).toBe("◐");
     expect(STATE_GLYPHS.exited).toBe("✕");
   });
+  it("gives sessions' stopped state its own glyph, distinct from exited", () => {
+    expect(STATE_GLYPHS.stopped).toBe("◻");
+    expect(STATE_GLYPHS.stopped).not.toBe(STATE_GLYPHS.exited);
+  });
   it("labels exited as dead everywhere in the UI", () => {
     expect(stateLabel("exited")).toBe("dead");
     expect(stateLabel("working")).toBe("working");

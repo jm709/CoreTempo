@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   closeWorkflow,
   openAgentTerminal,
@@ -80,6 +80,22 @@ describe("run gate", () => {
     uiState.editorDirty = true;
     resetUi();
     expect(uiState.editorDirty).toBe(false);
+  });
+});
+
+describe("mode (chrome, not run state)", () => {
+  afterEach(() => {
+    uiState.mode = "workflows";
+  });
+
+  test("defaults to workflows", () => {
+    expect(uiState.mode).toBe("workflows");
+  });
+
+  test("resetUi does not touch mode", () => {
+    uiState.mode = "sessions";
+    resetUi();
+    expect(uiState.mode).toBe("sessions");
   });
 });
 

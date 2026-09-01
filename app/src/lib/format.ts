@@ -1,12 +1,15 @@
-import type { AgentExit, AgentState, MessageRecord } from "./types";
+import type { AgentExit, AgentState, MessageRecord, SessionState } from "./types";
 
 // Spec §9.3: ● working (pulsing) · ◌ idle · ◐ starting · ✕ dead. Restarting reuses ◐.
-export const STATE_GLYPHS: Record<AgentState, string> = {
+// ◻ stopped is sessions-only (spec §2): a session parked without a live process,
+// distinct from exited's ✕ (a session that ended unexpectedly).
+export const STATE_GLYPHS: Record<AgentState | SessionState, string> = {
   working: "●",
   idle: "◌",
   starting: "◐",
   restarting: "◐",
   exited: "✕",
+  stopped: "◻",
 };
 
 export function stateLabel(s: AgentState): string {
