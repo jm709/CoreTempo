@@ -6,6 +6,7 @@ const term = vi.hoisted(() => ({
   ensure: vi.fn(async () => {}),
   attach: vi.fn(),
   resumeStream: vi.fn(async () => {}),
+  suspend: vi.fn(),
   has: vi.fn(() => false),
   dispose: vi.fn(),
 }));
@@ -15,7 +16,7 @@ vi.mock("../term/instances", () => ({ sessionTerm: term }));
 import { sessionsState } from "../state/sessions.svelte";
 import type { AgentExit, SessionState, SessionView } from "../types";
 import {
-  bannerFor, openSelected, retryStream, SESSION_SCROLLBACK,
+  bannerFor, openSelected, retryStream, SESSION_SCROLLBACK, syncSelection,
 } from "./sessionTerminalHelpers";
 
 function makeSession(state: SessionState, exit: AgentExit | null = null): SessionView {
@@ -74,6 +75,47 @@ describe("openSelected", () => {
     expect(term.resumeStream).toHaveBeenCalledWith("s-1");
     expect(term.ensure).not.toHaveBeenCalled();
     expect(term.attach).toHaveBeenCalledWith("s-1", pane);
+  });
+});
+
+describe("syncSelection", () => {
+  const pane = {} as HTMLElement;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    term.has.mockReturnValue(false);
+  });
+
+  it("suspends the terminal being left and opens the one arriving", async () => {
+    expect(await syncSelection("s-1", "s-2", pane, true)).toBe("s-2");
+    expect(term.suspend).toHaveBeenCalledWith("s-1");
+    expect(term.ensure).toHaveBeenCalledWith("s-2", null, SESSION_SCROLLBACK);
+    expect(term.attach).toHaveBeenCalledWith("s-2", pane);
+  });
+
+  it("suspends nothing when the selection has not moved", async () => {
+    term.has.mockReturnValue(true);
+    await syncSelection("s-1", "s-1", pane, true);
+    expect(term.suspend).not.toHaveBeenCalled();
+    expect(term.resumeStream).toHaveBeenCalledWith("s-1");
+  });
+
+  it("still suspends the old terminal when the selection is cleared", async () => {
+    expect(await syncSelection("s-1", null, pane, true)).toBeNull();
+    expect(term.suspend).toHaveBeenCalledWith("s-1");
+    expect(term.ensure).not.toHaveBeenCalled();
+  });
+
+  it("opens nothing while the daemon is unreachable", async () => {
+    await syncSelection("s-1", "s-2", pane, false);
+    expect(term.suspend).toHaveBeenCalledWith("s-1");
+    expect(term.ensure).not.toHaveBeenCalled();
+    expect(term.attach).not.toHaveBeenCalled();
+  });
+
+  it("opens nothing before the pane is mounted", async () => {
+    await syncSelection(null, "s-1", null, true);
+    expect(term.ensure).not.toHaveBeenCalled();
   });
 });
 

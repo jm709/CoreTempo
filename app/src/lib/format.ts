@@ -1,4 +1,6 @@
-import type { AgentExit, AgentState, MessageRecord, SessionState } from "./types";
+import type {
+  AgentExit, AgentState, MessageRecord, SessionsConnState, SessionState,
+} from "./types";
 
 // Spec §9.3: ● working (pulsing) · ◌ idle · ◐ starting · ✕ dead. Restarting reuses ◐.
 // ◻ stopped is sessions-only (spec §2): a session parked without a live process,
@@ -14,6 +16,18 @@ export const STATE_GLYPHS: Record<AgentState | SessionState, string> = {
 
 export function stateLabel(s: AgentState): string {
   return s === "exited" ? "dead" : s;
+}
+
+// Sessions topbar: what the daemon connection is doing. `idle` only exists before
+// the first status lands, and entering sessions mode always kicks the supervisor,
+// so it reads as starting rather than as a state of its own.
+export function connLabel(conn: SessionsConnState): string {
+  switch (conn) {
+    case "connected": return "connected";
+    case "unreachable": return "daemon unreachable — retrying";
+    case "idle":
+    case "starting": return "starting…";
+  }
 }
 
 // Pane overlay for a dead agent: `exited 3`, or `killed: Terminated` when a

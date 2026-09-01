@@ -43,6 +43,15 @@ export function applyGitPoll(views: SessionView[]): void {
   }
 }
 
+/// Mid-stream refresh after a `session.*`/`project.*` event. Unlike setLists it
+/// keeps the dedup floor — the bus that numbered the triggering event is still the
+/// one we are reading — and puts the sessions through applyGitPoll, so a row's live
+/// state survives a list snapshot the daemon took before the last state event.
+export function refreshLists(projects: ProjectView[], sessions: SessionView[]): void {
+  sessionsState.projects = projects;
+  applyGitPoll(sessions);
+}
+
 export function clearStreamError(id: string): void {
   // oxlint-disable-next-line no-dynamic-delete -- keyed rune map, ids are session-bounded
   delete sessionsState.streamErrors[id];

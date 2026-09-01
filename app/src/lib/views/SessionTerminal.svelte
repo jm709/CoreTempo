@@ -1,8 +1,7 @@
 <script lang="ts">
   import { sessionResume, toCmdError } from "../ipcSessions";
   import { sessionsState } from "../state/sessions.svelte";
-  import { sessionTerm } from "../term/instances";
-  import { bannerFor, openSelected, retryStream } from "./sessionTerminalHelpers";
+  import { bannerFor, retryStream, syncSelection } from "./sessionTerminalHelpers";
 
   let pane = $state<HTMLElement | null>(null);
   let actionError = $state<string | null>(null);
@@ -34,15 +33,17 @@
   $effect(() => {
     const id = sessionsState.selected;
     const el = pane;
+    // The daemon connection is a dependency, not decoration: a reconnect drops every
+    // terminal (sessionsWire) before it lands here, so this re-run is what reopens the
+    // selected one against the new daemon. While it is down there is no stream to
+    // subscribe to, so the open waits for it.
+    const connected = sessionsState.conn === "connected";
     actionError = null;
     generation += 1;
     const gen = generation;
     enqueue(async () => {
       if (gen !== generation) return; // a newer selection is already queued behind us
-      if (previous !== null && previous !== id) sessionTerm.suspend(previous);
-      previous = id;
-      if (id === null || el === null) return;
-      await openSelected(id, el);
+      previous = await syncSelection(previous, id, el, connected);
     });
   });
 

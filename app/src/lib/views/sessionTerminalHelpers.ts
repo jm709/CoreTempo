@@ -23,6 +23,22 @@ export async function openSelected(id: string, pane: HTMLElement): Promise<void>
   sessionTerm.attach(id, pane);
 }
 
+/// One selection change, as the sessions center makes it: the terminal being left
+/// keeps its screen but loses its stream, and the one arriving is shown — but only
+/// with a pane to show it in and a daemon to stream from. Returns the id now on
+/// screen, which is the caller's next `previous`.
+export async function syncSelection(
+  previous: string | null,
+  id: string | null,
+  pane: HTMLElement | null,
+  connected: boolean,
+): Promise<string | null> {
+  if (previous !== null && previous !== id) sessionTerm.suspend(previous);
+  if (id === null || pane === null || !connected) return id;
+  await openSelected(id, pane);
+  return id;
+}
+
 /// The `retry` action on the stream-error bar. The old terminal is discarded
 /// rather than resumed: the error means its subscription is gone, and its screen
 /// stops where the stream died, so a fresh one replaying the daemon's buffer is

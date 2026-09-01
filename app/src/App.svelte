@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { elapsed } from "./lib/format";
+  import { connLabel, elapsed } from "./lib/format";
   import { restartAgent } from "./lib/ipc";
   import { isMac, modLabel, resolveKey } from "./lib/keys";
   import { boot, startRun, stopRun } from "./lib/session";
+  import { enterSessionsMode } from "./lib/sessionsWire";
   import { agentsState, runningCount } from "./lib/state/agents.svelte";
   import { runState } from "./lib/state/run.svelte";
   import {
@@ -57,6 +58,12 @@
 
   $effect(() => {
     void boot();
+  });
+  // Lazy connect (spec §2): the sessions daemon is only discovered/spawned once the
+  // operator asks for sessions. `enterSessionsMode` is idempotent and its listeners
+  // then stay for the app's life, so switching back and forth costs nothing.
+  $effect(() => {
+    if (uiState.mode === "sessions") void enterSessionsMode();
   });
   $effect(() => {
     const t = setInterval(() => {
@@ -163,6 +170,9 @@
       </button>
     </span>
     {#if uiState.mode === "sessions"}
+      <span class="conn" class:bad={sessionsState.conn === "unreachable"}>
+        {connLabel(sessionsState.conn)}
+      </span>
       <button class="runbtn" onclick={openCreate}>+ new session</button>
     {/if}
     {#if uiState.mode === "workflows"}
@@ -336,6 +346,8 @@
   .hint + .runbtn { margin-left: 0; }
   .runbtn.running { color: var(--err); }
   .meta { color: var(--text-dim); }
+  .conn { color: var(--text-dim); }
+  .conn.bad { color: var(--err); }
   .viewtoggle { display: flex; gap: 2px; }
   .viewtoggle button { color: var(--text-dim); }
   .viewtoggle button.active { color: var(--accent); }
