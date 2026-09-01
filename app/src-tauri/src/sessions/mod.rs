@@ -2,3 +2,4 @@
 //! owns no session state, it proxies the sessions daemon's `/v1`.
 
 pub mod client;
+pub mod discovery;
