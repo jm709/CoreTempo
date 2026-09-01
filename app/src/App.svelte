@@ -27,6 +27,7 @@
   import NoWorkflowCard from "./lib/views/NoWorkflowCard.svelte";
   import Roster from "./lib/views/Roster.svelte";
   import SessionRail from "./lib/views/SessionRail.svelte";
+  import SessionTerminal from "./lib/views/SessionTerminal.svelte";
   import TerminalGrid from "./lib/views/TerminalGrid.svelte";
   import WorkflowEditor from "./lib/views/WorkflowEditor.svelte";
 
@@ -253,6 +254,11 @@
         <TerminalGrid />
       </div>
     {/if}
+    <!-- Mounted for the app's life: unmounting on a mode switch would drop the
+         selected session's xterm and its screen with it. -->
+    <div class="view" class:offscreen={uiState.mode !== "sessions"}>
+      <SessionTerminal />
+    </div>
   </main>
 
   <aside class="dock panel">
