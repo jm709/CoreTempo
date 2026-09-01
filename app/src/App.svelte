@@ -1,10 +1,15 @@
 <script lang="ts">
-  import { elapsed } from "./lib/format";
+  import { connLabel, elapsed } from "./lib/format";
   import { restartAgent } from "./lib/ipc";
   import { isMac, modLabel, resolveKey } from "./lib/keys";
   import { boot, startRun, stopRun } from "./lib/session";
+  import { enterSessionsMode } from "./lib/sessionsWire";
   import { agentsState, runningCount } from "./lib/state/agents.svelte";
   import { runState } from "./lib/state/run.svelte";
+  import {
+    blockedCount as sessionsBadge,
+    sessionsState,
+  } from "./lib/state/sessions.svelte";
   import {
     closeWorkflow,
     releaseCapture,
@@ -13,11 +18,17 @@
     uiState,
   } from "./lib/state/ui.svelte";
   import { jumpToAgentTerminal } from "./lib/term/jump";
-  import { blurAllTerminals } from "./lib/term/manager";
+  import { sessionTerm, workflowTerm } from "./lib/term/instances";
   import { confirmDiscard } from "./lib/dialogs";
+  import type { SessionView } from "./lib/types";
+  import CreateSessionModal from "./lib/views/CreateSessionModal.svelte";
+  import DeleteSessionModal from "./lib/views/DeleteSessionModal.svelte";
   import Dock from "./lib/views/Dock.svelte";
+  import Modal from "./lib/views/Modal.svelte";
   import NoWorkflowCard from "./lib/views/NoWorkflowCard.svelte";
   import Roster from "./lib/views/Roster.svelte";
+  import SessionRail from "./lib/views/SessionRail.svelte";
+  import SessionTerminal from "./lib/views/SessionTerminal.svelte";
   import TerminalGrid from "./lib/views/TerminalGrid.svelte";
   import WorkflowEditor from "./lib/views/WorkflowEditor.svelte";
 
@@ -26,6 +37,13 @@
 
   let now = $state(Date.now());
   let runError = $state<string | null>(null);
+  // null = closed; "" = open with no project pre-selected (none registered yet).
+  let createFor = $state<string | null>(null);
+  let deleting = $state<SessionView | null>(null);
+
+  function openCreate(): void {
+    createFor = sessionsState.projects[0]?.id ?? "";
+  }
 
   const showGrid = $derived(runState.phase === "running" || runState.phase === "stopping");
   const gate = $derived(runGate(runState.phase, uiState.editorPath, uiState.editorDirty));
@@ -40,6 +58,12 @@
 
   $effect(() => {
     void boot();
+  });
+  // Lazy connect (spec §2): the sessions daemon is only discovered/spawned once the
+  // operator asks for sessions. `enterSessionsMode` is idempotent and its listeners
+  // then stay for the app's life, so switching back and forth costs nothing.
+  $effect(() => {
+    if (uiState.mode === "sessions") void enterSessionsMode();
   });
   $effect(() => {
     const t = setInterval(() => {
@@ -63,6 +87,7 @@
   function onKeydown(ev: KeyboardEvent): void {
     const action = resolveKey(ev, mac);
     if (action === null) return;
+    if (uiState.mode === "sessions" && action.kind !== "release") return;
     ev.preventDefault();
     switch (action.kind) {
       case "focus-terminal": {
@@ -72,7 +97,10 @@
       }
       case "release":
         releaseCapture();
-        blurAllTerminals();
+        // Both managers: release is the one binding sessions mode lets through,
+        // and it is the session terminal that holds focus there.
+        workflowTerm.blurAll();
+        sessionTerm.blurAll();
         break;
       case "dock-feed":
         uiState.dockTab = "feed";
@@ -123,98 +151,181 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<div class="shell">
+<div class="shell" class:sessions={uiState.mode === "sessions"}>
   <header class="topbar panel mono">
     <span class="brand">◉ CoreTempo</span>
-    {#if canClose}
+    <span class="modeswitch">
       <button
-        class="closewf"
-        title="Close workflow"
-        aria-label="Close workflow"
+        class:active={uiState.mode === "workflows"}
         onclick={() => {
-          void onCloseClick();
+          uiState.mode = "workflows";
         }}
       >
-        ←
+        workflows
       </button>
-    {/if}
-    <span class="wf" title={uiState.editorPath ?? ""}>
-      {uiState.editorPath ?? runState.info?.workflow_path ?? "no workflow"}
+      <button
+        class:active={uiState.mode === "sessions"}
+        onclick={() => {
+          uiState.mode = "sessions";
+        }}
+      >
+        sessions{#if sessionsBadge() > 0}<span class="badge">{sessionsBadge()}</span>{/if}
+      </button>
     </span>
-    {#if runError !== null}<span class="err">{runError}</span>{/if}
-    {#if gate.hint !== null}<span class="hint">{gate.hint}</span>{/if}
-    <button
-      class="runbtn"
-      class:running={showGrid}
-      disabled={gate.disabled}
-      onclick={() => {
-        void onRunClick();
-      }}
-    >
-      {showGrid ? "■ Stop" : "▶ Run"}
-    </button>
-    {#if showGrid}
-      <span class="viewtoggle">
-        <button
-          class:active={runView === "graph"}
-          disabled={uiState.editorPath === null}
-          onclick={() => {
-            uiState.runCenter = "graph";
-          }}
-        >
-          graph
-        </button>
-        <button
-          class:active={runView === "terminals"}
-          onclick={() => {
-            uiState.runCenter = "terminals";
-          }}
-        >
-          terminals
-        </button>
+    {#if uiState.mode === "sessions"}
+      <span class="conn" class:bad={sessionsState.conn === "unreachable"}>
+        {connLabel(sessionsState.conn)}
       </span>
+      <button class="runbtn" onclick={openCreate}>+ new session</button>
     {/if}
-    <span class="meta">agents {runningCount()}/{agentsState.order.length} · {clock(now)}</span>
+    {#if uiState.mode === "workflows"}
+      {#if canClose}
+        <button
+          class="closewf"
+          title="Close workflow"
+          aria-label="Close workflow"
+          onclick={() => {
+            void onCloseClick();
+          }}
+        >
+          ←
+        </button>
+      {/if}
+      <span class="wf" title={uiState.editorPath ?? ""}>
+        {uiState.editorPath ?? runState.info?.workflow_path ?? "no workflow"}
+      </span>
+      {#if runError !== null}<span class="err">{runError}</span>{/if}
+      {#if gate.hint !== null}<span class="hint">{gate.hint}</span>{/if}
+      <button
+        class="runbtn"
+        class:running={showGrid}
+        disabled={gate.disabled}
+        onclick={() => {
+          void onRunClick();
+        }}
+      >
+        {showGrid ? "■ Stop" : "▶ Run"}
+      </button>
+      {#if showGrid}
+        <span class="viewtoggle">
+          <button
+            class:active={runView === "graph"}
+            disabled={uiState.editorPath === null}
+            onclick={() => {
+              uiState.runCenter = "graph";
+            }}
+          >
+            graph
+          </button>
+          <button
+            class:active={runView === "terminals"}
+            onclick={() => {
+              uiState.runCenter = "terminals";
+            }}
+          >
+            terminals
+          </button>
+        </span>
+      {/if}
+      <span class="meta">agents {runningCount()}/{agentsState.order.length} · {clock(now)}</span>
+    {/if}
   </header>
 
-  <aside class="rail panel"><Roster /></aside>
+  <aside class="rail panel">
+    {#if uiState.mode === "workflows"}
+      <Roster />
+    {:else}
+      <SessionRail
+        onCreate={(p) => {
+          createFor = p;
+        }}
+        onDelete={(s) => {
+          deleting = s;
+        }}
+      />
+    {/if}
+  </aside>
 
   <main class="center">
     <!-- The editor mounts once for the life of the open file: branching it on
          showGrid would destroy it (and any unsaved edits) when a run stops. -->
     {#if uiState.editorPath !== null}
-      <div class="view" class:offscreen={showGrid && runView !== "graph"}>
+      <div
+        class="view"
+        class:offscreen={uiState.mode !== "workflows" || (showGrid && runView !== "graph")}
+      >
         <WorkflowEditor />
       </div>
-    {:else if !showGrid}
+    {:else if !showGrid && uiState.mode === "workflows"}
       <NoWorkflowCard />
     {/if}
     {#if showGrid}
-      <div class="view" class:offscreen={runView !== "terminals"}>
+      <div
+        class="view"
+        class:offscreen={uiState.mode !== "workflows" || runView !== "terminals"}
+      >
         <TerminalGrid />
       </div>
     {/if}
+    <!-- Mounted for the app's life: unmounting on a mode switch would drop the
+         selected session's xterm and its screen with it. -->
+    <div class="view" class:offscreen={uiState.mode !== "sessions"}>
+      <SessionTerminal />
+    </div>
   </main>
 
-  <aside class="dock panel"><Dock /></aside>
+  <aside class="dock panel">
+    {#if uiState.mode === "workflows"}<Dock />{/if}
+  </aside>
 
   <footer class="statusbar panel mono">
-    <span>
-      {mod}1–9 focus terminal · {mod}` release ·
-      {mod}E {showGrid ? "graph/terminals" : "edit workflow"}
-    </span>
-    {#if runState.completed !== null}
-      <span class="done" class:bad={completionFailed}>
-        workflow {runState.completed.result}{runState.completed.code !== null
-          ? ` (code ${runState.completed.code})`
-          : ""}
+    {#if uiState.mode === "workflows"}
+      <span>
+        {mod}1–9 focus terminal · {mod}` release ·
+        {mod}E {showGrid ? "graph/terminals" : "edit workflow"}
       </span>
-    {/if}
-    {#if runState.info !== null}
-      <span class="elapsed">⏺ run {elapsed(runState.info.started_at, now)}</span>
+      {#if runState.completed !== null}
+        <span class="done" class:bad={completionFailed}>
+          workflow {runState.completed.result}{runState.completed.code !== null
+            ? ` (code ${runState.completed.code})`
+            : ""}
+        </span>
+      {/if}
+      {#if runState.info !== null}
+        <span class="elapsed">⏺ run {elapsed(runState.info.started_at, now)}</span>
+      {/if}
     {/if}
   </footer>
 </div>
+
+{#if createFor !== null}
+  <Modal
+    onClose={() => {
+      createFor = null;
+    }}
+  >
+    <CreateSessionModal
+      project={createFor}
+      onClose={() => {
+        createFor = null;
+      }}
+    />
+  </Modal>
+{/if}
+{#if deleting !== null}
+  <Modal
+    onClose={() => {
+      deleting = null;
+    }}
+  >
+    <DeleteSessionModal
+      session={deleting}
+      onClose={() => {
+        deleting = null;
+      }}
+    />
+  </Modal>
+{/if}
 
 <style>
   .shell {
@@ -223,6 +334,7 @@
     grid-template-rows: 36px 1fr 24px;
     grid-template-areas: "top top top" "rail center dock" "foot foot foot";
   }
+  .shell.sessions { grid-template-columns: 220px 1fr 0; }
   .topbar {
     grid-area: top; display: flex; align-items: center; gap: 12px; padding: 0 10px;
     font-size: var(--fs-data); border: none;
@@ -237,9 +349,18 @@
   .hint + .runbtn { margin-left: 0; }
   .runbtn.running { color: var(--err); }
   .meta { color: var(--text-dim); }
+  .conn { color: var(--text-dim); }
+  .conn.bad { color: var(--err); }
   .viewtoggle { display: flex; gap: 2px; }
   .viewtoggle button { color: var(--text-dim); }
   .viewtoggle button.active { color: var(--accent); }
+  .modeswitch { display: flex; gap: 2px; }
+  .modeswitch button { color: var(--text-dim); }
+  .modeswitch button.active { color: var(--accent); }
+  .badge {
+    color: var(--accent); margin-left: 4px;
+    border: 1px solid var(--panel-edge); border-radius: 2px; padding: 0 4px;
+  }
   .view { height: 100%; min-width: 0; min-height: 0; }
   .view.offscreen { display: none; }
   .rail { grid-area: rail; border: none; min-height: 0; }

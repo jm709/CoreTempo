@@ -11,9 +11,8 @@ vi.mock("./ipc", () => ({
 
 vi.mock("./dialogs", () => ({ confirmTrust: vi.fn(async () => true) }));
 
-vi.mock("./term/manager", () => ({
-  ensureTerminal: vi.fn(async () => {}),
-  disposeAllTerminals: vi.fn(),
+vi.mock("./term/instances", () => ({
+  workflowTerm: { ensure: vi.fn(async () => {}), disposeAll: vi.fn() },
 }));
 
 vi.mock("./wireEvents", () => ({
@@ -25,7 +24,7 @@ import { runStart, runUntrustedDirs, snapshot } from "./ipc";
 import { boot, startRun } from "./session";
 import { resetRun, runState } from "./state/run.svelte";
 import { uiState } from "./state/ui.svelte";
-import { ensureTerminal } from "./term/manager";
+import { workflowTerm } from "./term/instances";
 import { confirmTrust } from "./dialogs";
 
 const midRunSnapshot: Snapshot = {
@@ -70,7 +69,7 @@ describe("terminal subscription cursors", () => {
     // and shows a torn, mostly blank pane until the agent redraws.
     vi.mocked(snapshot).mockResolvedValue(midRunSnapshot);
     await boot();
-    expect(vi.mocked(ensureTerminal)).toHaveBeenCalledWith("builder", null, 20_000);
+    expect(vi.mocked(workflowTerm.ensure)).toHaveBeenCalledWith("builder", null, 20_000);
   });
 });
 

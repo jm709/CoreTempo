@@ -179,3 +179,42 @@ export interface WorkflowModel {
   flows: Record<string, FlowModel>;
 }
 export interface ParseReport { ok: boolean; errors: ValidationIssue[]; model: WorkflowModel | null }
+
+// Sessions mode wire types (exact serde mirrors of core/src/types/session.rs).
+export type SessionState = "starting" | "idle" | "working" | "stopped" | "exited";
+export type WorktreeStatus = "present" | "missing" | "none";
+export interface WorktreeInfo { path: string; branch: string; base: string }
+export interface SessionBlocked { tool: string | null; since: string }
+export interface ProjectView { id: string; path: string; name: string; created_at: string }
+export interface SessionView {
+  id: string; project: string; cwd: string;
+  worktree: WorktreeInfo | null; title: string;
+  claude_session_id: string | null; model: string | null;
+  permission_mode: string | null; isolated_config: boolean; prompt: string | null;
+  created_at: string; stopped_at: string | null;
+  state: SessionState; blocked: SessionBlocked | null; exit: AgentExit | null;
+  pty_cursor: number;
+  branch: string | null; changed_files: number | null; ahead: number | null;
+  worktree_status: WorktreeStatus;
+}
+export interface CreateSessionRequest {
+  project: string; worktree: boolean; cwd?: string; title?: string;
+  prompt?: string; model?: string; permission_mode?: string; isolated_config: boolean;
+}
+export interface DeleteSessionResponse { branch_kept: boolean }
+export interface ResumeResponse { session: SessionView; resumed: boolean }
+export type SessionsConnState = "idle" | "starting" | "connected" | "unreachable";
+/// Daemon events the sessions store consumes; anything else is ignored by kind.
+/// `pty.stream_error` is shell-originated (never sent by the daemon) — it has
+/// no `seq`/`ts`, so the store bypasses seq dedup for it (see applySessionEvent).
+export type SessionEvent =
+  | { seq: number; ts: string; type: "agent.state"; agent: string; state: AgentState }
+  | { seq: number; ts: string; type: "agent.lifecycle"; agent: string;
+      phase: LifecyclePhase; exit: AgentExit | null }
+  | { seq: number; ts: string; type: "agent.blocked"; agent: string;
+      blocked: boolean; tool: string | null }
+  | { seq: number; ts: string;
+      type: "session.created" | "session.stopped" | "session.resumed" | "session.deleted";
+      agent: string }
+  | { seq: number; ts: string; type: "project.registered" | "project.forgotten" }
+  | { type: "pty.stream_error"; agent: string; message: string };

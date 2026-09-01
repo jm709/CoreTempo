@@ -4,6 +4,8 @@ export type RunCenter = "graph" | "terminals";
 
 export type DockTab = "feed" | "chat" | "run";
 
+export type UiMode = "workflows" | "sessions";
+
 export const uiState = $state({
   focusedAgent: null as string | null,   // pane owning the accent border when captured
   captured: false,                       // keys go to the focused terminal
@@ -15,6 +17,7 @@ export const uiState = $state({
   editorPath: null as string | null,     // workflow file open in the stopped-mode editor
   editorDirty: false,                    // the editor holds edits not yet saved to editorPath
   runCenter: "graph" as RunCenter,       // center view while a run is active
+  mode: "workflows" as UiMode,           // topbar chrome, not run state — resetUi leaves it alone
 });
 
 let flashTimer: ReturnType<typeof setTimeout> | undefined;

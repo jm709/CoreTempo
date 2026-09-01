@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { askQueued, askReplied, askWorking, sendFailed, sendQueued } from "./fixtures/recorded";
 import {
-  elapsed, exitLabel, feedTime, isChat, isExternal, lifecycleGlyph, originAgent, originLabel,
-  STATE_GLYPHS, stateLabel,
+  connLabel, elapsed, exitLabel, feedTime, isChat, isExternal, lifecycleGlyph, originAgent,
+  originLabel, STATE_GLYPHS, stateLabel,
 } from "./format";
 
 describe("status glyphs (spec §9.3, exact characters)", () => {
@@ -12,6 +12,10 @@ describe("status glyphs (spec §9.3, exact characters)", () => {
     expect(STATE_GLYPHS.starting).toBe("◐");
     expect(STATE_GLYPHS.restarting).toBe("◐");
     expect(STATE_GLYPHS.exited).toBe("✕");
+  });
+  it("gives sessions' stopped state its own glyph, distinct from exited", () => {
+    expect(STATE_GLYPHS.stopped).toBe("◻");
+    expect(STATE_GLYPHS.stopped).not.toBe(STATE_GLYPHS.exited);
   });
   it("labels exited as dead everywhere in the UI", () => {
     expect(stateLabel("exited")).toBe("dead");
@@ -66,5 +70,16 @@ describe("exitLabel (pane overlay for a dead agent)", () => {
   });
   it("shows ? until the snapshot carries the exit", () => {
     expect(exitLabel(null)).toBe("exited ?");
+  });
+});
+
+describe("connLabel (sessions topbar)", () => {
+  it("names each connection state the operator can act on", () => {
+    expect(connLabel("connected")).toBe("connected");
+    expect(connLabel("unreachable")).toBe("daemon unreachable — retrying");
+    expect(connLabel("starting")).toBe("starting…");
+  });
+  it("reads idle as starting: entering the mode always kicks the supervisor", () => {
+    expect(connLabel("idle")).toBe("starting…");
   });
 });

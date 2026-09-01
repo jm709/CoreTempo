@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "coretempo_app_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "coretempo"
 path = "src/main.rs"
@@ -21,12 +25,24 @@ serde_json = "1.0.151"
 anyhow = "1.0.104"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tokio = { version = "1.53.1", features = ["sync", "fs", "macros", "rt"] }
+tokio = { version = "1.53.1", features = ["sync", "fs", "macros", "rt", "time"] }
 toml_edit = "0.25.13"
+# Same version tauri already resolves, so the shell links one reqwest, not two.
+# Loopback HTTP to the sessions daemon only: no TLS, no proxy, no charset.
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "stream"] }
+# `StreamExt::next` over reqwest's `bytes_stream()`, nothing else. Already in the
+# lock via reqwest, so this pin adds a name to Cargo.toml, not a crate to build.
+futures-util = { version = "=0.3.33", default-features = false }
+# Decoding the daemon's PTY chunks. Same version the rest of the tree already
+# resolves, so nothing new is compiled. (`core` hand-rolls the *encoder* because
+# it needs 20 lines and no dependency; decoding is the half with the error
+# cases, and this is a dependency the build already carries.)
+base64 = "=0.22.1"
 
 [dev-dependencies]
 tauri = { version = "2.11.5", features = ["test"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+axum = "=0.8.9"
 
 [lints]
 workspace = true

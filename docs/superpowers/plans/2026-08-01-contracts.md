@@ -1509,3 +1509,32 @@ frozen alongside the sections above:
     daemon that is already running. Exit statuses: 0, 1 (attach as above),
     3 (usage, transport, or an API refusal — the server's message printed
     verbatim).
+49. **Desktop Sessions mode** (Spec B, 2026-09-01). New Tauri commands
+    `sessions_status`, `session_list|create|stop|resume|delete`,
+    `project_list|register|forget`, `session_subscribe_pty(session, resume)`,
+    `session_unsubscribe_pty`, `session_write_pty|resize_pty|pause_pty` — thin
+    proxies over the sessions daemon's `/v1` routes; request/response bodies
+    are the amendment-47 wire types verbatim. `sessions_status` returns
+    `{ state, health }`, `state` one of `idle|starting|connected|unreachable`
+    (`health` populated only once `state` is `connected` and the daemon
+    answered); opening Sessions mode is what calls it, and that call is what
+    starts the daemon hunt. Two Tauri events: `coretempo:session-event`
+    (daemon `/v1/events` payloads, forwarded verbatim, plus one
+    shell-synthesized member the daemon never sends —
+    `{"type":"pty.stream_error","agent":"<session id>","message":…}`,
+    emitted when a session's PTY stream fails to open or dies mid-flight; a
+    stream the daemon closes cleanly stays silent, since that is already a
+    `session.stopped` event) and `coretempo:sessions-status`
+    (`{ state: "starting"|"connected"|"unreachable" }`, shell-originated —
+    three states, `idle` is not broadcast). PTY cursors are shell-owned (SSE
+    `id:` = start+len); `resume: false` resets them. `uiState.mode ∈
+    workflows|sessions`. The term manager is a per-transport factory
+    (`createTerminalManager`); workflow behaviour unchanged. Release bundles
+    ship `coretempod` as `externalBin` (`app/src-tauri/scripts/prepare-sidecar.sh`
+    copies the built binary to `binaries/coretempod-<target-triple>` before
+    `tauri build`, which resolves the sidecar path at compile time — even
+    `--no-bundle` fails without it present); the shell spawns it via
+    `std::process::Command` in its own process group, never
+    `tauri-plugin-shell`. `Discovery::production` finds the binary at
+    `$CORETEMPOD_BIN` when set, else beside the running app binary — `./dev`
+    builds `coretempod` and exports `CORETEMPOD_BIN` before `pnpm tauri dev`.

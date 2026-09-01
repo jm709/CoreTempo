@@ -67,7 +67,9 @@ button:disabled {
   color: var(--busy);
   animation: ct-pulse var(--t-pulse) ease-in-out infinite;
 }
-.glyph.idle {
+/* stopped is an operator's own doing, not a failure: neutral, never --err. */
+.glyph.idle,
+.glyph.stopped {
   color: var(--text-dim);
 }
 .glyph.starting,

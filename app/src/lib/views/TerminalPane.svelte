@@ -2,7 +2,7 @@
   import { restartAgent, toCmdError } from "../ipc";
   import { agentsState } from "../state/agents.svelte";
   import { focusTerminal, uiState } from "../state/ui.svelte";
-  import { attachTerminal, focusAgentTerminal } from "../term/manager";
+  import { workflowTerm } from "../term/instances";
   import { exitLabel, stateLabel } from "../format";
   import StatusGlyph from "./StatusGlyph.svelte";
 
@@ -12,12 +12,12 @@
   const hidden = $derived(uiState.maximizedAgent !== null && uiState.maximizedAgent !== agentId);
 
   function host(el: HTMLElement): void {
-    attachTerminal(agentId, el);
+    workflowTerm.attach(agentId, el);
   }
 
   function capture(): void {
     focusTerminal(agentId);
-    focusAgentTerminal(agentId);
+    workflowTerm.focus(agentId);
   }
 
   function toggleMaximize(): void {

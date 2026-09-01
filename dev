@@ -47,9 +47,20 @@ ensure_gui_libs() {
   fi
 }
 
+# coretempo-app declares coretempod as a Tauri externalBin, and tauri-build fails
+# the build script when binaries/coretempod-<triple> is missing. Any workspace-wide
+# cargo command therefore needs the sidecar staged first.
+build_sidecar() {
+  printf '==> building coretempod (sessions daemon / Tauri sidecar)\n'
+  cargo build -p coretempo-daemon --manifest-path "$ROOT/Cargo.toml"
+  "$ROOT/app/src-tauri/scripts/prepare-sidecar.sh" debug
+}
+
 run_app() {
   ensure_deps
   ensure_gui_libs
+  build_sidecar
+  export CORETEMPOD_BIN="$ROOT/target/debug/coretempod"
   # No DRM device (common on WSL without GPU passthrough) means MESA has no
   # physical device to pick: it tries ZINK, fails, and floods stderr with
   # libEGL/dri2 errors. Force the software rasterizer instead.
@@ -82,6 +93,7 @@ Copy the example to get started:  cp $ROOT/tempo.example.toml $ROOT/tempo.toml"
 run_check() {
   ensure_deps
   cd "$ROOT"
+  build_sidecar
   printf '==> cargo test\n' && cargo test --workspace
   printf '==> cargo clippy\n' && cargo clippy --workspace --all-targets --all-features -- -D warnings
   printf '==> cargo fmt\n' && cargo fmt --check
@@ -98,6 +110,7 @@ run_check() {
 
 run_live() {
   cd "$ROOT"
+  build_sidecar
   printf '==> cargo build --workspace (agents get the tempo beside coretempod)\n'
   cargo build --workspace
   printf '==> live claude test\n'
