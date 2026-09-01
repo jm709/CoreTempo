@@ -44,25 +44,37 @@ pub fn subscribe<R: tauri::Runtime>(
 ) -> Result<(), CmdError> {
     let state = app.state::<SessionsState>();
     let client = crate::sessions::supervisor::connected(&state)?;
+    // One lock scope for the whole swap — abort, cursor, spawn, insert. Two
+    // invokes that each released it in between would both find no pump, both
+    // spawn, and the loser's handle would be *overwritten* rather than aborted:
+    // dropping a `JoinHandle` does not stop its task, so that pump would keep
+    // forwarding to a stale channel and writing this session's cursor with
+    // nothing left holding a handle that could ever stop it.
+    let mut pumps = state.pty_pumps.lock().map_err(|_| {
+        CmdError::new(
+            "internal",
+            "the sessions pump lock is poisoned; restart the app",
+        )
+    })?;
+    // Abort before the cursor is read, not after: a pump still forwarding would
+    // advance the cursor under us and the new stream would reopen at an offset
+    // whose bytes are already on screen.
+    if let Some(previous) = pumps.remove(&session) {
+        previous.abort();
+    }
     let since = if resume {
         cursor(&state, &session)
     } else {
         forget_cursor(&state, &session);
         None
     };
-    // At most one pump per session: a second would render every byte twice.
-    unsubscribe(&state, &session);
     let path = match since {
         Some(cursor) => format!("/v1/sessions/{session}/pty?since={cursor}"),
         None => format!("/v1/sessions/{session}/pty"),
     };
     let handle =
         tauri::async_runtime::spawn(pump(app.clone(), client, session.clone(), path, channel));
-    if let Ok(mut pumps) = state.pty_pumps.lock() {
-        pumps.insert(session, handle);
-    } else {
-        tracing::error!("the sessions pump lock is poisoned");
-    }
+    pumps.insert(session, handle);
     Ok(())
 }
 

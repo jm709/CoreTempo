@@ -269,6 +269,75 @@ async fn a_second_subscribe_aborts_the_first_pump() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Two invokes racing for the same session — a reattach landing while a reload
+/// is still in flight. Every superseded pump must be *aborted*, not merely
+/// dropped: a dropped `JoinHandle` leaves its task running with nothing left
+/// that can ever stop it, still forwarding to a stale channel and still writing
+/// this session's cursor.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_subscribes_leave_exactly_one_live_pump() -> anyhow::Result<()> {
+    const RACERS: usize = 8;
+    let (port, stub) = spawn_stub().await?;
+    let app = connected_app(port)?;
+
+    let pairs: Vec<(Sink, Channel<InvokeResponseBody>)> =
+        (0..RACERS).map(|_| sink_channel()).collect();
+    let mut sinks = Vec::new();
+    let mut channels = Vec::new();
+    for (sink, channel) in pairs {
+        sinks.push(sink);
+        channels.push(channel);
+    }
+    let racers: Vec<_> = channels
+        .into_iter()
+        .map(|channel| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || subscribe(&handle, SESSION.to_string(), false, channel))
+        })
+        .collect();
+    for racer in racers {
+        racer
+            .join()
+            .map_err(|_| anyhow::anyhow!("racer panicked"))??;
+    }
+
+    assert_eq!(
+        app.state::<SessionsState>().pty_pumps.lock().unwrap().len(),
+        1,
+    );
+    // Let every abort land and the survivor's connection open.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let before: Vec<usize> = sinks.iter().map(|s| s.lock().unwrap().len()).collect();
+
+    // A frame at every connection the stub still holds. Only the survivor's is
+    // still open, so only its sink can grow.
+    let senders = stub.frames.lock().unwrap().clone();
+    for tx in senders {
+        let _ = tx.send(Ok(frame(27, 17, CHUNK_ONE_B64))).await;
+    }
+    let grown = wait_for_growth(&sinks, &before).await;
+    assert_eq!(grown, 1, "{grown} pumps are still forwarding, not 1");
+    Ok(())
+}
+
+/// Waits for at least one sink to grow, then lets stragglers land before
+/// counting — so "exactly one" is not just "the others have not arrived yet".
+async fn wait_for_growth(sinks: &[Sink], before: &[usize]) -> usize {
+    let count = |sinks: &[Sink]| {
+        sinks
+            .iter()
+            .zip(before)
+            .filter(|(sink, was)| sink.lock().unwrap().len() > **was)
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while count(sinks) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    count(sinks)
+}
+
 /// With no daemon, the command must say so with the code the UI switches on
 /// rather than spawn a pump that can never connect.
 #[tokio::test(flavor = "multi_thread")]
