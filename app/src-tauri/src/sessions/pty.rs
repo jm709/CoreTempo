@@ -10,13 +10,13 @@
 
 use base64::Engine;
 use futures_util::StreamExt;
-use tauri::Manager;
 use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{Emitter, Manager};
 
 use crate::commands::CmdError;
 use crate::sessions::client::DaemonClient;
 use crate::sessions::sse::SseParser;
-use crate::sessions::supervisor::SessionsState;
+use crate::sessions::supervisor::{SESSION_EVENT, SessionsState};
 
 /// One `{"seq":…, "b64":…}` PTY event (contracts §6.2).
 #[derive(serde::Deserialize)]
@@ -100,12 +100,16 @@ async fn pump<R: tauri::Runtime>(
     let response = match client.request(reqwest::Method::GET, &path).send().await {
         Ok(response) => response,
         Err(err) => {
-            tracing::warn!(%err, %session, "session pty stream could not be opened");
+            report_stream_error(
+                &app,
+                &session,
+                &format!("could not open the PTY stream: {err}"),
+            );
             return;
         }
     };
     if !response.status().is_success() {
-        tracing::warn!(status = %response.status(), %session, "session pty stream refused");
+        report_stream_error(&app, &session, &refusal(response).await);
         return;
     }
     let mut parser = SseParser::default();
@@ -124,6 +128,41 @@ async fn pump<R: tauri::Runtime>(
             store_cursor(&app, &session, event.id.as_deref());
         }
     }
+}
+
+/// How much of a refusal body to quote. The daemon's envelope is one short
+/// object; anything longer is not an envelope and is not worth forwarding.
+const MAX_REFUSAL_DETAIL: usize = 200;
+
+/// The refusal, with the daemon's own error envelope quoted when it sent one —
+/// a 401 and a 404 need different fixes and the status alone does not say which.
+async fn refusal(response: reqwest::Response) -> String {
+    let status = response.status();
+    let detail = response.text().await.unwrap_or_default();
+    let detail: String = detail.trim().chars().take(MAX_REFUSAL_DETAIL).collect();
+    if detail.is_empty() {
+        format!("the sessions daemon refused the PTY stream: {status}")
+    } else {
+        format!("the sessions daemon refused the PTY stream: {status} — {detail}")
+    }
+}
+
+/// Tells the webview a stream it believes it is attached to never opened.
+///
+/// **Shell-originated**: the daemon has no `pty.stream_error` event. It rides
+/// [`SESSION_EVENT`] anyway so one webview listener covers both — nothing
+/// retries a PTY stream, and `subscribe` has already answered `Ok`, so without
+/// this the terminal is dead with no signal at all.
+fn report_stream_error<R: tauri::Runtime>(app: &tauri::AppHandle<R>, session: &str, message: &str) {
+    tracing::warn!(%session, %message, "session pty stream failed to open");
+    let _ = app.emit(
+        SESSION_EVENT,
+        serde_json::json!({
+            "type": "pty.stream_error",
+            "agent": session,
+            "message": message,
+        }),
+    );
 }
 
 /// The chunk's raw bytes, or `None` with the reason logged — a malformed event

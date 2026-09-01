@@ -17,9 +17,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use coretempo_app_lib::sessions::client::DaemonClient;
 use coretempo_app_lib::sessions::pty::{subscribe, unsubscribe};
-use coretempo_app_lib::sessions::supervisor::{Conn, SessionsState};
-use tauri::Manager;
+use coretempo_app_lib::sessions::supervisor::{Conn, SESSION_EVENT, SessionsState};
 use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{Listener, Manager};
 use tokio::sync::mpsc;
 
 const SESSION: &str = "s-1f2e3d4c";
@@ -85,6 +85,26 @@ async fn spawn_stub() -> anyhow::Result<(u16, Arc<Stub>)> {
     let port = listener.local_addr()?.port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Ok((port, stub))
+}
+
+/// A daemon that refuses the PTY route — the stale-token 401 a same-port daemon
+/// restart produces, and the shape `unknown_agent` takes too.
+async fn spawn_refusing_stub() -> anyhow::Result<u16> {
+    let app = axum::Router::new().route(
+        "/v1/sessions/{id}/pty",
+        get(|| async {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!(
+                    {"error": {"code": "unauthorized", "message": "bad token"}}
+                )),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Ok(port)
 }
 
 /// Everything the pump forwarded, in order.
@@ -336,6 +356,40 @@ async fn wait_for_growth(sinks: &[Sink], before: &[usize]) -> usize {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     count(sinks)
+}
+
+/// A stream that never opens would otherwise be silent: `subscribe` has already
+/// answered `Ok`, so the webview believes it is attached, and nothing retries a
+/// PTY stream. The pump says so itself on the event channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_pty_stream_reports_itself_on_the_event_channel() -> anyhow::Result<()> {
+    let port = spawn_refusing_stub().await?;
+    let app = connected_app(port)?;
+    let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    app.listen(SESSION_EVENT, move |event| {
+        sink.lock()
+            .unwrap()
+            .push(serde_json::from_str(event.payload()).unwrap());
+    });
+
+    let (chunks, channel) = sink_channel();
+    subscribe(app.handle(), SESSION.to_string(), false, channel)?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while events.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reported = events.lock().unwrap().clone();
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported[0]["type"], "pty.stream_error");
+    assert_eq!(reported[0]["agent"], SESSION);
+    let message = reported[0]["message"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no message in {}", reported[0]))?;
+    assert!(message.contains("401"), "{message}");
+    assert!(chunks.lock().unwrap().is_empty());
+    Ok(())
 }
 
 /// With no daemon, the command must say so with the code the UI switches on
