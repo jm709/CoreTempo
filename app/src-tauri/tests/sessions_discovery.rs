@@ -24,6 +24,11 @@ type SeenAuth = Arc<Mutex<Option<String>>>;
 /// A stub daemon that answers `/v1/health` only for `expect_token`; anything
 /// else gets the 401 envelope, so a client carrying a stale token cannot pass
 /// the probe by accident.
+///
+/// Deliberately stricter than the real daemon, where `/v1/health` is the one
+/// route the auth guard lets through unauthenticated (`core/src/api/auth.rs`,
+/// `check`). Requiring the token here is what lets a test tell *which* token a
+/// probe carried; production would answer either.
 async fn spawn_health(expect_token: &'static str) -> anyhow::Result<(u16, SeenAuth)> {
     let seen: SeenAuth = Arc::new(Mutex::new(None));
     let recorder = Arc::clone(&seen);

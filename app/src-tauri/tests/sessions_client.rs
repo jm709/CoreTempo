@@ -7,6 +7,7 @@
 #![expect(clippy::unwrap_used, reason = "assertions are the vocabulary of tests")]
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
@@ -303,6 +304,39 @@ async fn register_project_posts_the_request_body() -> anyhow::Result<()> {
     let guard = seen.lock().unwrap();
     assert_eq!(guard.path.as_deref(), Some("/v1/projects"));
     assert_eq!(guard.body.as_ref().unwrap()["path"], "/home/u/proj");
+    Ok(())
+}
+
+/// A daemon that accepts the connection and then does not answer — mid-crash,
+/// or stuck behind the per-session mutex every lifecycle call holds — must fail
+/// the call rather than leave the IPC invoke pending forever.
+#[tokio::test]
+async fn a_daemon_that_never_answers_times_out() -> anyhow::Result<()> {
+    let app = axum::Router::new().route(
+        "/v1/sessions",
+        get(|| async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Json(serde_json::json!([]))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = DaemonClient::new(port, "t".into()).with_timeout(Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let err = client
+        .list_sessions()
+        .await
+        .expect_err("a daemon that never answers must fail the call");
+
+    assert_eq!(err.code, "daemon_timeout");
+    assert!(err.message.contains("wedged"), "{}", err.message);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "gave up after {:?}, so the timeout did not apply",
+        started.elapsed()
+    );
     Ok(())
 }
 
