@@ -50,6 +50,9 @@ ensure_gui_libs() {
 run_app() {
   ensure_deps
   ensure_gui_libs
+  printf '==> building coretempod (sessions daemon for the desktop)\n'
+  cargo build -p coretempo-daemon --manifest-path "$ROOT/Cargo.toml"
+  export CORETEMPOD_BIN="$ROOT/target/debug/coretempod"
   # No DRM device (common on WSL without GPU passthrough) means MESA has no
   # physical device to pick: it tries ZINK, fails, and floods stderr with
   # libEGL/dri2 errors. Force the software rasterizer instead.

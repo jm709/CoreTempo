@@ -1,5 +1,6 @@
 /target
 /app/src-tauri/gen/schemas
+/app/src-tauri/binaries/
 *.db
 *.db-wal
 *.db-shm

@@ -159,6 +159,16 @@ included — so one the operator has never approved for the project root raises
 2.1.247). Copying the root's approvals is what keeps a *derived worktree* from
 re-asking about servers already approved for the repository.
 
+The desktop app has a Sessions mode alongside its workflow view (amendment
+49). The webview never talks to the daemon directly — no CORS, and the
+daemon's token never reaches the webview — every call goes through Tauri
+commands that proxy the daemon's `/v1` routes, and the daemon's own events
+arrive as the `coretempo:session-event` Tauri event; `coretempo:sessions-status`
+is a separate, shell-originated event for the connection itself. The shell
+spawns `coretempod sessions` detached on first entry to the mode if none is
+already running; `CORETEMPOD_BIN` overrides the binary it spawns (`./dev`
+sets it to the freshly built debug binary).
+
 ## Agent state comes from hooks, not the screen
 
 CoreTempo writes one `agent-settings-<agent_id>.json` per agent and passes

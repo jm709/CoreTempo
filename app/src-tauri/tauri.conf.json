@@ -25,7 +25,8 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": []
+    "active": true,
+    "icon": [],
+    "externalBin": ["binaries/coretempod"]
   }
 }
