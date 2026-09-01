@@ -604,6 +604,7 @@ dependencies = [
  "anyhow",
  "axum",
  "coretempo-core",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

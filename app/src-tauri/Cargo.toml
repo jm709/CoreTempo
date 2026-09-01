@@ -30,6 +30,9 @@ toml_edit = "0.25.13"
 # Same version tauri already resolves, so the shell links one reqwest, not two.
 # Loopback HTTP to the sessions daemon only: no TLS, no proxy, no charset.
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "stream"] }
+# `StreamExt::next` over reqwest's `bytes_stream()`, nothing else. Already in the
+# lock via reqwest, so this pin adds a name to Cargo.toml, not a crate to build.
+futures-util = { version = "=0.3.33", default-features = false }
 
 [dev-dependencies]
 tauri = { version = "2.11.5", features = ["test"] }
