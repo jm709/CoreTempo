@@ -1,11 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod bridge;
-mod commands;
-mod merge;
-mod state;
-
 use anyhow::Context;
+use coretempo_app_lib::{commands, state};
 
 /// The frozen invoke surface (contracts §8.1). One factory so `main()` and the IPC tests can
 /// never drift apart.

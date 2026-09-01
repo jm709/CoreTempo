@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "coretempo_app_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "coretempo"
 path = "src/main.rs"
@@ -23,10 +27,14 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.53.1", features = ["sync", "fs", "macros", "rt"] }
 toml_edit = "0.25.13"
+# Same version tauri already resolves, so the shell links one reqwest, not two.
+# Loopback HTTP to the sessions daemon only: no TLS, no proxy, no charset.
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "stream"] }
 
 [dev-dependencies]
 tauri = { version = "2.11.5", features = ["test"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+axum = "=0.8.9"
 
 [lints]
 workspace = true

@@ -1,3 +1,17 @@
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "these are IPC entry points, not a Rust API: every one fails as the CmdError \
+              documented below, whose codes are the REST table (contracts §5.2)"
+)]
+#![expect(
+    clippy::unused_async,
+    reason = "tauri runs a non-async command blocking on the main thread \
+              (ExecutionContext::Blocking); the keyword keeps the UI responsive (spec §8)"
+)]
+
+//! The frozen invoke surface (contracts §8.1). Public only so `main.rs` can
+//! register these with `tauri::generate_handler!`.
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;

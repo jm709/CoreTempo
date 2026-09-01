@@ -602,7 +602,9 @@ name = "coretempo-app"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "coretempo-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tauri",
