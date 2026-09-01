@@ -311,6 +311,38 @@ describe("terminal manager", () => {
     expect(h.detach).toHaveBeenCalledTimes(1);
   });
 
+  test("a suspend during ensure never lets the stream go live", async () => {
+    // The selection dance can deselect a session while its ensure is still
+    // awaiting the xterm chunk: there is no entry to clear yet, so a subscribe
+    // that goes live here would leave the deselected session pumping forever.
+    const h = harness();
+    const term = manager(h.transport);
+    const pending = term.ensure("s-1", null, 5_000);
+    term.suspend("s-1");
+    await pending;
+    expect(h.subscribe).not.toHaveBeenCalled();
+    expect(term.has("s-1")).toBe(true);
+  });
+
+  test("a terminal suspended during ensure still resumes", async () => {
+    const h = harness();
+    const term = manager(h.transport);
+    const pending = term.ensure("s-1", null, 5_000);
+    term.suspend("s-1");
+    await pending;
+    await term.resumeStream("s-1");
+    expect(h.subscribe).toHaveBeenCalledWith("s-1", null, true, expect.any(Function));
+    expect(h.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  test("a suspend for an id no ensure is loading does not silence the next ensure", async () => {
+    const h = harness();
+    const term = manager(h.transport);
+    term.suspend("s-1");
+    await term.ensure("s-1", null, 5_000);
+    expect(h.subscribe).toHaveBeenCalledWith("s-1", null, false, expect.any(Function));
+  });
+
   test("resumeStream resubscribes with resume", async () => {
     const h = harness();
     const term = manager(h.transport);

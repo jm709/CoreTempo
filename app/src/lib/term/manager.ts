@@ -71,6 +71,12 @@ export function createTerminalManager(transport: TermTransport): TerminalManager
   // Panes whose element mounted before ensure registered the entry: the reactive
   // flush that mounts the grid always beats the xterm chunk import + subscribe.
   const pendingAttach = new Map<string, HTMLElement>();
+  // Ids whose ensure is still before its `entries.set`, and the subset of those a
+  // suspend has landed on: with no entry yet, `streaming` has nothing to hold the
+  // request, so ensure reads it here and skips the subscribe. Only an ensure in
+  // flight arms it, so a stray suspend cannot silence some later ensure.
+  const ensuring = new Set<string>();
+  const suspendedWhileEnsuring = new Set<string>();
   allEntries.add(entries);
 
   /// Stores the detach fn only while the entry still owns the subscription it
@@ -98,38 +104,46 @@ export function createTerminalManager(transport: TermTransport): TerminalManager
   /// All 2–6 terminals stay mounted and live; hidden ones keep absorbing writes.
   async function ensure(id: string, sinceCursor: number | null, scrollback: number): Promise<void> {
     if (entries.has(id)) return;
-    const x = await loadChunk();
-    const term = new x.Terminal(terminalOptions(scrollback));
-    term.loadAddon(new x.Unicode11Addon());
-    term.unicode.activeVersion = "11";
-    term.loadAddon(new x.WebLinksAddon());
-    term.loadAddon(new x.SearchAddon());
-    const fit = new x.FitAddon();
-    term.loadAddon(fit);
-    // App-scope chords (mod+1..9/`/F/T/E/R/Enter) must escape the captured terminal.
-    term.attachCustomKeyEventHandler((ev) => !isAppChord(ev));
-    const gauge = new Backpressure((paused) => {
-      void transport.pause(id, paused);
-    });
-    const entry: Entry = {
-      term, fit, webgl: null, gauge, wrapper: null, container: null, observer: null,
-      detach: null, streaming: false,
-    };
-    term.onData((data) => {
-      void transport.write(id, ENC.encode(data));
-    });
-    term.onResize(({ cols, rows }) => {
-      void transport.resize(id, cols, rows);
-    });
-    // Handlers above must exist before a parked attach runs fit(): the resize event
-    // from that fit is what propagates the pane's dimensions to the PTY.
-    entries.set(id, entry);
-    const parked = pendingAttach.get(id);
-    if (parked !== undefined) {
-      pendingAttach.delete(id);
-      openInPane(entry, parked);
+    ensuring.add(id);
+    try {
+      const x = await loadChunk();
+      const term = new x.Terminal(terminalOptions(scrollback));
+      term.loadAddon(new x.Unicode11Addon());
+      term.unicode.activeVersion = "11";
+      term.loadAddon(new x.WebLinksAddon());
+      term.loadAddon(new x.SearchAddon());
+      const fit = new x.FitAddon();
+      term.loadAddon(fit);
+      // App-scope chords (mod+1..9/`/F/T/E/R/Enter) must escape the captured terminal.
+      term.attachCustomKeyEventHandler((ev) => !isAppChord(ev));
+      const gauge = new Backpressure((paused) => {
+        void transport.pause(id, paused);
+      });
+      const entry: Entry = {
+        term, fit, webgl: null, gauge, wrapper: null, container: null, observer: null,
+        detach: null, streaming: false,
+      };
+      term.onData((data) => {
+        void transport.write(id, ENC.encode(data));
+      });
+      term.onResize(({ cols, rows }) => {
+        void transport.resize(id, cols, rows);
+      });
+      // Handlers above must exist before a parked attach runs fit(): the resize event
+      // from that fit is what propagates the pane's dimensions to the PTY.
+      entries.set(id, entry);
+      const parked = pendingAttach.get(id);
+      if (parked !== undefined) {
+        pendingAttach.delete(id);
+        openInPane(entry, parked);
+      }
+      // A suspend landed while the chunk loaded: keep the terminal, never open the
+      // stream. resumeStream is what brings it back.
+      if (!suspendedWhileEnsuring.has(id)) await subscribe(id, entry, sinceCursor, false);
+    } finally {
+      ensuring.delete(id);
+      suspendedWhileEnsuring.delete(id);
     }
-    await subscribe(id, entry, sinceCursor, false);
   }
 
   function attach(id: string, el: HTMLElement): void {
@@ -143,7 +157,10 @@ export function createTerminalManager(transport: TermTransport): TerminalManager
 
   function suspend(id: string): void {
     const entry = entries.get(id);
-    if (entry === undefined) return;
+    if (entry === undefined) {
+      if (ensuring.has(id)) suspendedWhileEnsuring.add(id);
+      return;
+    }
     entry.streaming = false;
     entry.detach?.();
     entry.detach = null;
