@@ -5,7 +5,10 @@
   import { boot, startRun, stopRun } from "./lib/session";
   import { agentsState, runningCount } from "./lib/state/agents.svelte";
   import { runState } from "./lib/state/run.svelte";
-  import { blockedCount as sessionsBadge } from "./lib/state/sessions.svelte";
+  import {
+    blockedCount as sessionsBadge,
+    sessionsState,
+  } from "./lib/state/sessions.svelte";
   import {
     closeWorkflow,
     releaseCapture,
@@ -17,7 +20,10 @@
   import { workflowTerm } from "./lib/term/instances";
   import { confirmDiscard } from "./lib/dialogs";
   import type { SessionView } from "./lib/types";
+  import CreateSessionModal from "./lib/views/CreateSessionModal.svelte";
+  import DeleteSessionModal from "./lib/views/DeleteSessionModal.svelte";
   import Dock from "./lib/views/Dock.svelte";
+  import Modal from "./lib/views/Modal.svelte";
   import NoWorkflowCard from "./lib/views/NoWorkflowCard.svelte";
   import Roster from "./lib/views/Roster.svelte";
   import SessionRail from "./lib/views/SessionRail.svelte";
@@ -29,9 +35,13 @@
 
   let now = $state(Date.now());
   let runError = $state<string | null>(null);
-  // Task 10 renders the create/delete modals off these; Task 9 only wires the rail.
+  // null = closed; "" = open with no project pre-selected (none registered yet).
   let createFor = $state<string | null>(null);
   let deleting = $state<SessionView | null>(null);
+
+  function openCreate(): void {
+    createFor = sessionsState.projects[0]?.id ?? "";
+  }
 
   const showGrid = $derived(runState.phase === "running" || runState.phase === "stopping");
   const gate = $derived(runGate(runState.phase, uiState.editorPath, uiState.editorDirty));
@@ -151,6 +161,9 @@
         sessions{#if sessionsBadge() > 0}<span class="badge">{sessionsBadge()}</span>{/if}
       </button>
     </span>
+    {#if uiState.mode === "sessions"}
+      <button class="runbtn" onclick={openCreate}>+ new session</button>
+    {/if}
     {#if uiState.mode === "workflows"}
       {#if canClose}
         <button
@@ -265,6 +278,35 @@
     {/if}
   </footer>
 </div>
+
+{#if createFor !== null}
+  <Modal
+    onClose={() => {
+      createFor = null;
+    }}
+  >
+    <CreateSessionModal
+      project={createFor}
+      onClose={() => {
+        createFor = null;
+      }}
+    />
+  </Modal>
+{/if}
+{#if deleting !== null}
+  <Modal
+    onClose={() => {
+      deleting = null;
+    }}
+  >
+    <DeleteSessionModal
+      session={deleting}
+      onClose={() => {
+        deleting = null;
+      }}
+    />
+  </Modal>
+{/if}
 
 <style>
   .shell {
