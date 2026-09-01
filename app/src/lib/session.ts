@@ -2,7 +2,7 @@ import { runStart, runStop, runUntrustedDirs, snapshot, toCmdError } from "./ipc
 import { resetAgents } from "./state/agents.svelte";
 import { runState } from "./state/run.svelte";
 import { releaseCapture, uiState } from "./state/ui.svelte";
-import { disposeAllTerminals, ensureTerminal } from "./term/manager";
+import { workflowTerm } from "./term/instances";
 import { confirmTrust } from "./dialogs";
 import { applySnapshot, wireEvents } from "./wireEvents";
 import type { Snapshot } from "./types";
@@ -19,7 +19,7 @@ async function openTerminals(snap: Snapshot): Promise<void> {
     // Contracts §8.2: a fresh terminal passes null to replay the full ring tail.
     // pty_cursors are end-of-stream positions, for clients that already hold the
     // screen; subscribing there joins mid-stream and shows a torn or blank pane.
-    await ensureTerminal(agent.id, null, snap.run.scrollback);
+    await workflowTerm.ensure(agent.id, null, snap.run.scrollback);
   }
 }
 
@@ -73,7 +73,7 @@ export async function stopRun(): Promise<void> {
     runState.completed = null;
     releaseCapture();
     uiState.maximizedAgent = null;
-    disposeAllTerminals();
+    workflowTerm.disposeAll();
     resetAgents();
     // messages stay: the traffic feed is history (SQLite-backed), not run state
   }

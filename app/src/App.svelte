@@ -13,7 +13,7 @@
     uiState,
   } from "./lib/state/ui.svelte";
   import { jumpToAgentTerminal } from "./lib/term/jump";
-  import { blurAllTerminals } from "./lib/term/manager";
+  import { workflowTerm } from "./lib/term/instances";
   import { confirmDiscard } from "./lib/dialogs";
   import Dock from "./lib/views/Dock.svelte";
   import NoWorkflowCard from "./lib/views/NoWorkflowCard.svelte";
@@ -72,7 +72,7 @@
       }
       case "release":
         releaseCapture();
-        blurAllTerminals();
+        workflowTerm.blurAll();
         break;
       case "dock-feed":
         uiState.dockTab = "feed";
