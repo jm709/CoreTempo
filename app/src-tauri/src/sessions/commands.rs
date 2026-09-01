@@ -26,7 +26,6 @@ use tauri::Manager;
 use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::commands::CmdError;
-use crate::sessions::discovery::Discovery;
 use crate::sessions::supervisor::{Conn, SessionsState, connected, ensure_supervisor};
 
 /// What the Sessions header renders: the connection, and the daemon's own
@@ -54,10 +53,11 @@ fn conn(state: &SessionsState) -> Conn {
 pub async fn sessions_status<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<SessionsStatusView, CmdError> {
-    ensure_supervisor(app.clone(), Discovery::production()?);
+    let state = app.state::<SessionsState>();
+    ensure_supervisor(app.clone(), state.discovery()?);
     // Cloned out of the lock before any await: a guard held across one would
     // block every other command on a slow daemon.
-    let conn = conn(&app.state::<SessionsState>());
+    let conn = conn(&state);
     let health = match &conn {
         // A connection that cannot answer health is one the supervisor is about
         // to lose; report the counts as unknown rather than failing the status

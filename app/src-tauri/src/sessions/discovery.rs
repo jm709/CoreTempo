@@ -21,6 +21,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Everything [`Discovery::connect`] needs, injectable so tests can point it at
 /// a scratch directory and a fake daemon.
+#[derive(Clone)]
 pub struct Discovery {
     /// Directory holding `api.json` (production: `~/.coretempo/sessions`).
     pub sessions_dir: PathBuf,

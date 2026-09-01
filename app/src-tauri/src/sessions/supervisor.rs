@@ -72,6 +72,46 @@ pub struct SessionsState {
     /// session id → the task forwarding that session's PTY stream.
     pub pty_pumps: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
     pub supervisor_started: AtomicBool,
+    /// Where to look for the daemon. `None` until something needs it, when it
+    /// is filled from the environment — see [`SessionsState::discovery`].
+    pub discovery: Mutex<Option<Discovery>>,
+}
+
+impl SessionsState {
+    /// A state that will hunt for the daemon through `discovery` rather than
+    /// the operator's real `~/.coretempo/sessions`. This is the seam a test
+    /// uses: without it, invoking `sessions_status` on a mock app probes — and
+    /// can spawn a daemon against — whatever the developer actually has.
+    #[must_use]
+    pub fn with_discovery(discovery: Discovery) -> SessionsState {
+        SessionsState {
+            discovery: Mutex::new(Some(discovery)),
+            ..SessionsState::default()
+        }
+    }
+
+    /// Where to look for the daemon, deriving it from the environment the first
+    /// time and keeping it after: re-deriving would re-read the environment on
+    /// every call, and would start failing mid-run if `HOME` went away.
+    ///
+    /// # Errors
+    /// `no_home` or `no_exe` from [`Discovery::production`] when the
+    /// environment cannot name a sessions directory or a binary, and `internal`
+    /// when the lock is poisoned.
+    pub fn discovery(&self) -> Result<Discovery, CmdError> {
+        let mut slot = self.discovery.lock().map_err(|_| {
+            CmdError::new(
+                "internal",
+                "the sessions discovery lock is poisoned; restart the app",
+            )
+        })?;
+        if let Some(discovery) = slot.as_ref() {
+            return Ok(discovery.clone());
+        }
+        let discovery = Discovery::production()?;
+        *slot = Some(discovery.clone());
+        Ok(discovery)
+    }
 }
 
 /// The connected client, or the error every command answers with when there is
@@ -197,4 +237,37 @@ fn reset_cursors<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         return;
     };
     cursors.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crate::sessions::discovery::Discovery;
+    use crate::sessions::supervisor::SessionsState;
+
+    /// A seeded discovery is what every later call gets back — nothing replaces
+    /// it with the operator's real one. This is what makes `build_test_app`'s
+    /// scratch directory load-bearing rather than decorative.
+    #[test]
+    fn a_seeded_discovery_is_kept_and_reused() {
+        let state = SessionsState::with_discovery(Discovery {
+            sessions_dir: PathBuf::from("/tmp/scratch-sessions"),
+            bin: PathBuf::from("/nonexistent-coretempod"),
+            deadline: Duration::from_millis(200),
+        });
+
+        for _ in 0..2 {
+            let discovery = state
+                .discovery()
+                .expect("a seeded discovery needs nothing from the environment");
+            assert_eq!(
+                discovery.sessions_dir,
+                PathBuf::from("/tmp/scratch-sessions")
+            );
+            assert_eq!(discovery.bin, PathBuf::from("/nonexistent-coretempod"));
+            assert_eq!(discovery.deadline, Duration::from_millis(200));
+        }
+    }
 }

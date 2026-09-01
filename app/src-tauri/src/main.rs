@@ -82,10 +82,22 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use tauri::test::{INVOKE_KEY, mock_builder, mock_context, noop_assets};
 
+    /// A sessions directory with no `api.json` and a binary that does not exist,
+    /// so a test that kicks the supervisor can never reach — or start a daemon
+    /// against — the operator's real `~/.coretempo/sessions`.
+    fn scratch_discovery() -> coretempo_app_lib::sessions::discovery::Discovery {
+        coretempo_app_lib::sessions::discovery::Discovery {
+            sessions_dir: std::env::temp_dir()
+                .join(format!("coretempo-shell-test-{}", std::process::id())),
+            bin: std::path::PathBuf::from("/nonexistent-coretempod"),
+            deadline: std::time::Duration::from_millis(200),
+        }
+    }
+
     fn build_test_app() -> anyhow::Result<tauri::App<tauri::test::MockRuntime>> {
         Ok(mock_builder()
             .manage(crate::state::AppState::default())
-            .manage(crate::SessionsState::default())
+            .manage(crate::SessionsState::with_discovery(scratch_discovery()))
             .invoke_handler(crate::invoke_handler())
             .build(mock_context(noop_assets()))?)
     }
@@ -147,10 +159,12 @@ mod tests {
     }
 
     /// `sessions_status` is what opening Sessions mode calls, and it is what
-    /// kicks the supervisor off. Which state it reports depends on whether the
-    /// operator has a daemon running, so only the shape is asserted.
+    /// kicks the supervisor off — so it must hunt for the daemon its *state*
+    /// names, not the operator's real one. Nothing the scratch discovery above
+    /// can find will ever answer, which is what makes `connected` a failure
+    /// rather than a machine-dependent maybe.
     #[test]
-    fn sessions_status_is_registered_and_reports_a_connection_state() -> anyhow::Result<()> {
+    fn sessions_status_hunts_the_daemon_its_state_names() -> anyhow::Result<()> {
         let app = build_test_app()?;
         let webview =
             tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
@@ -163,8 +177,8 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("no state in {value}"))?;
         assert!(
-            ["idle", "starting", "connected", "unreachable"].contains(&state),
-            "unexpected connection state {state}"
+            ["idle", "starting", "unreachable"].contains(&state),
+            "reported {state}: the shell reached a daemon the test never provided"
         );
         Ok(())
     }
