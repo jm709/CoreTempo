@@ -115,8 +115,15 @@ async fn pump<R: tauri::Runtime>(
     let mut parser = SseParser::default();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else {
-            return; // the daemon went away; the supervisor is what reconnects
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            // This stream can die while the daemon lives — the session's process
+            // exits, or this one connection breaks — and the supervisor would
+            // never notice, because its own stream is fine.
+            Err(err) => {
+                report_stream_error(&app, &session, &format!("the PTY stream failed: {err}"));
+                return;
+            }
         };
         for event in parser.push(&bytes) {
             let Some(decoded) = decode(&session, &event.data) else {
@@ -147,14 +154,19 @@ async fn refusal(response: reqwest::Response) -> String {
     }
 }
 
-/// Tells the webview a stream it believes it is attached to never opened.
+/// Tells the webview that a stream it believes it is attached to never opened,
+/// or died under it.
 ///
 /// **Shell-originated**: the daemon has no `pty.stream_error` event. It rides
 /// [`SESSION_EVENT`] anyway so one webview listener covers both — nothing
 /// retries a PTY stream, and `subscribe` has already answered `Ok`, so without
 /// this the terminal is dead with no signal at all.
+///
+/// Only *failures* are reported. A stream the daemon closed cleanly is a
+/// stopped session, which its own `session.stopped` event already announced;
+/// flagging that would put an error over every normal shutdown.
 fn report_stream_error<R: tauri::Runtime>(app: &tauri::AppHandle<R>, session: &str, message: &str) {
-    tracing::warn!(%session, %message, "session pty stream failed to open");
+    tracing::warn!(%session, %message, "session pty stream failed");
     let _ = app.emit(
         SESSION_EVENT,
         serde_json::json!({

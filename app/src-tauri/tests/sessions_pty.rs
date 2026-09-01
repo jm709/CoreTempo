@@ -7,7 +7,6 @@
 )]
 #![expect(clippy::unwrap_used, reason = "assertions are the vocabulary of tests")]
 
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +35,10 @@ const CHUNK_TWO_B64: &str = "Y2Fmw6kNCg==";
 /// Where the second chunk ends — the cursor a resume must ask for.
 const NEXT_CURSOR: u64 = 17;
 
-type Frames = mpsc::Sender<Result<Bytes, Infallible>>;
+/// The stub's body sender. Its error type is real (not `Infallible`) so a test
+/// can kill a stream mid-flight the way a dying daemon does, rather than only
+/// closing it cleanly.
+type Frames = mpsc::Sender<Result<Bytes, std::io::Error>>;
 
 /// What the stub daemon recorded, one entry per `/v1/sessions/{id}/pty`
 /// connection it served.
@@ -62,7 +64,7 @@ async fn pty_stream(State(stub): State<Arc<Stub>>, uri: axum::http::Uri) -> Resp
         .lock()
         .unwrap()
         .push(uri.query().map(ToString::to_string));
-    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(8);
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     let _ = tx.send(Ok(frame(10, 0, CHUNK_ONE_B64))).await;
     let _ = tx.send(Ok(frame(NEXT_CURSOR, 10, CHUNK_TWO_B64))).await;
     stub.frames.lock().unwrap().push(tx);
@@ -139,6 +141,31 @@ async fn wait_for_chunks(sink: &Sink, want: usize) -> Vec<Vec<u8>> {
         let chunks = sink.lock().unwrap().clone();
         if chunks.len() >= want || tokio::time::Instant::now() > deadline {
             return chunks;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Everything the shell emitted on the daemon's event channel.
+type Events = Arc<Mutex<Vec<serde_json::Value>>>;
+
+fn record_events(app: &tauri::App<tauri::test::MockRuntime>) -> Events {
+    let events: Events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    app.listen(SESSION_EVENT, move |event| {
+        sink.lock()
+            .unwrap()
+            .push(serde_json::from_str(event.payload()).unwrap());
+    });
+    events
+}
+
+async fn wait_for_events(events: &Events, want: usize) -> Vec<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = events.lock().unwrap().clone();
+        if seen.len() >= want || tokio::time::Instant::now() > deadline {
+            return seen;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -365,22 +392,12 @@ async fn wait_for_growth(sinks: &[Sink], before: &[usize]) -> usize {
 async fn a_refused_pty_stream_reports_itself_on_the_event_channel() -> anyhow::Result<()> {
     let port = spawn_refusing_stub().await?;
     let app = connected_app(port)?;
-    let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&events);
-    app.listen(SESSION_EVENT, move |event| {
-        sink.lock()
-            .unwrap()
-            .push(serde_json::from_str(event.payload()).unwrap());
-    });
+    let events = record_events(&app);
 
     let (chunks, channel) = sink_channel();
     subscribe(app.handle(), SESSION.to_string(), false, channel)?;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while events.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let reported = events.lock().unwrap().clone();
+    let reported = wait_for_events(&events, 1).await;
     assert_eq!(reported.len(), 1, "{reported:?}");
     assert_eq!(reported[0]["type"], "pty.stream_error");
     assert_eq!(reported[0]["agent"], SESSION);
@@ -389,6 +406,56 @@ async fn a_refused_pty_stream_reports_itself_on_the_event_channel() -> anyhow::R
         .ok_or_else(|| anyhow::anyhow!("no message in {}", reported[0]))?;
     assert!(message.contains("401"), "{message}");
     assert!(chunks.lock().unwrap().is_empty());
+    Ok(())
+}
+
+/// A PTY stream can die on its own while the daemon lives — the session's
+/// process exits, or that one connection breaks. The supervisor never notices
+/// (its own stream is fine), so the pump has to say so or the terminal is dead
+/// and silent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pty_stream_that_dies_mid_flight_reports_itself() -> anyhow::Result<()> {
+    let (port, stub) = spawn_stub().await?;
+    let app = connected_app(port)?;
+    let events = record_events(&app);
+
+    let (chunks, channel) = sink_channel();
+    subscribe(app.handle(), SESSION.to_string(), false, channel)?;
+    wait_for_chunks(&chunks, 2).await;
+    assert!(events.lock().unwrap().is_empty(), "nothing wrong yet");
+
+    sender(&stub, 0)
+        .send(Err(std::io::Error::other("the daemon dropped the stream")))
+        .await?;
+
+    let reported = wait_for_events(&events, 1).await;
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported[0]["type"], "pty.stream_error");
+    assert_eq!(reported[0]["agent"], SESSION);
+    Ok(())
+}
+
+/// A stream the daemon closed deliberately is not a failure — the session was
+/// stopped, and its own `session.stopped` event already said so. Reporting it
+/// as an error would put a red banner over every normal shutdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleanly_closed_pty_stream_stays_silent() -> anyhow::Result<()> {
+    let (port, stub) = spawn_stub().await?;
+    let app = connected_app(port)?;
+    let events = record_events(&app);
+
+    let (chunks, channel) = sink_channel();
+    subscribe(app.handle(), SESSION.to_string(), false, channel)?;
+    wait_for_chunks(&chunks, 2).await;
+
+    // Dropping the last sender ends the body the way a deliberate close does.
+    drop(stub.frames.lock().unwrap().remove(0));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        Vec::<serde_json::Value>::new(),
+    );
     Ok(())
 }
 
